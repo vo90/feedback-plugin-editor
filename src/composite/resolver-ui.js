@@ -309,7 +309,7 @@ function guidedOccurrenceMarkup(context, activeBlock) {
     }).join('');
     return `<div class="mb-3 rounded-lg border border-sky-800/50 bg-sky-950/20 px-3 py-2">`
         + `<div class="flex flex-wrap items-center justify-between gap-2"><div><b class="text-xs text-sky-100">Matching repetition group</b>`
-        + `<p class="text-[10px] text-sky-200/70">This choice applies to ${context.members.length} musically matching occurrences. Select one below to inspect or audition its surrounding context.</p></div>`
+        + `<p class="text-[10px] text-sky-200/70">The Lead/Rhythm choice matches in ${context.members.length} occurrences. Each occurrence keeps its own automatic shared notes and receives its own safety check. Select one below to inspect or audition its context.</p></div>`
         + `<button type="button" id="editor-composite-detach-occurrence" class="px-2 py-1 rounded bg-dark-700 hover:bg-dark-600 text-[10px]">Review this occurrence separately</button></div>`
         + `<div class="flex flex-wrap gap-1.5 mt-2">${chips}</div></div>`;
 }
@@ -712,7 +712,7 @@ function renderResult() {
         } else if (repeatNotice.kind === 'detached') {
             repeatNoticeMarkup = `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-[11px] text-sky-100"><b>${_editorEscHtml(repeatNotice.label)} is now reviewed separately.</b></div>`;
         } else {
-            repeatNoticeMarkup = `<div class="mb-3 rounded border border-emerald-800/50 bg-emerald-950/20 px-3 py-2 text-[11px] text-emerald-100"><b>Choice applied to all ${repeatNotice.applied} matching occurrences.</b> Every occurrence passed its own transition validation.</div>`;
+            repeatNoticeMarkup = `<div class="mb-3 rounded border border-emerald-800/50 bg-emerald-950/20 px-3 py-2 text-[11px] text-emerald-100"><b>Choice applied to all ${repeatNotice.applied} matching occurrences.</b> Each kept its own automatic shared notes and passed its own transition validation.</div>`;
         }
     }
     const statCards = activePlan.strategy === 'guided'
@@ -909,7 +909,7 @@ export function editorShowCompositeArrangementModal() {
         + `<label class="block text-xs text-gray-300">Hybrid mode<select id="editor-composite-strategy" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="gap-fill">Quick Hybrid — fill primary rests</option><option value="guided">Guided Hybrid — choose musical blocks</option></select></label>`
         + `<fieldset id="editor-composite-guided-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Guided repetition review</legend>`
         + `<label class="block text-xs text-gray-300">Repeated material<select id="editor-composite-repeat-mode" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="${GUIDED_REPEAT_MODE_EVERY}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_EVERY ? ' selected' : ''}>Review every occurrence</option><option value="${GUIDED_REPEAT_MODE_MATCHING}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_MATCHING ? ' selected' : ''}>Group matching repetitions</option></select></label>`
-        + `<p class="text-[10px] text-gray-500">Matching repetitions are compared note-for-note in both tracks. Every occurrence still receives its own transition safety check.</p></fieldset>`
+        + `<p class="text-[10px] text-gray-500">Matching compares the Lead/Rhythm material you choose between. Automatic notes shared by both tracks may differ; each occurrence keeps its own and receives its own safety check.</p></fieldset>`
         + `<fieldset id="editor-composite-gap-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Gap Fill safety</legend>`
         + `<label class="block text-xs text-gray-300">Timing unit<select id="editor-composite-gap-unit" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="beats"${gapFillUnit === 'beats' ? ' selected' : ''}>Beats — follows song tempo</option><option value="seconds"${gapFillUnit === 'seconds' ? ' selected' : ''}>Seconds — fixed real time</option></select></label>`
         + `<label class="block text-xs text-gray-300"><span id="editor-composite-min-gap-label">Minimum usable gap (${gapFillUnit})</span><input id="editor-composite-min-gap" type="number" min="0" value="${gapFillValues.minimumGap}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
@@ -917,7 +917,7 @@ export function editorShowCompositeArrangementModal() {
         + `<p class="text-[10px] text-gray-500">Every complete note, chord, trail, and connected gesture must fit inside the protected gap.</p></fieldset>`
         + `<label class="block text-xs text-gray-300">New track name<input id="editor-composite-name" maxlength="60" value="${_editorEscHtml(name)}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
         + `<button type="button" id="editor-composite-analyze" class="w-full px-3 py-2 rounded bg-accent hover:bg-accent-light text-xs font-medium">Analyze merge</button>`
-        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Quick Hybrid</b> adds complete secondary gestures only inside protected primary rests. <b class="text-gray-300">Guided Hybrid</b> skips identical and unambiguous material, then asks you to choose only where both arrangements differ. Matching-repetition mode can reuse one reviewed choice across musically identical occurrences.</div>`
+        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Quick Hybrid</b> adds complete secondary gestures only inside protected primary rests. <b class="text-gray-300">Guided Hybrid</b> skips identical and unambiguous material, then asks you to choose only where both arrangements differ. Matching-repetition mode reuses one review when the selectable Lead/Rhythm material repeats.</div>`
         + `</aside><main class="p-4 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-xs text-gray-400">Choose two source tracks and analyze the merge.</p></div></main></div>`
         + `<footer class="border-t border-gray-700 px-5 py-3 flex items-center gap-3"><div id="editor-composite-error" class="text-xs text-red-300 flex-1"></div>`
         + `<button type="button" id="editor-composite-cancel" class="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs">Cancel</button>`

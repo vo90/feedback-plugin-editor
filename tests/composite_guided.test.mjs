@@ -5,6 +5,7 @@ import {
     analyzeGuidedComposite,
     clearGuidedRepeatGroup,
     detachGuidedRepeatOccurrence,
+    GUIDED_REPEAT_MODE_EVERY,
     GUIDED_REPEAT_MODE_MATCHING,
     guidedReviewGroups,
     resolveGuidedRepeatGroup,
@@ -227,8 +228,81 @@ test('matching Guided repetitions become one review decision and resolve togethe
     assert.ok(plan.conflicts.every(block => block.resolution === null));
 });
 
-test('repetition matching rejects a musical or technique difference', () => {
+test('shared automatic notes may differ without creating a second review decision', () => {
+    const sharedOnlyInSecondOccurrence = note(8, 0, 0, 0.5, { palm_mute: true });
     const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 1, 3),
+            sharedOnlyInSecondOccurrence,
+            note(9, 1, 3),
+        ]),
+        secondary: arrangement('Rhythm', [
+            note(1, 2, 5),
+            structuredClone(sharedOnlyInSecondOccurrence),
+            note(9, 2, 5),
+        ]),
+        beats,
+        sections: [{ name: 'Verse', number: 2, start_time: 4 }],
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(plan.conflicts.length, 2);
+    assert.deepEqual(plan.conflicts.map(block => block.cells
+        .flatMap(cell => cell.commonEntries).length), [0, 1]);
+    plan.repeatMode = GUIDED_REPEAT_MODE_EVERY;
+    assert.equal(guidedReviewGroups(plan).length, 2,
+        'the default occurrence-by-occurrence workflow remains available');
+    plan.repeatMode = GUIDED_REPEAT_MODE_MATCHING;
+    assert.equal(guidedReviewGroups(plan).length, 1,
+        'fixed material cannot change the Lead-versus-Rhythm choice');
+
+    const resolved = resolveGuidedRepeatGroup(plan, plan.conflicts[0].id, 'primary');
+    assert.equal(resolved.ok, true);
+    assert.equal(resolved.applied.length, 2);
+    assert.deepEqual(materializeCompositeArrangement(plan, 'Shared-note repetitions')
+        .notes.map(entry => entry.beat), [1, 8, 9],
+    'the second occurrence keeps its own shared note without adding it to the first');
+});
+
+test('timing jitter across a bar boundary does not split a repeated review choice', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 0, 3), note(4.001, 1, 7), note(6, 2, 10),
+            note(9, 0, 3), note(11.999, 1, 7), note(14, 2, 10),
+        ]),
+        secondary: arrangement('Rhythm', [
+            note(1, 3, 5), note(4.001, 4, 8), note(6, 5, 12),
+            note(9, 3, 5), note(11.999, 4, 8), note(14, 5, 12),
+        ]),
+        beats,
+        sections: [{ name: 'Riff', number: 2, start_time: 4 }],
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(plan.conflicts.length, 2);
+    assert.deepEqual(plan.conflicts.map(block => block.cells
+        .map(cell => cell.primaryEntries.length)), [[1, 2], [2, 1]],
+    'the regression covers opposite exact cell buckets around the same boundary');
+    assert.deepEqual(plan.conflicts.map(block => block.primaryEntries
+        .map(entry => Number((entry.startBeat - block.startBeat).toFixed(3)))),
+    [[1, 4.001, 6], [1, 3.999, 6]], 'the original attack timing remains intact');
+    assert.equal(guidedReviewGroups(plan).length, 1);
+    assert.equal(plan.stats.repeatedOccurrences, 1);
+});
+
+test('an extra choice-dependent note still prevents repetition grouping', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 0, 3), note(9, 0, 3), note(10, 0, 7)]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9, 1, 5)]),
+        beats,
+        sections: [{ name: 'Riff', number: 2, start_time: 4 }],
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(plan.conflicts.length, 2);
+    assert.equal(guidedReviewGroups(plan).length, 2);
+    assert.equal(plan.stats.repeatedOccurrences, 0);
+});
+
+test('repetition matching rejects a technique or trail difference', () => {
+    const techniquePlan = analyzeGuidedComposite({
         primary: arrangement('Lead', [
             note(1, 0, 3),
             note(9, 0, 3, 0, { bend: true }),
@@ -237,9 +311,18 @@ test('repetition matching rejects a musical or technique difference', () => {
         beats,
         repeatMode: GUIDED_REPEAT_MODE_MATCHING,
     });
-    assert.equal(plan.conflicts.length, 2);
-    assert.equal(guidedReviewGroups(plan).length, 2);
-    assert.equal(plan.stats.repeatedOccurrences, 0);
+    assert.equal(techniquePlan.conflicts.length, 2);
+    assert.equal(guidedReviewGroups(techniquePlan).length, 2);
+
+    const trailPlan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 0, 3, 1), note(9, 0, 3, 1.1)]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9, 1, 5)]),
+        beats,
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(trailPlan.conflicts.length, 2);
+    assert.equal(guidedReviewGroups(trailPlan).length, 2);
+    assert.equal(trailPlan.stats.repeatedOccurrences, 0);
 });
 
 test('custom selections map to occurrence-specific note ids', () => {

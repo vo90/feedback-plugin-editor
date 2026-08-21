@@ -347,17 +347,15 @@ function uniqueEntries(entries) {
     return [...unique.values()].sort(compareEntries);
 }
 
-function commonEntriesForBlock(block) {
-    return uniqueEntries((block.cells || []).flatMap(cell => cell.commonEntries || []));
-}
-
-function repeatLaneEntries(block, lane, includeCommon = true) {
+// Repetition identity describes the choice the reviewer must make, not the
+// complete material that will be emitted for an occurrence. Common entries
+// are fixed regardless of Lead/Rhythm/Custom and deliberately stay out of the
+// signature. They remain in plan.fixedEntries and are validated in the
+// occurrence-specific result after a grouped choice is applied.
+function repeatChoiceEntries(block, lane) {
     const laneEntries = lane === 'secondary'
         ? block.secondaryEntries || [] : block.primaryEntries || [];
-    return uniqueEntries([
-        ...(includeCommon ? commonEntriesForBlock(block) : []),
-        ...laneEntries,
-    ]);
+    return uniqueEntries(laneEntries);
 }
 
 function entrySemanticKey(entry) {
@@ -375,15 +373,13 @@ function entrySemanticKey(entry) {
 }
 
 function blockRepeatFingerprint(block) {
-    const semanticKeys = lane => repeatLaneEntries(block, lane).map(entrySemanticKey);
+    // This is only a conservative bucket before the tempo-aware exact match.
+    // Sort semantic keys as a multiset so imported attacks straddling a bar
+    // boundary by a few milliseconds cannot change their fingerprint order.
+    const semanticKeys = lane => repeatChoiceEntries(block, lane)
+        .map(entrySemanticKey).sort();
     return stable({
-        cells: (block.cells || []).map(cell => ({
-            barBoundary: !!cell.barBoundary,
-            common: (cell.commonEntries || []).length,
-            primary: (cell.primaryEntries || []).length,
-            secondary: (cell.secondaryEntries || []).length,
-        })),
-        transition: (block.reasons || []).includes('transition'),
+        cells: (block.cells || []).map(cell => !!cell.barBoundary),
         primary: semanticKeys('primary'),
         secondary: semanticKeys('secondary'),
     });
@@ -421,13 +417,44 @@ function repeatEntriesEquivalent(left, right, leftBase, rightBase, beats) {
     return true;
 }
 
-function repeatEntryListsEquivalent(leftEntries, rightEntries, leftBase, rightBase, beats) {
+function matchRepeatEntryLists(leftEntries, rightEntries, leftBase, rightBase, beats) {
     if (leftEntries.length !== rightEntries.length) return false;
-    for (let index = 0; index < leftEntries.length; index++) {
-        if (!repeatEntriesEquivalent(leftEntries[index], rightEntries[index],
-            leftBase, rightBase, beats)) return false;
+    const candidates = leftEntries.map(left => rightEntries
+        .map((right, index) => ({
+            index,
+            distance: Math.abs((left.startBeat - leftBase) - (right.startBeat - rightBase)),
+        }))
+        .filter(({ index }) => repeatEntriesEquivalent(left, rightEntries[index],
+            leftBase, rightBase, beats))
+        .sort((a, b) => a.distance - b.distance || a.index - b.index)
+        .map(candidate => candidate.index));
+    if (candidates.some(matches => matches.length === 0)) return false;
+
+    // Tolerant timing can make two repeated attacks eligible for the same
+    // target. Use an augmenting one-to-one match instead of relying on the
+    // imported sort order, which may flip inside the tolerance window.
+    const leftByRight = new Map();
+    function assign(leftIndex, visited) {
+        for (const rightIndex of candidates[leftIndex]) {
+            if (visited.has(rightIndex)) continue;
+            visited.add(rightIndex);
+            const previousLeft = leftByRight.get(rightIndex);
+            if (previousLeft === undefined || assign(previousLeft, visited)) {
+                leftByRight.set(rightIndex, leftIndex);
+                return true;
+            }
+        }
+        return false;
     }
-    return true;
+    for (let leftIndex = 0; leftIndex < leftEntries.length; leftIndex++) {
+        if (!assign(leftIndex, new Set())) return false;
+    }
+    const rightByLeft = new Map();
+    for (const [rightIndex, leftIndex] of leftByRight) rightByLeft.set(leftIndex, rightIndex);
+    return leftEntries.map((left, leftIndex) => ({
+        left,
+        right: rightEntries[rightByLeft.get(leftIndex)],
+    }));
 }
 
 function repeatBlocksEquivalent(left, right, beats) {
@@ -441,10 +468,10 @@ function repeatBlocksEquivalent(left, right, beats) {
             || !relativeTimingNear(leftCell.endBeat, rightCell.endBeat,
                 left.startBeat, right.startBeat, beats)) return false;
     }
-    return repeatEntryListsEquivalent(repeatLaneEntries(left, 'primary'),
-        repeatLaneEntries(right, 'primary'), left.startBeat, right.startBeat, beats)
-        && repeatEntryListsEquivalent(repeatLaneEntries(left, 'secondary'),
-            repeatLaneEntries(right, 'secondary'), left.startBeat, right.startBeat, beats);
+    return !!matchRepeatEntryLists(repeatChoiceEntries(left, 'primary'),
+        repeatChoiceEntries(right, 'primary'), left.startBeat, right.startBeat, beats)
+        && !!matchRepeatEntryLists(repeatChoiceEntries(left, 'secondary'),
+            repeatChoiceEntries(right, 'secondary'), left.startBeat, right.startBeat, beats);
 }
 
 export function refreshGuidedRepeatGroups(plan) {
@@ -510,13 +537,11 @@ function mapCustomSelection(fromBlock, toBlock, selectedEntryIds, beats) {
     const selected = new Set(selectedEntryIds || []);
     const mapped = [];
     for (const lane of ['primary', 'secondary']) {
-        const fromEntries = repeatLaneEntries(fromBlock, lane, false);
-        const toEntries = repeatLaneEntries(toBlock, lane, false);
-        if (fromEntries.length !== toEntries.length) return null;
-        for (let index = 0; index < fromEntries.length; index++) {
-            if (!repeatEntriesEquivalent(fromEntries[index], toEntries[index],
-                fromBlock.startBeat, toBlock.startBeat, beats)) return null;
-            if (selected.has(fromEntries[index].id)) mapped.push(toEntries[index].id);
+        const pairs = matchRepeatEntryLists(repeatChoiceEntries(fromBlock, lane),
+            repeatChoiceEntries(toBlock, lane), fromBlock.startBeat, toBlock.startBeat, beats);
+        if (!pairs) return null;
+        for (const pair of pairs) {
+            if (selected.has(pair.left.id)) mapped.push(pair.right.id);
         }
     }
     return mapped;
