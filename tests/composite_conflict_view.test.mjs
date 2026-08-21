@@ -96,7 +96,9 @@ test('custom source notes are keyboard-selectable and invalid drafts stay visibl
     const svg = renderCompositeConflictTabSvg(view);
     assert.match(svg, /data-composite-entry-id="primary:0"/);
     assert.match(svg, /role="checkbox"/);
-    assert.match(svg, /Merged result/);
+    assert.match(svg, /Hybrid result/);
+    assert.match(svg, /Your current choice/);
+    assert.match(svg, />REVIEW</);
     assert.match(svg, /stroke="#f87171"/);
 });
 

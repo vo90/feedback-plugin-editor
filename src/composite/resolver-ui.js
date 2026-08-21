@@ -1,8 +1,8 @@
-/* Composite-arrangement resolver.
+/* Hybrid-track builder.
  *
- * This is the thin Editor integration over merge-engine.js: source/strategy
- * selection, Git-like conflict hunks, server-session registration, and one
- * structural history command. The merge rules remain DOM-free and testable.
+ * This is the Editor integration over the DOM-free automatic and guided
+ * planners: setup, musical-section review, preview, and one structural history
+ * command. The merge rules remain DOM-free and testable.
  */
 
 import { arrKind, _isFrettedKind } from '../instrument.js';
@@ -21,6 +21,7 @@ import {
     clearCompositeConflictResolution,
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     compositeGapFillDefaultsForUnit,
+    compositeResolvedEntries,
     compositeSelectionUnitIds,
     materializeCompositeArrangement,
     normalizeCompositeGapFillOptions,
@@ -97,7 +98,8 @@ export function _compositeGuidedPreferencesPure(raw) {
         try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
     }
     if (!parsed || typeof parsed !== 'object') parsed = {};
-    return { repeatMode: normalizeGuidedRepeatMode(parsed.repeatMode) };
+    return { repeatMode: parsed.repeatMode === GUIDED_REPEAT_MODE_EVERY
+        ? GUIDED_REPEAT_MODE_EVERY : GUIDED_REPEAT_MODE_MATCHING };
 }
 
 function loadCompositeGuidedPreferences() {
@@ -123,6 +125,11 @@ function gapFillOptionsFromDialog(unit = byId('editor-composite-gap-unit')?.valu
     });
 }
 
+function selectedCompositeStrategy() {
+    return document.querySelector('input[name="editor-composite-strategy"]:checked')?.value === 'guided'
+        ? 'guided' : 'gap-fill';
+}
+
 function applyGapFillUnitToDialog(unit, values) {
     const normalized = normalizeCompositeGapFillOptions({ unit, ...(values || {}) });
     const config = COMPOSITE_GAP_FILL_CONTROL_CONFIG[normalized.unit];
@@ -131,8 +138,8 @@ function applyGapFillUnitToDialog(unit, values) {
     const unitLabel = normalized.unit === 'seconds' ? 'seconds' : 'beats';
     const minLabel = byId('editor-composite-min-gap-label');
     const marginLabel = byId('editor-composite-margin-label');
-    if (minLabel) minLabel.textContent = `Minimum usable gap (${unitLabel})`;
-    if (marginLabel) marginLabel.textContent = `Transition margin each side (${unitLabel})`;
+    if (minLabel) minLabel.textContent = `Smallest gap to fill (${unitLabel})`;
+    if (marginLabel) marginLabel.textContent = `Extra space before and after (${unitLabel})`;
     if (minGap) {
         minGap.max = String(config.minimumMax);
         minGap.step = String(config.minimumStep);
@@ -213,21 +220,27 @@ function clearTransientState() {
     customDrafts.clear();
 }
 
-function resetResult(message = 'Choose two source tracks and analyze the merge.') {
+function resetResult(message = 'Choose two tracks and how you want to build the hybrid.') {
     restoreCompositePreviewSession();
     clearTransientState();
     const result = byId('editor-composite-result');
-    if (result) result.innerHTML = `<p class="text-xs text-gray-400">${_editorEscHtml(message)}</p>`;
+    if (result) result.innerHTML = `<p class="text-sm text-gray-400">${_editorEscHtml(message)}</p>`;
     const finish = byId('editor-composite-finish');
-    if (finish) finish.disabled = true;
+    if (finish) {
+        finish.disabled = true;
+        finish.hidden = true;
+    }
 }
 
 function setCompositeReviewMode(reviewing) {
     const workspace = byId('editor-composite-workspace');
     const setup = byId('editor-composite-setup');
+    const result = byId('editor-composite-result-workspace');
     if (setup) setup.hidden = reviewing;
-    if (workspace) workspace.style.gridTemplateColumns = reviewing
-        ? 'minmax(0, 1fr)' : '18rem minmax(0, 1fr)';
+    if (result) result.hidden = !reviewing;
+    if (workspace) workspace.style.gridTemplateColumns = 'minmax(0, 1fr)';
+    const finish = byId('editor-composite-finish');
+    if (finish && !reviewing) finish.hidden = true;
 }
 
 function optionMarkup(source) {
@@ -242,9 +255,9 @@ function entryMarkup(entry, checkboxName = '', stringCount = 6) {
     const length = Math.max(0, entry.endBeat - entry.startBeat);
     const tech = noteTechLabel(entry.note);
     const displayString = Math.max(1, stringCount - entry.string);
-    const body = `<span class="font-mono text-gray-200">Beat ${entry.startBeat.toFixed(3)}</span>`
-        + `<span class="text-gray-400">S${displayString} · F${entry.fret}</span>`
-        + (length > 1e-4 ? `<span class="text-gray-500">${length.toFixed(3)} beats</span>` : '')
+    const body = `<span class="text-gray-200">String ${displayString}, fret ${entry.fret}</span>`
+        + `<span class="font-mono text-gray-500">beat ${entry.startBeat.toFixed(3)}</span>`
+        + (length > 1e-4 ? `<span class="text-gray-500">holds ${length.toFixed(3)} beats</span>` : '')
         + (tech ? `<span class="text-amber-300">${_editorEscHtml(tech)}</span>` : '');
     if (!checkboxName) return `<li class="flex flex-wrap gap-x-3 gap-y-0.5 py-1">${body}</li>`;
     return `<label class="flex items-center gap-2 py-1 cursor-pointer hover:bg-dark-600/50 rounded px-1">`
@@ -270,8 +283,8 @@ function selectedSourceNames() {
     const primaryIndex = Number(byId('editor-composite-primary')?.value);
     const secondaryIndex = Number(byId('editor-composite-secondary')?.value);
     return {
-        primary: S.arrangements[primaryIndex]?.name || 'Primary',
-        secondary: S.arrangements[secondaryIndex]?.name || 'Secondary',
+        primary: S.arrangements[primaryIndex]?.name || 'Base track',
+        secondary: S.arrangements[secondaryIndex]?.name || 'Fill track',
     };
 }
 
@@ -308,10 +321,11 @@ function guidedOccurrenceMarkup(context, activeBlock) {
             + `${occurrenceIndex + 1}. ${_editorEscHtml(block.label)}</button>`;
     }).join('');
     return `<div class="mb-3 rounded-lg border border-sky-800/50 bg-sky-950/20 px-3 py-2">`
-        + `<div class="flex flex-wrap items-center justify-between gap-2"><div><b class="text-xs text-sky-100">Matching repetition group</b>`
-        + `<p class="text-[10px] text-sky-200/70">The Lead/Rhythm choice matches in ${context.members.length} occurrences. Each occurrence keeps its own automatic shared notes and receives its own safety check. Select one below to inspect or audition its context.</p></div>`
-        + `<button type="button" id="editor-composite-detach-occurrence" class="px-2 py-1 rounded bg-dark-700 hover:bg-dark-600 text-[10px]">Review this occurrence separately</button></div>`
-        + `<div class="flex flex-wrap gap-1.5 mt-2">${chips}</div></div>`;
+        + `<div><b class="text-sm text-sky-100">This riff appears ${context.members.length} times</b>`
+        + `<p class="text-xs text-sky-200/80 mt-1">Your choice will be used in every section shown below. Each copy is checked separately so its surrounding notes remain playable.</p></div>`
+        + `<div class="flex flex-wrap gap-1.5 mt-2">${chips}</div>`
+        + `<details class="mt-2 text-xs text-gray-400"><summary class="cursor-pointer hover:text-gray-200">More options</summary>`
+        + `<button type="button" id="editor-composite-detach-occurrence" class="mt-2 px-2.5 py-1.5 rounded bg-dark-700 hover:bg-dark-600 text-xs">Choose differently in this section</button></details></div>`;
 }
 
 function activateGuidedReviewGroup(plan, group, preferUnresolved = true) {
@@ -330,6 +344,7 @@ function activateGuidedReviewGroup(plan, group, preferUnresolved = true) {
 
 function renderOverview(plan) {
     if (plan.strategy === 'guided') {
+        const names = selectedSourceNames();
         const start = Number.isFinite(plan.timelineStartBeat) ? plan.timelineStartBeat : 0;
         const end = Math.max(start + 1, Number(plan.timelineEndBeat) || start + 1);
         const automaticClass = {
@@ -350,29 +365,16 @@ function renderOverview(plan) {
             const current = index === activeConflictIndex;
             const stateClass = block.validationError ? 'bg-red-500'
                 : block.resolution ? 'bg-emerald-500' : 'bg-amber-500';
-            const state = block.validationError ? 'Invalid transition'
-                : block.resolution ? 'Resolved' : 'Needs a choice';
+            const state = block.validationError ? 'Choice needs attention'
+                : block.resolution ? 'Choice made' : 'Needs review';
             return `<button type="button" data-conflict-index="${index}" aria-label="${state}: ${_editorEscHtml(block.label)}" aria-current="${current ? 'true' : 'false'}" class="absolute top-0 h-4 ${stateClass} ${current ? 'ring-2 ring-white ring-inset' : ''}"`
                 + ` style="left:${left}%;width:${width}%" title="${_editorEscHtml(`${block.label} · ${state}`)}"></button>`;
         }).join('');
-        return `<div class="mb-3"><div class="flex flex-wrap justify-between gap-2 text-[10px] text-gray-500 mb-1"><span>Guided song overview</span>`
-            + `<span>gray identical/empty · blue primary · violet secondary · amber review · green resolved · red invalid</span></div>`
+        return `<div class="mb-3" aria-label="Song review map"><div class="flex flex-wrap justify-between gap-2 text-xs text-gray-400 mb-1.5"><b class="text-gray-200">Song map</b>`
+            + `<span><span aria-hidden="true" class="text-slate-300">●</span> same/empty · <span aria-hidden="true" class="text-sky-400">●</span> ${_editorEscHtml(names.primary)} · <span aria-hidden="true" class="text-violet-400">●</span> ${_editorEscHtml(names.secondary)} · <span aria-hidden="true" class="text-amber-400">◆</span> needs review · <span aria-hidden="true" class="text-emerald-400">✓</span> chosen</span></div>`
             + `<div class="relative h-4 rounded bg-dark-900 overflow-hidden">${automatic}${decisions}</div></div>`;
     }
-    if (!plan.conflicts.length) return '';
-    const all = [...plan.fixedEntries, ...plan.conflicts.flatMap(c => [...c.primaryEntries, ...c.secondaryEntries])];
-    const start = Math.min(...all.map(e => e.startBeat));
-    const end = Math.max(start + 1, ...all.map(e => e.effectiveEndBeat));
-    const markers = plan.conflicts.map((conflict, index) => {
-        const left = ((conflict.startBeat - start) / (end - start)) * 100;
-        const width = Math.max(0.7, ((conflict.endBeat - conflict.startBeat) / (end - start)) * 100);
-        const resolved = !!conflict.resolution;
-        const current = index === activeConflictIndex;
-        return `<button type="button" data-conflict-index="${index}" aria-label="${resolved ? 'Resolved' : 'Unresolved'} conflict ${index + 1}" aria-current="${current ? 'true' : 'false'}" class="absolute top-0 h-3 rounded-sm ${resolved ? 'bg-emerald-500' : 'bg-red-500'} ${current ? 'ring-2 ring-white ring-inset' : ''}"`
-            + ` style="left:${left}%;width:${width}%" title="${resolved ? 'Resolved' : 'Unresolved'} conflict ${index + 1}"></button>`;
-    }).join('');
-    return `<div class="mb-3"><div class="flex justify-between text-[10px] text-gray-500 mb-1"><span>Merge overview</span><span>red unresolved · green resolved</span></div>`
-        + `<div class="relative h-3 rounded bg-dark-900 overflow-hidden">${markers}</div></div>`;
+    return '';
 }
 
 function customMarkup(group) {
@@ -383,24 +385,32 @@ function customMarkup(group) {
     const stringCount = activePlan?.compatibility?.stringCount || 6;
     const render = (entry) => entryMarkup(entry, `custom-${group.id}`, stringCount).replace(
         `data-entry-id="${entry.id}"`, `data-entry-id="${entry.id}"${checked.has(entry.id) ? ' checked' : ''}`);
+    const primarySelected = group.primaryEntries.filter(entry => checked.has(entry.id)).length;
+    const secondarySelected = group.secondaryEntries.filter(entry => checked.has(entry.id)).length;
+    const names = selectedSourceNames();
     return `<div class="mt-3 border-t border-gray-700 pt-2">`
-        + `<p class="text-[11px] text-gray-400 mb-1">Choose notes here or click them directly in either source tab. Cross-source notes may not overlap on one string.</p>`
-        + [...group.primaryEntries, ...group.secondaryEntries].map(render).join('')
-        + `<div id="editor-composite-custom-error" class="text-[11px] text-red-300 mt-1">${_editorEscHtml(group.validationError || '')}</div></div>`;
+        + `<div class="rounded-lg border border-amber-700/50 bg-amber-950/20 px-3 py-2">`
+        + `<b class="text-sm text-amber-100">Mix notes yourself</b>`
+        + `<p class="text-xs text-gray-300 mt-1">Click notes in the ${_editorEscHtml(names.primary)} or ${_editorEscHtml(names.secondary)} tablature above. Connected notes, chords, and trails stay together.</p>`
+        + `<p class="text-xs text-amber-200 mt-2" aria-live="polite"><b>${primarySelected}</b> from ${_editorEscHtml(names.primary)} · <b>${secondarySelected}</b> from ${_editorEscHtml(names.secondary)}</p>`
+        + `<div id="editor-composite-custom-error" class="text-xs text-red-300 mt-1" role="alert">${_editorEscHtml(group.validationError || '')}</div></div>`
+        + `<details class="mt-2 text-xs text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Advanced note list</summary>`
+        + `<div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2"><div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b>${group.primaryEntries.map(render).join('')}</div>`
+        + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b>${group.secondaryEntries.map(render).join('')}</div></div></details></div>`;
 }
 
-function renderPreviewControls(view) {
-    const resultReady = !!view.conflict.resolution;
-    const buttonClass = 'px-2.5 py-1.5 rounded border border-gray-600 bg-dark-700 hover:border-gray-400 text-[11px] disabled:opacity-40 disabled:cursor-not-allowed';
+function renderPreviewControls(view, wholeSong = false) {
+    const resultReady = wholeSong || !!view.conflict.resolution;
+    const buttonClass = 'px-2.5 py-1.5 rounded border border-gray-600 bg-dark-700 hover:border-gray-400 text-xs disabled:opacity-40 disabled:cursor-not-allowed';
     return `<div class="mb-3 rounded-lg border border-gray-700 bg-dark-900/70 px-3 py-2">`
-        + `<div class="flex flex-wrap items-center gap-2"><span class="text-[10px] uppercase tracking-wide text-gray-400 font-semibold mr-1">Audition this section</span>`
+        + `<div class="flex flex-wrap items-center gap-2"><span class="text-xs text-gray-300 font-semibold mr-1">${wholeSong ? 'Preview the hybrid' : 'Listen to this section'}</span>`
         + `<button type="button" data-composite-preview="song" aria-pressed="false" class="${buttonClass}" ${S.audioBuffer ? '' : 'disabled'}>▶ Song audio</button>`
-        + `<button type="button" data-composite-preview="primary" aria-pressed="false" class="${buttonClass} text-sky-200">▶ ${_editorEscHtml(view.names.primary)} guide</button>`
-        + `<button type="button" data-composite-preview="secondary" aria-pressed="false" class="${buttonClass} text-violet-200">▶ ${_editorEscHtml(view.names.secondary)} guide</button>`
-        + `<button type="button" data-composite-preview="result" aria-pressed="false" class="${buttonClass} text-emerald-200" ${resultReady ? '' : 'disabled'}>▶ Result guide</button>`
+        + (wholeSong ? '' : `<button type="button" data-composite-preview="primary" aria-pressed="false" class="${buttonClass} text-sky-200">▶ ${_editorEscHtml(view.names.primary)}</button>`
+            + `<button type="button" data-composite-preview="secondary" aria-pressed="false" class="${buttonClass} text-violet-200">▶ ${_editorEscHtml(view.names.secondary)}</button>`)
+        + `<button type="button" data-composite-preview="result" aria-pressed="false" class="${buttonClass} text-emerald-200" ${resultReady ? '' : 'disabled'}>▶ Hybrid guide</button>`
         + `<button type="button" id="editor-composite-preview-stop" class="${buttonClass}" disabled>■ Stop</button>`
-        + `<button type="button" id="editor-composite-keep-loop" class="ml-auto ${buttonClass}">Send section to Editor loop</button></div>`
-        + `<p class="mt-1.5 text-[10px] text-gray-500">The selected bars loop automatically. Pitched guides play over the imported song audio; Song audio suppresses arrangement guides. Your metronome setting remains active.</p></div>`;
+        + (wholeSong ? '' : `<button type="button" id="editor-composite-keep-loop" class="ml-auto ${buttonClass}">Keep this section looped in the editor</button>`)
+        + `</div><p class="mt-1.5 text-xs text-gray-500">${wholeSong ? 'The guide plays the planned hybrid over your song. Nothing is created until you press Create Hybrid Track.' : 'The selected bars repeat while you compare the song and each playable part.'}</p></div>`;
 }
 
 function currentConflictView() {
@@ -417,6 +427,37 @@ function currentConflictView() {
     });
 }
 
+function entryLastBeat(entry) {
+    return Math.max(Number(entry?.startBeat) || 0, Number(entry?.endBeat) || 0,
+        Number(entry?.effectiveEndBeat) || 0);
+}
+
+function wholePlanPreviewView() {
+    if (!activePlan) return null;
+    const names = selectedSourceNames();
+    const primary = activePlan.sourceEntries?.primary || [];
+    const secondary = activePlan.sourceEntries?.secondary || [];
+    const result = compositeResolvedEntries(activePlan);
+    const all = [...primary, ...secondary, ...result];
+    const startBeat = all.length ? Math.max(0, Math.min(...all.map(entry => entry.startBeat))) : 0;
+    const endBeat = all.length ? Math.max(startBeat + 1, ...all.map(entryLastBeat))
+        : Math.max(1, activePlan.beats.length - 1);
+    return {
+        names,
+        context: { startBeat, endBeat },
+        conflict: { resolution: 'ready' },
+        lanes: [
+            { id: 'primary', entries: primary },
+            { id: 'secondary', entries: secondary },
+            { id: 'result', entries: result },
+        ],
+    };
+}
+
+function currentPreviewView() {
+    return currentConflictView() || wholePlanPreviewView();
+}
+
 function setCompositeContextLoop(view) {
     const region = compositePreviewRegionPure(view.context, activePlan.beats);
     _setBarSel(region);
@@ -426,7 +467,7 @@ function setCompositeContextLoop(view) {
 }
 
 function startCompositePreview(mode) {
-    const view = currentConflictView();
+    const view = currentPreviewView();
     if (!view) return;
     rememberCompositePreviewSession();
     if (S.playing) stopPlayback();
@@ -441,12 +482,13 @@ function startCompositePreview(mode) {
     startPlayback();
     compositePreviewPlaying = !!S.playing;
     updateCompositePreviewButtons();
-    const label = mode === 'song' ? 'song audio' : `${mode} guide over song audio`;
-    setStatus(`Composite preview: looping ${label}.`);
+    const label = mode === 'song' ? 'song audio' : mode === 'result'
+        ? 'hybrid guide over song audio' : `${view.names[mode]} guide over song audio`;
+    setStatus(`Hybrid preview: playing ${label}.`);
 }
 
 function keepCompositeContextLoop() {
-    const view = currentConflictView();
+    const view = currentPreviewView();
     if (!view) return;
     rememberCompositePreviewSession();
     endCompositePreviewPlayback();
@@ -456,20 +498,21 @@ function keepCompositeContextLoop() {
     compositePreviewRestore = null;
     const button = byId('editor-composite-keep-loop');
     if (button) button.textContent = 'Editor loop set ✓';
-    setStatus('Conflict context sent to the Editor loop. It will remain after you close the resolver.');
+    setStatus('This section will stay looped after you close the Hybrid Track builder.');
 }
 
 function renderConflict(plan) {
     const guided = plan.strategy === 'guided';
     if (!plan.conflicts.length) {
-        return `<div class="rounded border border-emerald-700/50 bg-emerald-950/20 p-4 text-xs text-emerald-200 flex flex-wrap items-center justify-between gap-3">`
-            + `<div><b class="block text-sm mb-1">${guided ? 'No review needed' : 'No manual conflicts'}</b>${guided ? 'The two tracks are identical or contain only unambiguous single-source material.' : 'The analyzed merge is ready to finish.'}</div>`
-            + `<button type="button" id="editor-composite-edit-settings" class="px-2.5 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs text-gray-200">Edit setup</button></div>`;
+        return `<div class="rounded border border-emerald-700/50 bg-emerald-950/20 p-4 text-sm text-emerald-100 flex flex-wrap items-center justify-between gap-3">`
+            + `<div><b class="block text-base mb-1">No choices needed</b>The tracks match here, or only one track is playing at a time. The hybrid is ready to create.</div>`
+            + `<button type="button" id="editor-composite-edit-settings" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm text-gray-200">Back and adjust</button></div>`;
     }
     activeConflictIndex = Math.max(0, Math.min(activeConflictIndex, plan.conflicts.length - 1));
     const group = plan.conflicts[activeConflictIndex];
     const repeatContext = guided ? guidedRepeatContext(plan, group) : null;
-    const repeatCountSuffix = repeatContext?.grouped ? ` for all ${repeatContext.members.length}` : '';
+    const repeatBadge = repeatContext?.grouped
+        ? `<span class="inline-block mt-1 rounded-full bg-sky-950/70 px-2 py-0.5 text-xs text-sky-200">Applies to ${repeatContext.members.length} matching sections</span>` : '';
     const names = selectedSourceNames();
     const draft = customDrafts.get(group.id);
     const view = buildCompositeConflictViewModel({
@@ -487,23 +530,17 @@ function renderConflict(plan) {
     const stateClass = group.validationError ? 'bg-red-900/70 text-red-200'
         : group.resolution ? 'bg-emerald-900/70 text-emerald-200'
             : guided ? 'bg-amber-900/70 text-amber-100' : 'bg-red-900/70 text-red-200';
-    const stateLabel = group.validationError ? 'Invalid transition'
-        : group.resolution ? 'Resolved' : 'Needs a choice';
+    const stateLabel = group.validationError ? 'Choice needs attention'
+        : group.resolution ? 'Choice made' : 'Needs review';
     const rangeLabel = guided && group.label
         ? `${group.label} · ${conflictReason(group)}`
         : `Beats ${group.startBeat.toFixed(3)}–${group.endBeat.toFixed(3)} · ${conflictReason(group)}`;
-    const resolutionButtons = guided
-        ? `<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">`
-            + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Use ${_editorEscHtml(names.primary)}${repeatCountSuffix}</b><span class="text-[10px] text-gray-400">Choose this arrangement for the complete ${repeatContext?.grouped ? 'repetition group' : 'block'}</span></button>`
-            + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}${repeatCountSuffix}</b><span class="text-[10px] text-gray-400">Choose this arrangement for the complete ${repeatContext?.grouped ? 'repetition group' : 'block'}</span></button>`
-            + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id) || group.resolution === 'custom'}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) || group.resolution === 'custom' ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection${repeatCountSuffix}</b><span class="text-[10px] text-gray-400">Pick complete notes and gestures from either track</span></button></div>`
-        : `<div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">`
-            + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Keep ${_editorEscHtml(names.primary)}</b><span class="text-[10px] text-gray-400">Use the complete primary gesture</span></button>`
-            + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}</b><span class="text-[10px] text-gray-400">Use the complete secondary gesture</span></button>`
-            + `<button type="button" data-resolution="compatible" aria-pressed="${group.resolution === 'compatible'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'compatible' ? 'bg-emerald-900/70 border-emerald-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-emerald-500'}"><b class="block text-emerald-300">Combine compatible</b><span class="text-[10px] text-gray-400">Primary plus safe secondary notes</span></button>`
-            + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id)}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection</b><span class="text-[10px] text-gray-400">Pick notes directly from either tab</span></button></div>`;
+    const resolutionButtons = `<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">`
+        + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-3 rounded-lg border text-sm ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Play ${_editorEscHtml(names.primary)} here</b><span class="text-xs text-gray-400">Use this track for the complete section</span>${repeatBadge}</button>`
+        + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-3 rounded-lg border text-sm ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Play ${_editorEscHtml(names.secondary)} here</b><span class="text-xs text-gray-400">Use this track for the complete section</span>${repeatBadge}</button>`
+        + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id) || group.resolution === 'custom'}" class="text-left px-3 py-3 rounded-lg border text-sm ${customDrafts.has(group.id) || group.resolution === 'custom' ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Mix notes manually</b><span class="text-xs text-gray-400">Advanced: choose notes from either track</span>${repeatBadge}</button></div>`;
     const splitMarkup = guided && group.splitPoints && group.splitPoints.length
-        ? `<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Split ${repeatContext?.grouped ? `all ${repeatContext.members.length} matching occurrences` : 'this block'} at a bar</summary><div class="flex flex-wrap gap-1 mt-2">${group.splitPoints.map(point => `<button type="button" data-guided-split-beat="${point.beat}" class="px-2 py-1 rounded border border-gray-600 bg-dark-700 hover:border-gray-400">${_editorEscHtml(point.label)}</button>`).join('')}</div></details>`
+        ? `<div><b class="text-gray-300">Divide this review section at a bar</b><p class="mt-0.5">Use this if the musical part changes inside the highlighted area.</p><div class="flex flex-wrap gap-1 mt-2">${group.splitPoints.map(point => `<button type="button" data-guided-split-beat="${point.beat}" class="px-2 py-1 rounded border border-gray-600 bg-dark-700 hover:border-gray-400">${_editorEscHtml(point.label)}</button>`).join('')}</div></div>`
         : '';
     const decisionNumber = repeatContext ? repeatContext.groupIndex + 1 : activeConflictIndex + 1;
     const decisionTotal = repeatContext ? repeatContext.groups.length : plan.conflicts.length;
@@ -513,27 +550,25 @@ function renderConflict(plan) {
         : group.resolution || customDrafts.has(group.id);
     return `<section class="rounded border ${resolvedClass} bg-dark-800/70 p-3">`
         + `<div class="flex flex-wrap items-start justify-between gap-3 mb-3">`
-        + `<div><div class="flex flex-wrap items-center gap-2"><h4 class="text-sm font-semibold">${guided ? 'Review decision' : 'Conflict'} ${decisionNumber} of ${decisionTotal}</h4>`
-        + `<span class="rounded-full px-2 py-0.5 text-[10px] ${stateClass}">${stateLabel}</span>`
-        + `<span class="text-[10px] text-gray-500">${unresolved} ${guided ? 'decisions left' : 'unresolved'}</span></div>`
-        + `<p class="text-[11px] text-gray-400 mt-1">${_editorEscHtml(rangeLabel)}</p></div>`
-        + `<div class="flex flex-wrap gap-1"><button type="button" id="editor-composite-edit-settings" class="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 rounded text-xs">Edit setup</button>`
-        + `<button type="button" id="editor-composite-prev" aria-label="Previous review decision" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${decisionNumber <= 1 ? 'disabled' : ''}>←</button>`
-        + `<button type="button" id="editor-composite-next" aria-label="Next review decision" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${decisionNumber >= decisionTotal ? 'disabled' : ''}>→</button></div></div>`
+        + `<div><div class="flex flex-wrap items-center gap-2"><h4 class="text-base font-semibold">Section ${decisionNumber} of ${decisionTotal}</h4>`
+        + `<span class="rounded-full px-2 py-0.5 text-xs ${stateClass}">${stateLabel}</span>`
+        + `<span class="text-xs text-gray-400">${unresolved} left</span></div>`
+        + `<p class="text-xs text-gray-300 mt-1">${_editorEscHtml(rangeLabel)}</p></div>`
+        + `<div class="flex flex-wrap gap-1"><button type="button" id="editor-composite-edit-settings" class="px-2.5 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs">Back and adjust</button>`
+        + `<button type="button" id="editor-composite-prev" aria-label="Previous review section" class="px-2.5 py-1.5 bg-dark-700 rounded text-xs disabled:opacity-40" ${decisionNumber <= 1 ? 'disabled' : ''}>← Previous</button>`
+        + `<button type="button" id="editor-composite-next" aria-label="Next review section" class="px-2.5 py-1.5 bg-dark-700 rounded text-xs disabled:opacity-40" ${decisionNumber >= decisionTotal ? 'disabled' : ''}>Next →</button></div></div>`
         + guidedOccurrenceMarkup(repeatContext, group)
         + renderPreviewControls(view)
         + `<div class="overflow-x-auto rounded-xl border border-gray-700/70 bg-slate-950">${renderCompositeConflictTabSvg(view)}</div>`
-        + `<div class="mt-3 rounded-lg border ${guided ? 'border-amber-800/40 bg-amber-950/20' : 'border-red-800/40 bg-red-950/20'} px-3 py-2">`
-        + `<div class="text-[10px] uppercase tracking-wide ${guided ? 'text-amber-300' : 'text-red-300'} font-semibold">${guided ? 'Why this block needs review' : 'Why this needs a choice'}</div>`
-        + `<p class="text-xs text-gray-200 mt-1">${_editorEscHtml(view.explanation)}</p>${renderCompositeDifferenceTable(view)}</div>`
-        + `<div class="mt-3"><div class="text-[10px] uppercase tracking-wide text-gray-500 mb-1.5">Build the merged result</div>`
+        + `<details class="mt-3 rounded-lg border border-gray-700 bg-dark-900/50 px-3 py-2 text-xs"><summary class="cursor-pointer text-gray-300 hover:text-white">Why does this section need review?</summary>`
+        + `<p class="text-xs text-gray-200 mt-2">${_editorEscHtml(view.explanation)}</p>${renderCompositeDifferenceTable(view)}</details>`
+        + `<div class="mt-3"><div class="text-xs font-semibold text-gray-300 mb-1.5">Choose what to play</div>`
         + `${resolutionButtons}</div>${customMarkup(group)}`
-        + `<div class="flex flex-wrap justify-between items-center gap-2 mt-3 pt-3 border-t border-gray-700">`
-        + `<div class="space-y-2">${splitMarkup}<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">`
+        + `<details class="mt-3 text-xs text-gray-400"><summary class="cursor-pointer hover:text-gray-200">More options and technical details</summary><div class="space-y-3 mt-2">${splitMarkup}<details class="text-xs text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">`
         + `<div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b><ul>${group.primaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div>`
-        + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div></div></details></div>`
-        + `<div class="flex gap-2"><button type="button" id="editor-composite-reset-choice" class="px-2.5 py-1.5 rounded bg-dark-700 hover:bg-dark-600 text-xs disabled:opacity-40" ${canReset ? '' : 'disabled'}>Reset ${repeatContext?.grouped ? 'group ' : ''}choice</button>`
-        + `<button type="button" id="editor-composite-apply-next" class="px-3 py-1.5 rounded bg-accent hover:bg-accent-light text-xs font-medium disabled:opacity-40" ${group.resolution ? '' : 'disabled'}>Apply &amp; Next →</button></div></div></section>`;
+        + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div></div></details></div></details>`
+        + `<div class="sticky bottom-0 flex flex-wrap justify-end gap-2 mt-3 p-3 border border-gray-700 rounded-lg bg-dark-800/95 shadow-lg"><button type="button" id="editor-composite-reset-choice" class="px-3 py-2 rounded bg-dark-700 hover:bg-dark-600 text-sm disabled:opacity-40" ${canReset ? '' : 'disabled'}>Clear choice</button>`
+        + `<button type="button" id="editor-composite-apply-next" class="px-4 py-2 rounded bg-accent hover:bg-accent-light text-sm font-medium disabled:opacity-40" ${group.resolution ? '' : 'disabled'}>Confirm choice &amp; continue →</button></div></section>`;
 }
 
 function bindResultEvents() {
@@ -690,6 +725,49 @@ function bindResultEvents() {
     });
 }
 
+export function _compositeAutomaticSummaryPure(stats = {}, names = {}) {
+    const base = String(names.primary || 'Base track');
+    const fill = String(names.secondary || 'Fill track');
+    const added = Math.max(0, Number(stats.secondaryAddedCleanly) || 0);
+    const skipped = Math.max(0, Number(stats.secondarySkippedByStrategy) || 0);
+    return {
+        title: 'Ready to create',
+        description: `${base} stays unchanged. ${added} ${fill} ${added === 1 ? 'note was' : 'notes were'} added in safe gaps. ${skipped} ${fill} ${skipped === 1 ? 'note was' : 'notes were'} left out because ${skipped === 1 ? 'it was' : 'they were'} too close to ${base}.`,
+        added,
+        skipped,
+    };
+}
+
+function renderAutomaticOverview(plan, names) {
+    const all = [...(plan.sourceEntries?.primary || []), ...(plan.sourceEntries?.secondary || [])];
+    if (!all.length) return '';
+    const start = Math.min(...all.map(entry => entry.startBeat));
+    const end = Math.max(start + 1, ...all.map(entryLastBeat));
+    const additions = plan.fixedEntries.filter(entry => entry.source === 'secondary').map(entry => {
+        const left = ((entry.startBeat - start) / (end - start)) * 100;
+        const width = Math.max(0.25, ((entryLastBeat(entry) - entry.startBeat) / (end - start)) * 100);
+        return `<span class="absolute inset-y-0 rounded bg-violet-400" style="left:${left}%;width:${width}%" title="Added from ${_editorEscHtml(names.secondary)}"></span>`;
+    }).join('');
+    return `<div class="rounded-lg border border-gray-700 bg-dark-900/60 px-3 py-3 mb-3" aria-label="Where fill-track notes were added">`
+        + `<div class="flex flex-wrap justify-between gap-2 text-xs mb-2"><b class="text-gray-200">Where notes were added</b><span class="text-gray-400"><span aria-hidden="true" class="text-violet-300">●</span> ${_editorEscHtml(names.secondary)} added to the hybrid</span></div>`
+        + `<div class="relative h-5 rounded bg-sky-950/70 border border-sky-900 overflow-hidden">${additions}</div>`
+        + `<p class="text-xs text-gray-500 mt-1.5">The full bar represents the song. Colored marks show the safe gaps that received notes.</p></div>`;
+}
+
+function renderAutomaticResult(plan, names, normalizationDetails) {
+    const summary = _compositeAutomaticSummaryPure(plan.stats, names);
+    const preview = wholePlanPreviewView();
+    return `<section class="max-w-5xl mx-auto">`
+        + `<div class="rounded-xl border border-emerald-700/50 bg-emerald-950/20 p-5 mb-3">`
+        + `<div class="flex flex-wrap items-start justify-between gap-3"><div><b class="block text-lg text-emerald-100">${summary.title}</b>`
+        + `<p class="text-sm text-gray-200 mt-1 max-w-3xl">${_editorEscHtml(summary.description)}</p></div>`
+        + `<button type="button" id="editor-composite-edit-settings" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm text-gray-200">Back and adjust</button></div></div>`
+        + renderAutomaticOverview(plan, names)
+        + renderPreviewControls(preview, true)
+        + normalizationDetails
+        + `<p class="text-sm text-gray-400 mt-3">When the preview sounds right, choose <b class="text-gray-200">Create Hybrid Track</b> below. Your original tracks will remain unchanged.</p></section>`;
+}
+
 function renderResult() {
     if (activePreviewMode) endCompositePreviewPlayback();
     const result = byId('editor-composite-result');
@@ -700,36 +778,39 @@ function renderResult() {
     const unresolved = activePlan.strategy === 'guided'
         ? stats.unresolvedReviewDecisions : unresolvedBlocks;
     const normalized = stats.timingAdjustments || 0;
-    const normalizationNotice = normalized ? `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-[11px] text-sky-100">`
-        + `<b>${normalized} tiny imported note ${normalized === 1 ? 'boundary was' : 'boundaries were'} normalized</b> within the tempo-aware ${Math.round(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS * 1000)} ms safety limit. `
-        + `Only the new composite will use the trimmed trail; both source tracks remain unchanged.</div>` : '';
+    const normalizationNotice = normalized ? `<details class="mb-3 rounded border border-gray-700 bg-dark-900/50 px-3 py-2 text-xs text-gray-400">`
+        + `<summary class="cursor-pointer hover:text-gray-200">Technical details: ${normalized} tiny import timing ${normalized === 1 ? 'seam was' : 'seams were'} cleaned up</summary>`
+        + `<p class="mt-2">The cleanup stayed within the tempo-aware ${Math.round(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS * 1000)} ms safety limit. Only the new hybrid uses the adjusted trail; both original tracks remain unchanged.</p></details>` : '';
     const repeatNotice = activePlan.repeatNotice;
     let repeatNoticeMarkup = '';
     if (repeatNotice && (repeatNotice.requested > 1 || repeatNotice.kind !== 'applied')) {
         if (repeatNotice.kind === 'partial') {
             const failures = repeatNotice.failed.map(failure => `${failure.label}: ${failure.error}`).join(' ');
-            repeatNoticeMarkup = `<div class="mb-3 rounded border border-amber-700/60 bg-amber-950/25 px-3 py-2 text-[11px] text-amber-100"><b>Applied to ${repeatNotice.applied} of ${repeatNotice.requested} matching occurrences.</b> ${repeatNotice.failed.length} exceptional occurrence${repeatNotice.failed.length === 1 ? '' : 's'} remains for individual review. ${_editorEscHtml(failures)}</div>`;
+            repeatNoticeMarkup = `<div class="mb-3 rounded border border-amber-700/60 bg-amber-950/25 px-3 py-2 text-xs text-amber-100"><b>Your choice worked in ${repeatNotice.applied} of ${repeatNotice.requested} matching sections.</b> ${repeatNotice.failed.length} ${repeatNotice.failed.length === 1 ? 'section needs' : 'sections need'} a separate choice because the surrounding notes differ. ${_editorEscHtml(failures)}</div>`;
         } else if (repeatNotice.kind === 'detached') {
-            repeatNoticeMarkup = `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-[11px] text-sky-100"><b>${_editorEscHtml(repeatNotice.label)} is now reviewed separately.</b></div>`;
+            repeatNoticeMarkup = `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-xs text-sky-100"><b>${_editorEscHtml(repeatNotice.label)} can now have its own choice.</b></div>`;
         } else {
-            repeatNoticeMarkup = `<div class="mb-3 rounded border border-emerald-800/50 bg-emerald-950/20 px-3 py-2 text-[11px] text-emerald-100"><b>Choice applied to all ${repeatNotice.applied} matching occurrences.</b> Each kept its own automatic shared notes and passed its own transition validation.</div>`;
+            repeatNoticeMarkup = `<div class="mb-3 rounded border border-emerald-800/50 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-100"><b>Your choice was used in all ${repeatNotice.applied} matching sections.</b> Each section passed its own playability check.</div>`;
         }
     }
-    const statCards = activePlan.strategy === 'guided'
-        ? `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryNotes}</b>secondary notes</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates collapsed</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.reviewDecisions}</b>review decisions <span class="block text-[9px] text-gray-500">${stats.decisionBlocks} occurrences</span></div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-amber-300' : 'text-emerald-300'}">${unresolved}</b>decisions left</div>`
-        : `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryAddedCleanly}</b>clean additions</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates removed</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondarySkippedByStrategy}</b>strategy skips</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-red-300' : 'text-emerald-300'}">${unresolved}</b>unresolved</div>`;
-    result.innerHTML = `<div class="grid gap-2 mb-3 text-center text-[11px]" style="grid-template-columns:repeat(5,minmax(0,1fr))">${statCards}</div>`
-        + normalizationNotice + repeatNoticeMarkup + renderOverview(activePlan) + renderConflict(activePlan);
+    const names = selectedSourceNames();
+    if (activePlan.strategy !== 'guided') {
+        result.innerHTML = renderAutomaticResult(activePlan, names, normalizationNotice);
+    } else {
+        const occurrences = Math.max(stats.reviewDecisions || 0, stats.decisionBlocks || 0);
+        const groupedText = occurrences > (stats.reviewDecisions || 0)
+            ? ` across ${occurrences} song sections` : '';
+        result.innerHTML = `<div class="mb-3 rounded-lg border border-gray-700 bg-dark-900/60 px-3 py-2 flex flex-wrap items-center justify-between gap-2">`
+            + `<div><b class="text-sm text-gray-100">${stats.reviewDecisions} ${stats.reviewDecisions === 1 ? 'choice' : 'choices'}${groupedText}</b>`
+            + `<p class="text-xs text-gray-400">Choose which part you want to play in each different section.</p></div>`
+            + `<b class="text-sm ${unresolved ? 'text-amber-300' : 'text-emerald-300'}">${unresolved ? `${unresolved} left` : 'All choices complete ✓'}</b></div>`
+            + normalizationNotice + repeatNoticeMarkup + renderOverview(activePlan) + renderConflict(activePlan);
+    }
     const finish = byId('editor-composite-finish');
-    if (finish) finish.disabled = unresolvedBlocks > 0;
+    if (finish) {
+        finish.hidden = false;
+        finish.disabled = unresolvedBlocks > 0;
+    }
     bindResultEvents();
 }
 
@@ -737,7 +818,7 @@ function analyzeFromDialog() {
     restoreCompositePreviewSession();
     const primaryIndex = Number(byId('editor-composite-primary')?.value);
     const secondaryIndex = Number(byId('editor-composite-secondary')?.value);
-    const strategy = byId('editor-composite-strategy')?.value || 'gap-fill';
+    const strategy = selectedCompositeStrategy();
     const repeatMode = normalizeGuidedRepeatMode(byId('editor-composite-repeat-mode')?.value);
     const gapFill = gapFillOptionsFromDialog();
     if (strategy === 'gap-fill') {
@@ -754,7 +835,7 @@ function analyzeFromDialog() {
     const error = byId('editor-composite-error');
     if (primaryIndex === secondaryIndex) {
         if (error) error.textContent = 'Choose two different source tracks.';
-        resetResult('The primary and secondary source must be different.');
+        resetResult('The base track and fill track must be different.');
         return;
     }
     const sources = {
@@ -767,7 +848,7 @@ function analyzeFromDialog() {
         : analyzeCompositeMerge({ ...sources, strategy: 'gap-fill', gapFill });
     if (!plan.ok) {
         if (error) error.textContent = plan.compatibility.errors.join(' ');
-        resetResult('The selected arrangements are not merge-compatible.');
+        resetResult('These tracks cannot be combined. Check that they use the same instrument, tuning, string count, and capo.');
         return;
     }
     if (error) error.textContent = '';
@@ -828,12 +909,12 @@ async function finishMerge() {
     if (!activePlan) return;
     const unresolved = activePlan.conflicts.filter(c => !c.resolution);
     if (unresolved.length) {
-        if (error) error.textContent = `Resolve ${unresolved.length} remaining conflict(s).`;
+        if (error) error.textContent = `Finish the ${unresolved.length} remaining ${unresolved.length === 1 ? 'choice' : 'choices'} first.`;
         return;
     }
     const name = String(byId('editor-composite-name')?.value || '').trim();
     if (!name) {
-        if (error) error.textContent = 'Enter a name for the composite track.';
+        if (error) error.textContent = 'Enter a name for the new Hybrid Track.';
         return;
     }
     const duplicateName = S.arrangements.some(arr => String(arr && arr.name || '').trim().toLowerCase() === name.toLowerCase());
@@ -850,7 +931,7 @@ async function finishMerge() {
     }
     const finish = byId('editor-composite-finish');
     if (finish) finish.disabled = true;
-    if (error) error.textContent = 'Registering the new arrangement…';
+    if (error) error.textContent = 'Creating the new Hybrid Track…';
     try {
         const response = await fetch('/api/plugins/editor/add-arrangement', {
             method: 'POST',
@@ -860,11 +941,10 @@ async function finishMerge() {
         const data = await response.json().catch(() => ({}));
         if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
         S.history.exec(new CreateCompositeArrangementCmd(arrangement));
-        const summary = activePlan.stats;
         editorHideCompositeArrangementModal();
-        setStatus(`Created “${name}”: ${arrangement.notes.length} notes, ${summary.duplicatesRemoved} duplicate${summary.duplicatesRemoved === 1 ? '' : 's'} removed. Save to commit.`);
+        setStatus(`Created Hybrid Track “${name}” with ${arrangement.notes.length} notes. Save the song when you are ready.`);
     } catch (cause) {
-        if (error) error.textContent = `Could not add the arrangement: ${cause.message}`;
+        if (error) error.textContent = `Could not create the Hybrid Track: ${cause.message}`;
         if (finish) finish.disabled = false;
     }
 }
@@ -878,12 +958,12 @@ export function editorHideCompositeArrangementModal() {
 export function editorShowCompositeArrangementModal() {
     editorHideCompositeArrangementModal();
     if (!S.sessionId || S.format !== 'sloppak') {
-        setStatus('Composite arrangements require an open feedpak project.');
+        setStatus('Open a song project before creating a Hybrid Track.');
         return false;
     }
     const sources = _compositeEligibleSourcesPure(S.arrangements);
     if (sources.length < 2) {
-        setStatus('Add at least two guitar or bass tracks before creating a composite.');
+        setStatus('A Hybrid Track needs at least two guitar or bass tracks.');
         return false;
     }
     const primary = sources.some(source => source.index === S.currentArr)
@@ -899,29 +979,33 @@ export function editorShowCompositeArrangementModal() {
     modal.id = 'editor-composite-modal';
     modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4';
     modal.innerHTML = `<div class="max-w-full flex flex-col rounded-xl border border-gray-600 bg-dark-800 shadow-2xl" style="width:min(90rem, calc(100vw - 2rem));height:min(54rem, calc(100vh - 2rem))" role="dialog" aria-modal="true" aria-labelledby="editor-composite-title">`
-        + `<header class="flex items-start justify-between gap-4 border-b border-gray-700 px-5 py-3"><div><h3 id="editor-composite-title" class="text-base font-semibold">Create Composite Arrangement</h3>`
-        + `<p class="text-xs text-gray-400 mt-0.5">Combine two synchronized fretted tracks. Both sources stay unchanged.</p></div>`
+        + `<header class="flex items-start justify-between gap-4 border-b border-gray-700 px-5 py-3"><div><h3 id="editor-composite-title" class="text-lg font-semibold">Create a Hybrid Guitar Track</h3>`
+        + `<p class="text-sm text-gray-400 mt-0.5">Combine two synchronized guitar or bass parts into one playable track. Your original tracks stay unchanged.</p></div>`
         + `<button type="button" id="editor-composite-close" class="text-gray-400 hover:text-white text-xl leading-none" aria-label="Close">×</button></header>`
-        + `<div id="editor-composite-workspace" class="grid min-h-0 flex-1 overflow-hidden" style="grid-template-columns:18rem minmax(0,1fr)">`
-        + `<aside id="editor-composite-setup" class="border-r border-gray-700 p-4 space-y-3 overflow-y-auto">`
-        + `<label class="block text-xs text-gray-300">Primary track<select id="editor-composite-primary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
-        + `<label class="block text-xs text-gray-300">Secondary track<select id="editor-composite-secondary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
-        + `<label class="block text-xs text-gray-300">Hybrid mode<select id="editor-composite-strategy" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="gap-fill">Quick Hybrid — fill primary rests</option><option value="guided">Guided Hybrid — choose musical blocks</option></select></label>`
-        + `<fieldset id="editor-composite-guided-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Guided repetition review</legend>`
-        + `<label class="block text-xs text-gray-300">Repeated material<select id="editor-composite-repeat-mode" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="${GUIDED_REPEAT_MODE_EVERY}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_EVERY ? ' selected' : ''}>Review every occurrence</option><option value="${GUIDED_REPEAT_MODE_MATCHING}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_MATCHING ? ' selected' : ''}>Group matching repetitions</option></select></label>`
-        + `<p class="text-[10px] text-gray-500">Matching compares the Lead/Rhythm material you choose between. Automatic notes shared by both tracks may differ; each occurrence keeps its own and receives its own safety check.</p></fieldset>`
-        + `<fieldset id="editor-composite-gap-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Gap Fill safety</legend>`
-        + `<label class="block text-xs text-gray-300">Timing unit<select id="editor-composite-gap-unit" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="beats"${gapFillUnit === 'beats' ? ' selected' : ''}>Beats — follows song tempo</option><option value="seconds"${gapFillUnit === 'seconds' ? ' selected' : ''}>Seconds — fixed real time</option></select></label>`
-        + `<label class="block text-xs text-gray-300"><span id="editor-composite-min-gap-label">Minimum usable gap (${gapFillUnit})</span><input id="editor-composite-min-gap" type="number" min="0" value="${gapFillValues.minimumGap}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
-        + `<label class="block text-xs text-gray-300"><span id="editor-composite-margin-label">Transition margin each side (${gapFillUnit})</span><input id="editor-composite-margin" type="number" min="0" value="${gapFillValues.transitionMargin}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
-        + `<p class="text-[10px] text-gray-500">Every complete note, chord, trail, and connected gesture must fit inside the protected gap.</p></fieldset>`
-        + `<label class="block text-xs text-gray-300">New track name<input id="editor-composite-name" maxlength="60" value="${_editorEscHtml(name)}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
-        + `<button type="button" id="editor-composite-analyze" class="w-full px-3 py-2 rounded bg-accent hover:bg-accent-light text-xs font-medium">Analyze merge</button>`
-        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Quick Hybrid</b> adds complete secondary gestures only inside protected primary rests. <b class="text-gray-300">Guided Hybrid</b> skips identical and unambiguous material, then asks you to choose only where both arrangements differ. Matching-repetition mode reuses one review when the selectable Lead/Rhythm material repeats.</div>`
-        + `</aside><main class="p-4 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-xs text-gray-400">Choose two source tracks and analyze the merge.</p></div></main></div>`
-        + `<footer class="border-t border-gray-700 px-5 py-3 flex items-center gap-3"><div id="editor-composite-error" class="text-xs text-red-300 flex-1"></div>`
-        + `<button type="button" id="editor-composite-cancel" class="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs">Cancel</button>`
-        + `<button type="button" id="editor-composite-finish" disabled class="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded text-xs font-medium disabled:opacity-40 disabled:cursor-not-allowed">Finish Merge</button></footer></div>`;
+        + `<div id="editor-composite-workspace" class="grid min-h-0 flex-1 overflow-hidden" style="grid-template-columns:minmax(0,1fr)">`
+        + `<section id="editor-composite-setup" class="p-5 overflow-y-auto"><div class="max-w-5xl mx-auto space-y-5">`
+        + `<section><h4 class="text-base font-semibold">1. Choose the two tracks</h4><p class="text-sm text-gray-400 mt-1">The base track is kept. The fill track supplies the extra or alternative parts.</p>`
+        + `<div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">`
+        + `<label class="block rounded-lg border border-sky-800/60 bg-sky-950/20 p-3 text-sm text-sky-100"><b>Base track — always kept</b><select id="editor-composite-primary" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm">${sources.map(optionMarkup).join('')}</select></label>`
+        + `<label class="block rounded-lg border border-violet-800/60 bg-violet-950/20 p-3 text-sm text-violet-100"><b>Fill track</b><select id="editor-composite-secondary" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm">${sources.map(optionMarkup).join('')}</select></label></div></section>`
+        + `<fieldset><legend class="text-base font-semibold">2. Choose how to build the hybrid</legend><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">`
+        + `<label data-composite-mode-card="gap-fill" class="cursor-pointer rounded-xl border border-accent bg-sky-950/25 p-4 hover:border-sky-400"><span class="flex items-start gap-3"><input type="radio" name="editor-composite-strategy" value="gap-fill" checked class="mt-1 accent-accent"><span><b class="block text-base text-white">Automatic</b><span class="block text-sm text-gray-300 mt-1">Keep the base track and add fill-track notes only where the complete notes and trails fit safely.</span><span class="block text-xs text-emerald-300 mt-2">Fastest · no section-by-section choices</span></span></span></label>`
+        + `<label data-composite-mode-card="guided" class="cursor-pointer rounded-xl border border-gray-600 bg-dark-700/50 p-4 hover:border-violet-400"><span class="flex items-start gap-3"><input type="radio" name="editor-composite-strategy" value="guided" class="mt-1 accent-accent"><span><b class="block text-base text-white">Review sections yourself</b><span class="block text-sm text-gray-300 mt-1">The song is divided into musical sections. Choose the base track, fill track, or a manual mix where they differ.</span><span class="block text-xs text-violet-300 mt-2">More control · repeated riffs can share one choice</span></span></span></label>`
+        + `</div></fieldset>`
+        + `<section id="editor-composite-guided-controls" hidden class="rounded-lg border border-gray-700 bg-dark-900/50 p-4"><h4 class="text-sm font-semibold">Repeated riffs</h4>`
+        + `<label class="block text-sm text-gray-300 mt-2">How should repeated sections be reviewed?<select id="editor-composite-repeat-mode" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"><option value="${GUIDED_REPEAT_MODE_MATCHING}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_MATCHING ? ' selected' : ''}>Review matching riffs once (recommended)</option><option value="${GUIDED_REPEAT_MODE_EVERY}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_EVERY ? ' selected' : ''}>Review every occurrence separately</option></select></label>`
+        + `<p class="text-xs text-gray-400 mt-2">When the same playable riff appears again, one choice can be reused. Every copy still gets its own playability check.</p></section>`
+        + `<details id="editor-composite-gap-controls" class="rounded-lg border border-gray-700 bg-dark-900/50 p-4"><summary class="cursor-pointer text-sm font-semibold hover:text-white">Advanced safety settings</summary>`
+        + `<div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3"><label class="block text-sm text-gray-300">Timing unit<select id="editor-composite-gap-unit" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"><option value="beats"${gapFillUnit === 'beats' ? ' selected' : ''}>Beats — follows song tempo</option><option value="seconds"${gapFillUnit === 'seconds' ? ' selected' : ''}>Seconds — fixed real time</option></select></label>`
+        + `<label class="block text-sm text-gray-300"><span id="editor-composite-min-gap-label">Smallest gap to fill (${gapFillUnit})</span><input id="editor-composite-min-gap" type="number" min="0" value="${gapFillValues.minimumGap}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"></label>`
+        + `<label class="block text-sm text-gray-300"><span id="editor-composite-margin-label">Extra space before and after (${gapFillUnit})</span><input id="editor-composite-margin" type="number" min="0" value="${gapFillValues.transitionMargin}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"></label></div>`
+        + `<p class="text-xs text-gray-400 mt-2">A fill-track note is added only when its entire chord, trail, and connected technique fit between base-track parts.</p></details>`
+        + `<section class="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end"><label class="block text-sm text-gray-300"><b>3. Name the new track</b><input id="editor-composite-name" maxlength="60" value="${_editorEscHtml(name)}" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"></label>`
+        + `<button type="button" id="editor-composite-analyze" class="px-5 py-2.5 rounded bg-accent hover:bg-accent-light text-sm font-medium">Preview automatic hybrid</button></section>`
+        + `</div></section><main id="editor-composite-result-workspace" hidden class="p-4 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-sm text-gray-400">Choose two tracks and how you want to build the hybrid.</p></div></main></div>`
+        + `<footer class="border-t border-gray-700 px-5 py-3 flex items-center gap-3"><div id="editor-composite-error" class="text-sm text-red-300 flex-1" role="alert" aria-live="polite"></div>`
+        + `<button type="button" id="editor-composite-cancel" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm">Cancel</button>`
+        + `<button type="button" id="editor-composite-finish" hidden disabled class="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 rounded text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed">Create Hybrid Track</button></footer></div>`;
     (document.querySelector('.editor-root') || document.body).appendChild(modal);
     byId('editor-composite-primary').value = String(primary);
     byId('editor-composite-secondary').value = String(secondary);
@@ -929,16 +1013,27 @@ export function editorShowCompositeArrangementModal() {
     byId('editor-composite-cancel').addEventListener('click', editorHideCompositeArrangementModal);
     byId('editor-composite-analyze').addEventListener('click', analyzeFromDialog);
     byId('editor-composite-finish').addEventListener('click', finishMerge);
-    const strategySelect = byId('editor-composite-strategy');
+    const strategyInputs = [...document.querySelectorAll('input[name="editor-composite-strategy"]')];
     const unitSelect = byId('editor-composite-gap-unit');
     const repeatModeSelect = byId('editor-composite-repeat-mode');
     let currentGapFillUnit = gapFillUnit;
-    const syncGapControls = () => {
-        const gapDisabled = strategySelect?.value !== 'gap-fill';
-        for (const input of [unitSelect, byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
-            if (input) input.disabled = gapDisabled;
+    const syncModeControls = () => {
+        const strategy = selectedCompositeStrategy();
+        const guidedControls = byId('editor-composite-guided-controls');
+        const gapControls = byId('editor-composite-gap-controls');
+        if (guidedControls) guidedControls.hidden = strategy !== 'guided';
+        if (gapControls) gapControls.hidden = strategy !== 'gap-fill';
+        for (const card of document.querySelectorAll('[data-composite-mode-card]')) {
+            const selected = card.dataset.compositeModeCard === strategy;
+            card.classList.toggle('border-accent', selected);
+            card.classList.toggle('border-gray-600', !selected);
+            card.classList.toggle('bg-sky-950/25', selected && strategy === 'gap-fill');
+            card.classList.toggle('bg-violet-950/20', selected && strategy === 'guided');
+            card.classList.toggle('bg-dark-700/50', !selected);
         }
-        if (repeatModeSelect) repeatModeSelect.disabled = strategySelect?.value !== 'guided';
+        const analyze = byId('editor-composite-analyze');
+        if (analyze) analyze.textContent = strategy === 'guided'
+            ? 'Find sections to review' : 'Preview automatic hybrid';
     };
     const rememberCurrentGapFillValues = () => {
         const options = gapFillOptionsFromDialog(currentGapFillUnit);
@@ -949,16 +1044,19 @@ export function editorShowCompositeArrangementModal() {
         };
         saveCompositeGapFillPreferences(gapFillPreferences);
     };
-    for (const control of [byId('editor-composite-primary'), byId('editor-composite-secondary'), strategySelect]) {
+    for (const control of [byId('editor-composite-primary'), byId('editor-composite-secondary')]) {
         control.addEventListener('change', () => {
-            syncGapControls();
-            resetResult('Sources or merge settings changed. Analyze the merge again.');
+            resetResult('The selected tracks changed. Build the preview again when you are ready.');
         });
     }
+    for (const input of strategyInputs) input.addEventListener('change', () => {
+        syncModeControls();
+        resetResult('The building method changed. Continue with the settings shown below.');
+    });
     repeatModeSelect.addEventListener('change', () => {
         guidedPreferences.repeatMode = normalizeGuidedRepeatMode(repeatModeSelect.value);
         saveCompositeGuidedPreferences(guidedPreferences);
-        resetResult('Guided repetition review changed. Analyze the merge again.');
+        resetResult('The repeated-riff setting changed. Find the review sections again when you are ready.');
     });
     unitSelect.addEventListener('change', () => {
         rememberCurrentGapFillValues();
@@ -966,16 +1064,16 @@ export function editorShowCompositeArrangementModal() {
         gapFillPreferences.unit = currentGapFillUnit;
         applyGapFillUnitToDialog(currentGapFillUnit, gapFillPreferences[currentGapFillUnit]);
         saveCompositeGapFillPreferences(gapFillPreferences);
-        resetResult('Gap Fill timing unit changed. Analyze the merge again.');
+        resetResult('The timing unit changed. Preview the automatic hybrid again when you are ready.');
     });
     for (const input of [byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
         input.addEventListener('change', () => {
             rememberCurrentGapFillValues();
-            resetResult('Gap Fill safety settings changed. Analyze the merge again.');
+            resetResult('The safety settings changed. Preview the automatic hybrid again when you are ready.');
         });
     }
     applyGapFillUnitToDialog(gapFillUnit, gapFillValues);
-    syncGapControls();
+    syncModeControls();
     _installModalKeyboard(modal, modal.firstElementChild, editorHideCompositeArrangementModal);
     byId('editor-composite-primary').focus();
     return true;

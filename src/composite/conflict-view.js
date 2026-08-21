@@ -1,4 +1,4 @@
-/* Composite conflict visualization.
+/* Hybrid-track review visualization.
  *
  * Converts a DOM-free merge plan into the three synchronized tab lanes used by
  * the resolver.  Keeping the view model and SVG generation pure makes the
@@ -212,12 +212,12 @@ function propertyDifferences(conflict) {
 function conflictExplanation(conflict, names, stringCount) {
     if ((conflict.reasons || []).includes('guided-choice')) {
         if ((conflict.reasons || []).includes('transition')) {
-            return `The complete ${names.primary} and ${names.secondary} gestures cross this block boundary. Choose the musical handoff; trails will never be clipped silently.`;
+            return `Notes or trails cross the edge of this section. Choose which track should play through the handoff; no trail will be cut off.`;
         }
         const common = Math.max(0, Math.trunc(finite(conflict.commonCount)));
         const commonText = common
             ? ` ${common} identical ${common === 1 ? 'note is' : 'notes are'} already included once.` : '';
-        return `Both tracks contain different playable material in this block.${commonText} Choose one arrangement or build a custom result.`;
+        return `Both tracks play different parts here.${commonText} Choose a track, or mix the notes yourself.`;
     }
     const pair = overlappingPair(conflict);
     if (!pair.primary || !pair.secondary) return 'These source notes require a choice.';
@@ -278,9 +278,9 @@ export function buildCompositeConflictViewModel({
         explanation: conflictExplanation(conflict, names, stringCount),
         differences: propertyDifferences(conflict),
         lanes: [
-            { id: 'primary', label: names.primary, subtitle: 'Lead / primary source', entries: primary },
-            { id: 'secondary', label: names.secondary, subtitle: 'Rhythm / secondary source', entries: secondary },
-            { id: 'result', label: 'Merged result', subtitle: conflict.resolution || custom ? 'Current choice' : 'Choose a resolution', entries: result },
+            { id: 'primary', label: names.primary, subtitle: 'Base track · always kept outside reviewed sections', entries: primary },
+            { id: 'secondary', label: names.secondary, subtitle: 'Fill track · alternative part for this section', entries: secondary },
+            { id: 'result', label: 'Hybrid result', subtitle: conflict.resolution || custom ? 'Your current choice' : 'Choose what to play here', entries: result },
         ],
     };
 }
@@ -395,19 +395,19 @@ export function renderCompositeConflictTabSvg(view) {
                 view.context, view.stringCount, plotLeft, plotWidth);
         }).join('');
         const noChoice = lane.id === 'result' && !view.conflict.resolution && !view.custom
-            ? `<text x="${(conflictX + conflictWidth / 2).toFixed(1)}" y="${laneY + 22}" text-anchor="middle" fill="#fca5a5" font-size="10">Choose a resolution</text>` : '';
+            ? `<text x="${(conflictX + conflictWidth / 2).toFixed(1)}" y="${laneY + 22}" text-anchor="middle" fill="#fcd34d" font-size="10">Choose what to play here</text>` : '';
         return `<g><rect x="8" y="${laneY}" width="${width - 16}" height="${laneHeight}" rx="10" fill="${colors.soft}" opacity="0.38" stroke="${colors.main}" stroke-opacity="0.38"/>`
             + `<rect x="${conflictX.toFixed(1)}" y="${laneY + 3}" width="${conflictWidth.toFixed(1)}" height="${laneHeight - 6}" rx="4" fill="#ef4444" opacity="0.14" stroke="#f87171" stroke-dasharray="4 3"/>`
             + `<text x="20" y="${laneY + 27}" fill="${colors.text}" font-size="13" font-weight="700">${escapeMarkup(lane.label)}</text>`
             + `<text x="20" y="${laneY + 44}" fill="#94a3b8" font-size="9">${escapeMarkup(lane.subtitle)}</text>`
             + strings.join('') + notes + noChoice + '</g>';
     }).join('');
-    const aria = `Three aligned tablature lanes for conflict ${view.conflictIndex + 1} of ${view.conflictCount}. ${view.explanation}`;
+    const aria = `Three aligned tablature lanes for review section ${view.conflictIndex + 1} of ${view.conflictCount}. ${view.explanation}`;
     return `<svg viewBox="0 0 ${width} ${height}" width="100%" role="img" aria-label="${escapeMarkup(aria)}" style="min-width:46rem">`
         + `<rect width="${width}" height="${height}" rx="12" fill="#0f172a"/>`
         + beatLines.join('') + measureLines + lanes
         + `<path d="M${conflictX.toFixed(1)} 28v8M${conflictEndX.toFixed(1)} 28v8M${conflictX.toFixed(1)} 32H${conflictEndX.toFixed(1)}" stroke="#f87171" stroke-width="2"/>`
-        + `<text x="${(conflictX + conflictWidth / 2).toFixed(1)}" y="27" text-anchor="middle" fill="#fca5a5" font-size="10" font-weight="700">CONFLICT</text>`
+        + `<text x="${(conflictX + conflictWidth / 2).toFixed(1)}" y="27" text-anchor="middle" fill="#fcd34d" font-size="10" font-weight="700">REVIEW</text>`
         + '</svg>';
 }
 

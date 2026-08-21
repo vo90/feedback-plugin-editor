@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
     _compositeEligibleSourcesPure,
+    _compositeAutomaticSummaryPure,
     _compositeGapFillPreferencesPure,
     _compositeGuidedPreferencesPure,
     _compositeUniqueNamePure,
@@ -46,7 +47,7 @@ test('composite Gap Fill preferences remember separate beat and second values', 
 
 test('Guided repetition preferences default safely and remember grouped review', () => {
     assert.deepEqual(_compositeGuidedPreferencesPure(null), {
-        repeatMode: 'every-occurrence',
+        repeatMode: 'matching-repetitions',
     });
     assert.deepEqual(_compositeGuidedPreferencesPure(JSON.stringify({
         repeatMode: 'matching-repetitions',
@@ -54,7 +55,19 @@ test('Guided repetition preferences default safely and remember grouped review',
         repeatMode: 'matching-repetitions',
     });
     assert.deepEqual(_compositeGuidedPreferencesPure('{broken'), {
-        repeatMode: 'every-occurrence',
+        repeatMode: 'matching-repetitions',
+    });
+});
+
+test('automatic result summary uses player-facing track names and outcomes', () => {
+    assert.deepEqual(_compositeAutomaticSummaryPure({
+        secondaryAddedCleanly: 1,
+        secondarySkippedByStrategy: 2,
+    }, { primary: 'Lead', secondary: 'Rhythm' }), {
+        title: 'Ready to create',
+        description: 'Lead stays unchanged. 1 Rhythm note was added in safe gaps. 2 Rhythm notes were left out because they were too close to Lead.',
+        added: 1,
+        skipped: 2,
     });
 });
 
