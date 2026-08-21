@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
     analyzeCompositeMerge,
     COMPOSITE_GAP_FILL_DEFAULTS,
+    compositeGapFillDefaultsForUnit,
     compositeCompatibility,
     materializeCompositeArrangement,
     normalizeCompositeGapFillOptions,
@@ -102,10 +103,16 @@ test('gap fill treats coincident zero-sustain attacks as primary activity', () =
 
 test('gap fill defaults are normalized and bounded', () => {
     assert.deepEqual(normalizeCompositeGapFillOptions(), COMPOSITE_GAP_FILL_DEFAULTS);
+    assert.deepEqual(compositeGapFillDefaultsForUnit('seconds'), {
+        unit: 'seconds', minimumGap: 0.5, transitionMargin: 0.125,
+    });
     assert.deepEqual(normalizeCompositeGapFillOptions({
         minimumGapBeats: -2,
         transitionMarginBeats: 99,
-    }), { minimumGapBeats: 0, transitionMarginBeats: 8 });
+    }), { unit: 'beats', minimumGap: 0, transitionMargin: 8 });
+    assert.deepEqual(normalizeCompositeGapFillOptions({
+        unit: 'seconds', minimumGap: 99, transitionMargin: -2,
+    }), { unit: 'seconds', minimumGap: 30, transitionMargin: 0 });
 });
 
 test('gap fill blocks every technique-labelled trail and any secondary trail that reaches the next lead passage', () => {
@@ -195,11 +202,53 @@ test('gap fill requires the configured usable window after transition margins', 
         strategy: 'gap-fill',
     };
     const guarded = analyzeCompositeMerge({ ...input,
-        gapFill: { minimumGapBeats: 1, transitionMarginBeats: 0.25 } });
+        gapFill: { unit: 'beats', minimumGap: 1, transitionMargin: 0.25 } });
     assert.equal(guarded.stats.secondaryAddedCleanly, 0);
     const tighter = analyzeCompositeMerge({ ...input,
-        gapFill: { minimumGapBeats: 0.5, transitionMarginBeats: 0.25 } });
+        gapFill: { unit: 'beats', minimumGap: 0.5, transitionMargin: 0.25 } });
     assert.equal(tighter.stats.secondaryAddedCleanly, 1);
+});
+
+test('seconds gap fill measures real time across tempo changes', () => {
+    const tempoBeats = [0, 0.25, 0.5, 0.75, 1, 2, 3, 4]
+        .map((time, i) => ({ time, measure: i % 4 === 0 ? i / 4 + 1 : -1 }));
+    const gridNote = (beat, string, fret, sustainBeats = 0) => ({
+        beat,
+        beatEnd: sustainBeats ? beat + sustainBeats : undefined,
+        time: tempoBeats[beat].time,
+        sustain: sustainBeats
+            ? tempoBeats[beat + sustainBeats].time - tempoBeats[beat].time : 0,
+        string,
+        fret,
+        techniques: {},
+    });
+    const input = {
+        primary: arr('Lead', [
+            gridNote(0, 0, 3, 1),
+            gridNote(3, 1, 5),
+            gridNote(6, 0, 7),
+        ]),
+        secondary: arr('Rhythm', [
+            gridNote(2, 3, 9),
+            gridNote(5, 3, 11),
+        ]),
+        beats: tempoBeats,
+        strategy: 'gap-fill',
+    };
+    const beatPlan = analyzeCompositeMerge({
+        ...input,
+        gapFill: { unit: 'beats', minimumGap: 1, transitionMargin: 0.25 },
+    });
+    assert.deepEqual(beatPlan.fixedEntries.filter(entry => entry.source === 'secondary')
+        .map(entry => entry.fret), [9, 11]);
+
+    const secondsPlan = analyzeCompositeMerge({
+        ...input,
+        gapFill: { unit: 'seconds', minimumGap: 0.5, transitionMargin: 0.05 },
+    });
+    assert.deepEqual(secondsPlan.fixedEntries.filter(entry => entry.source === 'secondary')
+        .map(entry => entry.fret), [11]);
+    assert.equal(secondsPlan.gapFill.unit, 'seconds');
 });
 
 test('full union groups overlapping same-string notes into unresolved hunks', () => {

@@ -11,14 +11,87 @@ import { host } from '../host.js';
 import { _editorEscHtml, _installModalKeyboard, setStatus } from '../ui.js';
 import {
     analyzeCompositeMerge,
-    COMPOSITE_GAP_FILL_DEFAULTS,
+    compositeGapFillDefaultsForUnit,
     materializeCompositeArrangement,
+    normalizeCompositeGapFillOptions,
     resolveCompositeConflict,
 } from './merge-engine.js';
 
 let activePlan = null;
 let activeConflictIndex = 0;
 const customDrafts = new Map();
+const COMPOSITE_GAP_FILL_PREFS_KEY = 'editorCompositeGapFill';
+const COMPOSITE_GAP_FILL_CONTROL_CONFIG = Object.freeze({
+    beats: Object.freeze({ minimumMax: 16, minimumStep: 0.25, marginMax: 8, marginStep: 0.125 }),
+    seconds: Object.freeze({ minimumMax: 30, minimumStep: 0.05, marginMax: 10, marginStep: 0.025 }),
+});
+
+function preferenceValuesForUnit(unit, value) {
+    const normalized = normalizeCompositeGapFillOptions({ unit, ...(value || {}) });
+    return {
+        minimumGap: normalized.minimumGap,
+        transitionMargin: normalized.transitionMargin,
+    };
+}
+
+export function _compositeGapFillPreferencesPure(raw) {
+    let parsed = raw;
+    if (typeof raw === 'string') {
+        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+    }
+    if (!parsed || typeof parsed !== 'object') parsed = {};
+    const unit = parsed.unit === 'seconds' ? 'seconds' : 'beats';
+    return {
+        unit,
+        beats: preferenceValuesForUnit('beats', parsed.beats),
+        seconds: preferenceValuesForUnit('seconds', parsed.seconds),
+    };
+}
+
+function loadCompositeGapFillPreferences() {
+    let raw = null;
+    try { raw = localStorage.getItem(COMPOSITE_GAP_FILL_PREFS_KEY); } catch (_) { /* blocked storage */ }
+    return _compositeGapFillPreferencesPure(raw);
+}
+
+function saveCompositeGapFillPreferences(preferences) {
+    try { localStorage.setItem(COMPOSITE_GAP_FILL_PREFS_KEY, JSON.stringify(preferences)); } catch (_) { /* blocked storage */ }
+}
+
+function inputNumber(id) {
+    const raw = byId(id)?.value;
+    return raw === '' || raw === undefined ? Number.NaN : Number(raw);
+}
+
+function gapFillOptionsFromDialog(unit = byId('editor-composite-gap-unit')?.value) {
+    return normalizeCompositeGapFillOptions({
+        unit,
+        minimumGap: inputNumber('editor-composite-min-gap'),
+        transitionMargin: inputNumber('editor-composite-margin'),
+    });
+}
+
+function applyGapFillUnitToDialog(unit, values) {
+    const normalized = normalizeCompositeGapFillOptions({ unit, ...(values || {}) });
+    const config = COMPOSITE_GAP_FILL_CONTROL_CONFIG[normalized.unit];
+    const minGap = byId('editor-composite-min-gap');
+    const margin = byId('editor-composite-margin');
+    const unitLabel = normalized.unit === 'seconds' ? 'seconds' : 'beats';
+    const minLabel = byId('editor-composite-min-gap-label');
+    const marginLabel = byId('editor-composite-margin-label');
+    if (minLabel) minLabel.textContent = `Minimum usable gap (${unitLabel})`;
+    if (marginLabel) marginLabel.textContent = `Transition margin each side (${unitLabel})`;
+    if (minGap) {
+        minGap.max = String(config.minimumMax);
+        minGap.step = String(config.minimumStep);
+        minGap.value = String(normalized.minimumGap);
+    }
+    if (margin) {
+        margin.max = String(config.marginMax);
+        margin.step = String(config.marginStep);
+        margin.value = String(normalized.transitionMargin);
+    }
+}
 
 export function _compositeEligibleSourcesPure(arrangements) {
     return (arrangements || []).map((arrangement, index) => ({ arrangement, index }))
@@ -214,10 +287,14 @@ function analyzeFromDialog() {
     const primaryIndex = Number(byId('editor-composite-primary')?.value);
     const secondaryIndex = Number(byId('editor-composite-secondary')?.value);
     const strategy = byId('editor-composite-strategy')?.value || 'gap-fill';
-    const gapFill = {
-        minimumGapBeats: Number(byId('editor-composite-min-gap')?.value),
-        transitionMarginBeats: Number(byId('editor-composite-margin')?.value),
+    const gapFill = gapFillOptionsFromDialog();
+    const preferences = loadCompositeGapFillPreferences();
+    preferences.unit = gapFill.unit;
+    preferences[gapFill.unit] = {
+        minimumGap: gapFill.minimumGap,
+        transitionMargin: gapFill.transitionMargin,
     };
+    saveCompositeGapFillPreferences(preferences);
     const error = byId('editor-composite-error');
     if (primaryIndex === secondaryIndex) {
         if (error) error.textContent = 'Choose two different source tracks.';
@@ -354,6 +431,10 @@ export function editorShowCompositeArrangementModal() {
         ? S.currentArr : sources[0].index;
     const secondary = sources.find(source => source.index !== primary).index;
     const name = _compositeUniqueNamePure(S.arrangements.map(arr => arr && arr.name));
+    const gapFillPreferences = loadCompositeGapFillPreferences();
+    const gapFillUnit = gapFillPreferences.unit;
+    const gapFillValues = gapFillPreferences[gapFillUnit]
+        || compositeGapFillDefaultsForUnit(gapFillUnit);
     const modal = document.createElement('div');
     modal.id = 'editor-composite-modal';
     modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4';
@@ -367,8 +448,9 @@ export function editorShowCompositeArrangementModal() {
         + `<label class="block text-xs text-gray-300">Secondary track<select id="editor-composite-secondary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
         + `<label class="block text-xs text-gray-300">Merge strategy<select id="editor-composite-strategy" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="gap-fill">Gap Fill — secondary during rests</option><option value="full-union">Full Union — all compatible notes</option></select></label>`
         + `<fieldset id="editor-composite-gap-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Gap Fill safety</legend>`
-        + `<label class="block text-xs text-gray-300">Minimum usable gap (beats)<input id="editor-composite-min-gap" type="number" min="0" max="16" step="0.25" value="${COMPOSITE_GAP_FILL_DEFAULTS.minimumGapBeats}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
-        + `<label class="block text-xs text-gray-300">Transition margin each side (beats)<input id="editor-composite-margin" type="number" min="0" max="8" step="0.125" value="${COMPOSITE_GAP_FILL_DEFAULTS.transitionMarginBeats}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
+        + `<label class="block text-xs text-gray-300">Timing unit<select id="editor-composite-gap-unit" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="beats"${gapFillUnit === 'beats' ? ' selected' : ''}>Beats — follows song tempo</option><option value="seconds"${gapFillUnit === 'seconds' ? ' selected' : ''}>Seconds — fixed real time</option></select></label>`
+        + `<label class="block text-xs text-gray-300"><span id="editor-composite-min-gap-label">Minimum usable gap (${gapFillUnit})</span><input id="editor-composite-min-gap" type="number" min="0" value="${gapFillValues.minimumGap}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
+        + `<label class="block text-xs text-gray-300"><span id="editor-composite-margin-label">Transition margin each side (${gapFillUnit})</span><input id="editor-composite-margin" type="number" min="0" value="${gapFillValues.transitionMargin}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
         + `<p class="text-[10px] text-gray-500">Every complete note, chord, trail, and connected gesture must fit inside the protected gap.</p></fieldset>`
         + `<label class="block text-xs text-gray-300">New track name<input id="editor-composite-name" maxlength="60" value="${_editorEscHtml(name)}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
         + `<button type="button" id="editor-composite-analyze" class="w-full px-3 py-2 rounded bg-accent hover:bg-accent-light text-xs font-medium">Analyze merge</button>`
@@ -385,19 +467,44 @@ export function editorShowCompositeArrangementModal() {
     byId('editor-composite-analyze').addEventListener('click', analyzeFromDialog);
     byId('editor-composite-finish').addEventListener('click', finishMerge);
     const strategySelect = byId('editor-composite-strategy');
+    const unitSelect = byId('editor-composite-gap-unit');
+    let currentGapFillUnit = gapFillUnit;
     const syncGapControls = () => {
         const disabled = strategySelect?.value !== 'gap-fill';
-        for (const input of [byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
+        for (const input of [unitSelect, byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
             if (input) input.disabled = disabled;
         }
     };
-    for (const control of [byId('editor-composite-primary'), byId('editor-composite-secondary'),
-        strategySelect, byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
+    const rememberCurrentGapFillValues = () => {
+        const options = gapFillOptionsFromDialog(currentGapFillUnit);
+        gapFillPreferences.unit = currentGapFillUnit;
+        gapFillPreferences[currentGapFillUnit] = {
+            minimumGap: options.minimumGap,
+            transitionMargin: options.transitionMargin,
+        };
+        saveCompositeGapFillPreferences(gapFillPreferences);
+    };
+    for (const control of [byId('editor-composite-primary'), byId('editor-composite-secondary'), strategySelect]) {
         control.addEventListener('change', () => {
             syncGapControls();
             resetResult('Sources or merge settings changed. Analyze the merge again.');
         });
     }
+    unitSelect.addEventListener('change', () => {
+        rememberCurrentGapFillValues();
+        currentGapFillUnit = unitSelect.value === 'seconds' ? 'seconds' : 'beats';
+        gapFillPreferences.unit = currentGapFillUnit;
+        applyGapFillUnitToDialog(currentGapFillUnit, gapFillPreferences[currentGapFillUnit]);
+        saveCompositeGapFillPreferences(gapFillPreferences);
+        resetResult('Gap Fill timing unit changed. Analyze the merge again.');
+    });
+    for (const input of [byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
+        input.addEventListener('change', () => {
+            rememberCurrentGapFillValues();
+            resetResult('Gap Fill safety settings changed. Analyze the merge again.');
+        });
+    }
+    applyGapFillUnitToDialog(gapFillUnit, gapFillValues);
     syncGapControls();
     _installModalKeyboard(modal, modal.firstElementChild, editorHideCompositeArrangementModal);
     byId('editor-composite-primary').focus();

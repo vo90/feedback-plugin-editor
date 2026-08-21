@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
     _compositeEligibleSourcesPure,
+    _compositeGapFillPreferencesPure,
     _compositeUniqueNamePure,
     CreateCompositeArrangementCmd,
 } from '../src/composite/resolver-ui.js';
@@ -23,6 +24,23 @@ test('composite names are unique without changing their instrument-readable pref
     assert.equal(_compositeUniqueNamePure(['Lead', 'Rhythm']), 'Hybrid Guitar');
     assert.equal(_compositeUniqueNamePure(['Hybrid Guitar']), 'Hybrid Guitar 2');
     assert.equal(_compositeUniqueNamePure(['hybrid guitar', 'HYBRID GUITAR 2']), 'Hybrid Guitar 3');
+});
+
+test('composite Gap Fill preferences remember separate beat and second values', () => {
+    assert.deepEqual(_compositeGapFillPreferencesPure(null), {
+        unit: 'beats',
+        beats: { minimumGap: 1, transitionMargin: 0.25 },
+        seconds: { minimumGap: 0.5, transitionMargin: 0.125 },
+    });
+    assert.deepEqual(_compositeGapFillPreferencesPure(JSON.stringify({
+        unit: 'seconds',
+        beats: { minimumGap: 2, transitionMargin: 0.5 },
+        seconds: { minimumGap: 0.8, transitionMargin: 0.2 },
+    })), {
+        unit: 'seconds',
+        beats: { minimumGap: 2, transitionMargin: 0.5 },
+        seconds: { minimumGap: 0.8, transitionMargin: 0.2 },
+    });
 });
 
 test('composite creation inserts before drums and rolls back without touching sources', t => {

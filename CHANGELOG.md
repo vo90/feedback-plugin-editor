@@ -85,9 +85,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inherits chord-level duration when needed, follows linked notes and connected
   slides to their destinations, and treats coincident chords / connected
   gestures atomically. A rhythm event is admitted only when its entire longest
-  trail fits inside a lead-silence window. The resolver exposes a minimum usable
-  gap and a per-side transition margin (defaults: 1 beat and 1/4 beat), while
-  Full Union keeps its deliberately permissive behavior.
+  trail fits inside a lead-silence window. The resolver exposes a shared
+  **Beats / Seconds** timing-unit selector for the minimum usable gap and
+  per-side transition margin. Beats remains the default (1 beat / 1/4 beat);
+  seconds uses fixed real time through tempo changes (initially 0.5 s / 0.125 s).
+  The selected unit and separate values for each unit are remembered locally,
+  while Full Union keeps its deliberately permissive behavior.
 - **The auto fret-hand anchor engine now looks ahead and stops thrashing on lone
   notes.** `_compute_anchors` was a single forward-greedy pass — fixed width 4,
   no look-ahead, relocating one fret below any note that fell outside the current

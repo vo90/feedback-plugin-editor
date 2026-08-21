@@ -13,9 +13,26 @@ import { _stringCountFor } from '../lanes.js';
 
 export const COMPOSITE_BEAT_EPS = 1e-4;
 export const COMPOSITE_GAP_FILL_DEFAULTS = Object.freeze({
-    minimumGapBeats: 1,
-    transitionMarginBeats: 0.25,
+    unit: 'beats',
+    minimumGap: 1,
+    transitionMargin: 0.25,
 });
+
+const COMPOSITE_GAP_FILL_UNIT_DEFAULTS = Object.freeze({
+    beats: Object.freeze({ minimumGap: 1, transitionMargin: 0.25 }),
+    // The first-time seconds values match the beat defaults at 120 BPM.
+    seconds: Object.freeze({ minimumGap: 0.5, transitionMargin: 0.125 }),
+});
+
+const COMPOSITE_GAP_FILL_UNIT_LIMITS = Object.freeze({
+    beats: Object.freeze({ minimumGap: 16, transitionMargin: 8 }),
+    seconds: Object.freeze({ minimumGap: 30, transitionMargin: 10 }),
+});
+
+export function compositeGapFillDefaultsForUnit(unit) {
+    const normalizedUnit = unit === 'seconds' ? 'seconds' : 'beats';
+    return { unit: normalizedUnit, ...COMPOSITE_GAP_FILL_UNIT_DEFAULTS[normalizedUnit] };
+}
 
 function clone(value) {
     if (value == null) return value;
@@ -214,9 +231,12 @@ function duplicateOf(entry, lookup) {
     return null;
 }
 
-function mergeIntervals(entries, padding = 0) {
+function mergeIntervals(entries, padding = 0, coordinate = beat => beat) {
     const pad = Math.max(0, finite(padding));
-    const spans = entries.map(e => ({ start: e.startBeat - pad, end: e.effectiveEndBeat + pad }))
+    const spans = entries.map(e => ({
+        start: coordinate(e.startBeat) - pad,
+        end: coordinate(e.effectiveEndBeat) + pad,
+    }))
         .sort((a, b) => a.start - b.start || a.end - b.end);
     const merged = [];
     for (const span of spans) {
@@ -228,11 +248,18 @@ function mergeIntervals(entries, padding = 0) {
 }
 
 export function normalizeCompositeGapFillOptions(options = {}) {
-    const minimumGapBeats = Math.max(0, Math.min(16,
-        finite(options.minimumGapBeats, COMPOSITE_GAP_FILL_DEFAULTS.minimumGapBeats)));
-    const transitionMarginBeats = Math.max(0, Math.min(8,
-        finite(options.transitionMarginBeats, COMPOSITE_GAP_FILL_DEFAULTS.transitionMarginBeats)));
-    return { minimumGapBeats, transitionMarginBeats };
+    const unit = options.unit === 'seconds' ? 'seconds' : 'beats';
+    const defaults = COMPOSITE_GAP_FILL_UNIT_DEFAULTS[unit];
+    const limits = COMPOSITE_GAP_FILL_UNIT_LIMITS[unit];
+    // Accept the first PoC's beat-specific field names so an open dialog or
+    // downstream caller from that build degrades to the new shared-unit model.
+    const legacyMinimum = unit === 'beats' ? options.minimumGapBeats : options.minimumGapSeconds;
+    const legacyMargin = unit === 'beats' ? options.transitionMarginBeats : options.transitionMarginSeconds;
+    const minimumGap = Math.max(0, Math.min(limits.minimumGap,
+        finite(options.minimumGap, finite(legacyMinimum, defaults.minimumGap))));
+    const transitionMargin = Math.max(0, Math.min(limits.transitionMargin,
+        finite(options.transitionMargin, finite(legacyMargin, defaults.transitionMargin))));
+    return { unit, minimumGap, transitionMargin };
 }
 
 function groupPlayableEntries(entries) {
@@ -274,14 +301,20 @@ function groupPlayableEntries(entries) {
 }
 
 function eligibleGapFillWindows(primaryEntries, secondaryEntries, beats, options) {
-    const { minimumGapBeats, transitionMarginBeats } = options;
+    const { unit, minimumGap, transitionMargin } = options;
+    // Beat mode follows the musical grid. Seconds mode projects every boundary
+    // through the real tempo map first, so its safety time remains constant
+    // through tempo changes and ramps.
+    const coordinate = unit === 'seconds' ? beat => timeOf(beats, beat) : beat => beat;
     const allEntries = [...primaryEntries, ...secondaryEntries];
-    const contentStart = Math.min(0, ...allEntries.map(entry => entry.startBeat));
-    const contentEnd = Math.max(
+    const contentStartBeat = Math.min(0, ...allEntries.map(entry => entry.startBeat));
+    const contentEndBeat = Math.max(
         Array.isArray(beats) && beats.length ? beats.length - 1 : 0,
         ...allEntries.map(entry => entry.effectiveEndBeat),
     );
-    const occupied = mergeIntervals(primaryEntries, transitionMarginBeats);
+    const contentStart = coordinate(contentStartBeat);
+    const contentEnd = coordinate(contentEndBeat);
+    const occupied = mergeIntervals(primaryEntries, transitionMargin, coordinate);
     const windows = [];
     let cursor = contentStart;
     for (const span of occupied) {
@@ -289,20 +322,22 @@ function eligibleGapFillWindows(primaryEntries, secondaryEntries, beats, options
         if (span.start > contentEnd - COMPOSITE_BEAT_EPS) break;
         const start = Math.max(contentStart, span.start);
         const end = Math.min(contentEnd, span.end);
-        if (start - cursor + COMPOSITE_BEAT_EPS >= minimumGapBeats) {
+        if (start - cursor + COMPOSITE_BEAT_EPS >= minimumGap) {
             windows.push({ start: cursor, end: start });
         }
         cursor = Math.max(cursor, end);
     }
-    if (contentEnd - cursor + COMPOSITE_BEAT_EPS >= minimumGapBeats) {
+    if (contentEnd - cursor + COMPOSITE_BEAT_EPS >= minimumGap) {
         windows.push({ start: cursor, end: contentEnd });
     }
-    return windows;
+    return { windows, coordinate };
 }
 
-function groupFitsWindow(group, windows) {
-    return windows.some(window => group.startBeat >= window.start - COMPOSITE_BEAT_EPS
-        && group.endBeat <= window.end + COMPOSITE_BEAT_EPS);
+function groupFitsWindow(group, windows, coordinate) {
+    const start = coordinate(group.startBeat);
+    const end = coordinate(group.endBeat);
+    return windows.some(window => start >= window.start - COMPOSITE_BEAT_EPS
+        && end <= window.end + COMPOSITE_BEAT_EPS);
 }
 
 function collisionPairs(primaryEntries, secondaryEntries) {
@@ -389,14 +424,15 @@ export function analyzeCompositeMerge({
     let candidates = secondaryEntries;
     const gapFillOptions = normalizeCompositeGapFillOptions(gapFill);
     if (strategy === 'gap-fill') {
-        const windows = eligibleGapFillWindows(primaryEntries, secondaryEntries, beats, gapFillOptions);
+        const { windows, coordinate } = eligibleGapFillWindows(
+            primaryEntries, secondaryEntries, beats, gapFillOptions);
         candidates = [];
         // Coincident entries are one playable event (usually a chord). Never
         // keep only the short child of a chord while dropping a sibling whose
         // trail crosses into primary activity: the complete event fits or the
         // complete event is skipped.
         for (const group of groupPlayableEntries(secondaryEntries)) {
-            if (groupFitsWindow(group, windows)) candidates.push(...group.entries);
+            if (groupFitsWindow(group, windows, coordinate)) candidates.push(...group.entries);
             else skippedEntries.push(...group.entries);
         }
     }
