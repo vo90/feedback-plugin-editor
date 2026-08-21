@@ -19,6 +19,7 @@ import { _editorEscHtml, _installModalKeyboard, setStatus } from '../ui.js';
 import {
     analyzeCompositeMerge,
     clearCompositeConflictResolution,
+    COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     compositeGapFillDefaultsForUnit,
     materializeCompositeArrangement,
     normalizeCompositeGapFillOptions,
@@ -204,11 +205,12 @@ function noteTechLabel(note) {
     return compositeTechniqueLabels(note).join(', ');
 }
 
-function entryMarkup(entry, checkboxName = '') {
+function entryMarkup(entry, checkboxName = '', stringCount = 6) {
     const length = Math.max(0, entry.endBeat - entry.startBeat);
     const tech = noteTechLabel(entry.note);
+    const displayString = Math.max(1, stringCount - entry.string);
     const body = `<span class="font-mono text-gray-200">Beat ${entry.startBeat.toFixed(3)}</span>`
-        + `<span class="text-gray-400">S${entry.string + 1} · F${entry.fret}</span>`
+        + `<span class="text-gray-400">S${displayString} · F${entry.fret}</span>`
         + (length > 1e-4 ? `<span class="text-gray-500">${length.toFixed(3)} beats</span>` : '')
         + (tech ? `<span class="text-amber-300">${_editorEscHtml(tech)}</span>` : '');
     if (!checkboxName) return `<li class="flex flex-wrap gap-x-3 gap-y-0.5 py-1">${body}</li>`;
@@ -221,7 +223,9 @@ function conflictReason(group) {
     const reasons = [];
     if (group.reasons.includes('same-string-overlap')) reasons.push('different notes overlap on the same string');
     if (group.reasons.includes('note-variant')) reasons.push('the same position has different sustain, technique, or harmony data');
-    return reasons.join('; ') || 'source notes require a choice';
+    const overlapMilliseconds = Math.round(Math.max(0, Number(group.overlapSeconds) || 0) * 1000);
+    const overlap = overlapMilliseconds > 0 ? ` (${overlapMilliseconds} ms overlap)` : '';
+    return `${reasons.join('; ') || 'source notes require a choice'}${overlap}`;
 }
 
 function selectedSourceNames() {
@@ -254,7 +258,8 @@ function customMarkup(group) {
     const draft = customDrafts.get(group.id);
     if (!draft) return '';
     const checked = new Set(draft);
-    const render = (entry) => entryMarkup(entry, `custom-${group.id}`).replace(
+    const stringCount = activePlan?.compatibility?.stringCount || 6;
+    const render = (entry) => entryMarkup(entry, `custom-${group.id}`, stringCount).replace(
         `data-entry-id="${entry.id}"`, `data-entry-id="${entry.id}"${checked.has(entry.id) ? ' checked' : ''}`);
     return `<div class="mt-3 border-t border-gray-700 pt-2">`
         + `<p class="text-[11px] text-gray-400 mb-1">Choose notes here or click them directly in either source tab. Cross-source notes may not overlap on one string.</p>`
@@ -374,8 +379,8 @@ function renderConflict(plan) {
         + `</div></div>${customMarkup(group)}`
         + `<div class="flex flex-wrap justify-between items-center gap-2 mt-3 pt-3 border-t border-gray-700">`
         + `<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">`
-        + `<div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b><ul>${group.primaryEntries.map(e => entryMarkup(e)).join('')}</ul></div>`
-        + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e)).join('')}</ul></div></div></details>`
+        + `<div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b><ul>${group.primaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div>`
+        + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div></div></details>`
         + `<div class="flex gap-2"><button type="button" id="editor-composite-reset-choice" class="px-2.5 py-1.5 rounded bg-dark-700 hover:bg-dark-600 text-xs disabled:opacity-40" ${group.resolution || customDrafts.has(group.id) ? '' : 'disabled'}>Reset choice</button>`
         + `<button type="button" id="editor-composite-apply-next" class="px-3 py-1.5 rounded bg-accent hover:bg-accent-light text-xs font-medium disabled:opacity-40" ${group.resolution ? '' : 'disabled'}>Apply &amp; Next →</button></div></div></section>`;
 }
@@ -465,13 +470,17 @@ function renderResult() {
     if (!result || !activePlan) return;
     const stats = activePlan.stats;
     const unresolved = activePlan.conflicts.filter(c => !c.resolution).length;
+    const normalized = stats.timingAdjustments || 0;
+    const normalizationNotice = normalized ? `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-[11px] text-sky-100">`
+        + `<b>${normalized} tiny imported note ${normalized === 1 ? 'boundary was' : 'boundaries were'} normalized</b> within the tempo-aware ${Math.round(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS * 1000)} ms safety limit. `
+        + `Only the new composite will use the trimmed trail; both source tracks remain unchanged.</div>` : '';
     result.innerHTML = `<div class="grid gap-2 mb-3 text-center text-[11px]" style="grid-template-columns:repeat(5,minmax(0,1fr))">`
         + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
         + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryAddedCleanly}</b>clean additions</div>`
         + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates removed</div>`
         + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondarySkippedByStrategy}</b>strategy skips</div>`
         + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-red-300' : 'text-emerald-300'}">${unresolved}</b>unresolved</div></div>`
-        + renderOverview(activePlan) + renderConflict(activePlan);
+        + normalizationNotice + renderOverview(activePlan) + renderConflict(activePlan);
     const finish = byId('editor-composite-finish');
     if (finish) finish.disabled = unresolved > 0;
     bindResultEvents();

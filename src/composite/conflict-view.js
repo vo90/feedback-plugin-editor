@@ -213,11 +213,14 @@ function conflictExplanation(conflict, names, stringCount) {
     const pair = overlappingPair(conflict);
     if (!pair.primary || !pair.secondary) return 'These source notes require a choice.';
     const displayString = Math.max(1, stringCount - pair.primary.string);
+    const overlapMilliseconds = Math.round(Math.max(0, finite(conflict.overlapSeconds)) * 1000);
+    const overlap = overlapMilliseconds > 0 ? ` They overlap by ${overlapMilliseconds} ms, including their trails.`
+        : ' Their attacks fall within the timing tolerance.';
     if ((conflict.reasons || []).includes('same-string-overlap')) {
         return `String ${displayString} cannot play fret ${pair.primary.fret} from ${names.primary}`
-            + ` and fret ${pair.secondary.fret} from ${names.secondary} at the same time, including their trails.`;
+            + ` and fret ${pair.secondary.fret} from ${names.secondary} together.${overlap}`;
     }
-    return `String ${displayString}, fret ${pair.primary.fret} starts in both tracks, but its sustain, technique, or harmony data differs.`;
+    return `String ${displayString}, fret ${pair.primary.fret} starts in both tracks, but its sustain, technique, or harmony data differs.${overlap}`;
 }
 
 function laneEntry(entry, conflictIds, selectedIds, selectable, invalid = false) {

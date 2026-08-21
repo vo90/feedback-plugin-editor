@@ -69,7 +69,7 @@ test('view model keeps synchronized source context and an honest unresolved resu
         secondaryName: 'Rhythm',
     });
     assert.equal(view.explanation,
-        'String 6 cannot play fret 7 from Lead and fret 5 from Rhythm at the same time, including their trails.');
+        'String 6 cannot play fret 7 from Lead and fret 5 from Rhythm together. They overlap by 500 ms, including their trails.');
     assert.deepEqual(view.lanes[0].entries.map(entry => entry.fret), [3, 7]);
     assert.deepEqual(view.lanes[1].entries.map(entry => entry.fret), [5, 5]);
     assert.deepEqual(view.lanes[2].entries.map(entry => entry.fret), [3, 5]);
@@ -117,4 +117,3 @@ test('note variants provide a compact escaped property comparison', () => {
     assert.match(renderCompositeDifferenceTable(view), /&lt;Lead&gt;/);
     assert.doesNotMatch(renderCompositeDifferenceTable(view), /<Lead>/);
 });
-

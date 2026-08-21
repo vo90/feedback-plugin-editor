@@ -12,6 +12,9 @@ import { arrKind } from '../instrument.js';
 import { _stringCountFor } from '../lanes.js';
 
 export const COMPOSITE_BEAT_EPS = 1e-4;
+export const COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS = 0.001;
+export const COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS = 0.005;
+export const COMPOSITE_TIMING_TOLERANCE_BEAT_FRACTION = 0.01;
 export const COMPOSITE_GAP_FILL_DEFAULTS = Object.freeze({
     unit: 'beats',
     minimumGap: 1,
@@ -43,6 +46,49 @@ function clone(value) {
 function finite(value, fallback = 0) {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback;
+}
+
+export function compositeTimingToleranceSeconds(beats, beat = 0) {
+    const center = finite(beat);
+    const before = timeOf(beats, center - 0.5);
+    const after = timeOf(beats, center + 0.5);
+    const localBeatSeconds = Math.abs(after - before);
+    const proposed = Number.isFinite(localBeatSeconds) && localBeatSeconds > 1e-9
+        ? localBeatSeconds * COMPOSITE_TIMING_TOLERANCE_BEAT_FRACTION
+        : COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS;
+    return Math.max(COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS,
+        Math.min(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS, proposed));
+}
+
+function timingNear(a, b, beats) {
+    const left = timeOf(beats, a);
+    const right = timeOf(beats, b);
+    if (!Number.isFinite(left) || !Number.isFinite(right)) return near(a, b);
+    return Math.abs(left - right) <= compositeTimingToleranceSeconds(beats, (a + b) / 2) + 1e-9;
+}
+
+function entrySources(entry) {
+    const sources = Array.isArray(entry && entry.sources) && entry.sources.length
+        ? entry.sources : [entry && entry.source].filter(Boolean);
+    return new Set(sources);
+}
+
+function entriesShareSource(a, b) {
+    const aSources = entrySources(a);
+    for (const source of entrySources(b)) if (aSources.has(source)) return true;
+    return false;
+}
+
+function entryHasSource(entry, source) {
+    return entrySources(entry).has(source);
+}
+
+function mergeEntryProvenance(canonical, duplicate) {
+    canonical.sources = [...new Set([...entrySources(canonical), ...entrySources(duplicate)])];
+    canonical.duplicateEntryIds = [...new Set([
+        ...(canonical.duplicateEntryIds || []), duplicate.id,
+        ...(duplicate.duplicateEntryIds || []),
+    ])];
 }
 
 function stable(value) {
@@ -126,6 +172,7 @@ function flattenArrangement(arrangement, source, beats) {
         return {
             id: `${source}:${index}`,
             source,
+            sources: [source],
             sourceIndex: index,
             startBeat,
             endBeat,
@@ -137,6 +184,7 @@ function flattenArrangement(arrangement, source, beats) {
         };
     }).filter(e => Number.isFinite(e.startBeat) && e.string >= 0 && e.fret >= 0)
         .sort(compareEntries);
+    normalizeTinySourceBoundaries(entries, beats);
     return extendConnectedPlayableSpans(entries);
 }
 
@@ -149,21 +197,63 @@ function near(a, b) {
     return Math.abs(a - b) <= COMPOSITE_BEAT_EPS;
 }
 
-function overlap(a, b) {
-    if (near(a.startBeat, b.startBeat)) return true;
-    return a.startBeat < b.effectiveEndBeat - COMPOSITE_BEAT_EPS
-        && b.startBeat < a.effectiveEndBeat - COMPOSITE_BEAT_EPS;
+function normalizeTinySourceBoundaries(entries, beats, { preserveConnections = false } = {}) {
+    const byString = new Map();
+    for (const entry of entries) {
+        if (!byString.has(entry.string)) byString.set(entry.string, []);
+        byString.get(entry.string).push(entry);
+    }
+    for (const stringEntries of byString.values()) {
+        stringEntries.sort(compareEntries);
+        for (let index = 0; index < stringEntries.length - 1; index++) {
+            const entry = stringEntries[index];
+            const next = stringEntries[index + 1];
+            if (preserveConnections && entry.connectedToId) continue;
+            if (next.startBeat <= entry.startBeat + COMPOSITE_BEAT_EPS
+                || entry.endBeat <= next.startBeat + 1e-12) continue;
+            const authoredEndTime = timeOf(beats, entry.endBeat);
+            const nextStartTime = timeOf(beats, next.startBeat);
+            const overlapSeconds = authoredEndTime - nextStartTime;
+            if (!Number.isFinite(overlapSeconds) || overlapSeconds <= 0
+                || overlapSeconds > compositeTimingToleranceSeconds(beats, next.startBeat) + 1e-9) continue;
+            const fromEndBeat = entry.endBeat;
+            entry.endBeat = next.startBeat;
+            entry.effectiveEndBeat = Math.max(entry.startBeat + COMPOSITE_BEAT_EPS, entry.endBeat);
+            entry.timingAdjustment = {
+                kind: 'boundary-clamp',
+                fromEndBeat,
+                toEndBeat: next.startBeat,
+                overlapSeconds,
+            };
+        }
+    }
 }
 
-function exactDuplicate(a, b) {
+function collisionOverlapSeconds(a, b, beats) {
+    const start = Math.max(timeOf(beats, a.startBeat), timeOf(beats, b.startBeat));
+    const end = Math.min(timeOf(beats, a.effectiveEndBeat), timeOf(beats, b.effectiveEndBeat));
+    return Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : 0;
+}
+
+function overlap(a, b, beats) {
+    if (timingNear(a.startBeat, b.startBeat, beats)) return true;
+    const overlapSeconds = collisionOverlapSeconds(a, b, beats);
+    if (overlapSeconds <= 0) return false;
+    // Only a sequential end/start boundary receives timing slop. Near-simultaneous
+    // different-fret attacks remain a real physical conflict.
+    const laterStartBeat = Math.max(a.startBeat, b.startBeat);
+    return overlapSeconds > compositeTimingToleranceSeconds(beats, laterStartBeat) + 1e-9;
+}
+
+function exactDuplicate(a, b, beats) {
     return a.string === b.string && a.fret === b.fret
-        && near(a.startBeat, b.startBeat) && near(a.endBeat, b.endBeat)
+        && timingNear(a.startBeat, b.startBeat, beats) && timingNear(a.endBeat, b.endBeat, beats)
         && a.techniqueSignature === b.techniqueSignature;
 }
 
-function collisionReason(a, b) {
-    if (a.string !== b.string || !overlap(a, b)) return '';
-    if (near(a.startBeat, b.startBeat) && a.fret === b.fret) return 'note-variant';
+function collisionReason(a, b, beats) {
+    if (a.string !== b.string || !overlap(a, b, beats)) return '';
+    if (timingNear(a.startBeat, b.startBeat, beats) && a.fret === b.fret) return 'note-variant';
     return 'same-string-overlap';
 }
 
@@ -213,22 +303,16 @@ export function compositeCompatibility(primary, secondary) {
 function duplicateLookup(primaryEntries) {
     const map = new Map();
     for (const entry of primaryEntries) {
-        const bucket = Math.round(entry.startBeat / COMPOSITE_BEAT_EPS);
-        const key = `${entry.string}:${entry.fret}:${bucket}`;
+        const key = `${entry.string}:${entry.fret}`;
         if (!map.has(key)) map.set(key, []);
         map.get(key).push(entry);
     }
     return map;
 }
 
-function duplicateOf(entry, lookup) {
-    const bucket = Math.round(entry.startBeat / COMPOSITE_BEAT_EPS);
-    for (let delta = -1; delta <= 1; delta++) {
-        const candidates = lookup.get(`${entry.string}:${entry.fret}:${bucket + delta}`) || [];
-        const found = candidates.find(primary => exactDuplicate(primary, entry));
-        if (found) return found;
-    }
-    return null;
+function duplicateOf(entry, lookup, beats) {
+    const candidates = lookup.get(`${entry.string}:${entry.fret}`) || [];
+    return candidates.find(primary => exactDuplicate(primary, entry, beats)) || null;
 }
 
 function mergeIntervals(entries, padding = 0, coordinate = beat => beat) {
@@ -340,7 +424,7 @@ function groupFitsWindow(group, windows, coordinate) {
         && end <= window.end + COMPOSITE_BEAT_EPS);
 }
 
-function collisionPairs(primaryEntries, secondaryEntries) {
+function collisionPairs(primaryEntries, secondaryEntries, beats) {
     const byString = new Map();
     for (const entry of primaryEntries) {
         if (!byString.has(entry.string)) byString.set(entry.string, []);
@@ -352,8 +436,13 @@ function collisionPairs(primaryEntries, secondaryEntries) {
         for (const primary of candidates) {
             if (primary.startBeat > secondary.effectiveEndBeat + COMPOSITE_BEAT_EPS) break;
             if (primary.effectiveEndBeat < secondary.startBeat - COMPOSITE_BEAT_EPS) continue;
-            const reason = collisionReason(primary, secondary);
-            if (reason) pairs.push({ primary, secondary, reason });
+            const reason = collisionReason(primary, secondary, beats);
+            if (reason) pairs.push({
+                primary,
+                secondary,
+                reason,
+                overlapSeconds: collisionOverlapSeconds(primary, secondary, beats),
+            });
         }
     }
     return pairs.sort((a, b) => Math.min(a.primary.startBeat, a.secondary.startBeat)
@@ -377,6 +466,7 @@ function groupConflictPairs(pairs) {
                 resolution: null,
                 selectedEntryIds: [],
                 validationError: '',
+                overlapSeconds: 0,
             };
             groups.push(group);
         } else {
@@ -385,6 +475,7 @@ function groupConflictPairs(pairs) {
         if (!group.primaryEntries.some(e => e.id === pair.primary.id)) group.primaryEntries.push(pair.primary);
         if (!group.secondaryEntries.some(e => e.id === pair.secondary.id)) group.secondaryEntries.push(pair.secondary);
         if (!group.reasons.includes(pair.reason)) group.reasons.push(pair.reason);
+        group.overlapSeconds = Math.max(group.overlapSeconds, finite(pair.overlapSeconds));
     }
     for (const group of groups) {
         group.primaryEntries.sort(compareEntries);
@@ -415,8 +506,16 @@ export function analyzeCompositeMerge({
     const duplicates = [];
     const secondaryEntries = [];
     for (const entry of allSecondary) {
-        const duplicate = duplicateOf(entry, lookup);
-        if (duplicate) duplicates.push({ secondary: entry, primary: duplicate });
+        const duplicate = duplicateOf(entry, lookup, beats);
+        if (duplicate) {
+            mergeEntryProvenance(duplicate, entry);
+            duplicates.push({
+                secondary: entry,
+                primary: duplicate,
+                startDeltaSeconds: Math.abs(timeOf(beats, duplicate.startBeat) - timeOf(beats, entry.startBeat)),
+                endDeltaSeconds: Math.abs(timeOf(beats, duplicate.endBeat) - timeOf(beats, entry.endBeat)),
+            });
+        }
         else secondaryEntries.push(entry);
     }
 
@@ -437,7 +536,7 @@ export function analyzeCompositeMerge({
         }
     }
 
-    const pairs = collisionPairs(primaryEntries, candidates);
+    const pairs = collisionPairs(primaryEntries, candidates, beats);
     const conflicts = groupConflictPairs(pairs);
     const conflictingPrimary = new Set(pairs.map(p => p.primary.id));
     const conflictingSecondary = new Set(pairs.map(p => p.secondary.id));
@@ -463,11 +562,15 @@ export function analyzeCompositeMerge({
         fixedEntries,
         conflicts,
         duplicates,
+        timingAdjustments: [...primaryEntries, ...allSecondary]
+            .filter(entry => entry.timingAdjustment).map(entry => entry.timingAdjustment),
         skippedEntries,
         stats: {
             primaryNotes: primaryEntries.length,
             secondaryNotes: allSecondary.length,
             duplicatesRemoved: duplicates.length,
+            timingAdjustments: [...primaryEntries, ...allSecondary]
+                .filter(entry => entry.timingAdjustment).length,
             secondaryAddedCleanly: fixedEntries.filter(e => e.source === 'secondary').length,
             secondarySkippedByStrategy: skippedEntries.length,
             conflictHunks: conflicts.length,
@@ -476,35 +579,64 @@ export function analyzeCompositeMerge({
     };
 }
 
-function selectionFor(group, resolution, selectedEntryIds) {
-    if (resolution === 'primary') return group.primaryEntries;
-    if (resolution === 'secondary') return group.secondaryEntries;
+function conflictEntries(group) {
+    const unique = new Map();
+    for (const entry of [...(group.primaryEntries || []), ...(group.secondaryEntries || [])]) {
+        unique.set(entry.id, entry);
+    }
+    return [...unique.values()];
+}
+
+function selectionFor(plan, group, resolution, selectedEntryIds) {
+    const available = conflictEntries(group);
+    if (resolution === 'primary') return available.filter(entry => entryHasSource(entry, 'primary'));
+    if (resolution === 'secondary') return available.filter(entry => entryHasSource(entry, 'secondary'));
     if (resolution === 'compatible') {
-        const chosen = group.primaryEntries.slice();
-        for (const entry of group.secondaryEntries) {
-            if (!chosen.some(other => other.source !== entry.source && collisionReason(other, entry))) chosen.push(entry);
+        const chosen = available.filter(entry => entryHasSource(entry, 'primary'));
+        for (const entry of available.filter(candidate => entryHasSource(candidate, 'secondary'))) {
+            if (chosen.some(other => other.id === entry.id)) continue;
+            if (!chosen.some(other => !entriesShareSource(other, entry)
+                && collisionReason(other, entry, plan.beats))) chosen.push(entry);
         }
         return chosen;
     }
     if (resolution === 'custom') {
         const ids = new Set(selectedEntryIds || []);
-        return [...group.primaryEntries, ...group.secondaryEntries].filter(e => ids.has(e.id));
+        return available.filter(e => ids.has(e.id));
     }
     return [];
 }
 
-export function validateCompositeSelection(entries) {
+export function validateCompositeSelection(entries, beats = [], stringCount = 6) {
     const selected = entries || [];
     for (let i = 0; i < selected.length; i++) {
         for (let j = i + 1; j < selected.length; j++) {
             const a = selected[i];
             const b = selected[j];
-            if (a.source !== b.source && collisionReason(a, b)) {
-                return { ok: false, error: `String ${a.string + 1} has overlapping source notes.` };
+            if (!entriesShareSource(a, b) && collisionReason(a, b, beats)) {
+                const displayString = Math.max(1, Math.trunc(finite(stringCount, 6)) - a.string);
+                const overlapMilliseconds = Math.max(1,
+                    Math.round(collisionOverlapSeconds(a, b, beats) * 1000));
+                return {
+                    ok: false,
+                    error: `String ${displayString} has source notes overlapping by ${overlapMilliseconds} ms.`,
+                };
             }
         }
     }
     return { ok: true, error: '' };
+}
+
+function entriesWithCandidateResolution(plan, currentGroup, selected) {
+    const entries = [...(plan.fixedEntries || []), ...selected];
+    for (const group of plan.conflicts || []) {
+        if (group === currentGroup || !group.resolution) continue;
+        const ids = new Set(group.selectedEntryIds || []);
+        entries.push(...conflictEntries(group).filter(entry => ids.has(entry.id)));
+    }
+    const unique = new Map();
+    for (const entry of entries) unique.set(entry.id, entry);
+    return [...unique.values()];
 }
 
 export function resolveCompositeConflict(plan, conflictId, resolution, selectedEntryIds = []) {
@@ -513,8 +645,12 @@ export function resolveCompositeConflict(plan, conflictId, resolution, selectedE
     if (!['primary', 'secondary', 'compatible', 'custom'].includes(resolution)) {
         return { ok: false, error: 'Unknown conflict resolution.' };
     }
-    const selected = selectionFor(group, resolution, selectedEntryIds);
-    const validation = validateCompositeSelection(selected);
+    const selected = selectionFor(plan, group, resolution, selectedEntryIds);
+    const validation = validateCompositeSelection(
+        entriesWithCandidateResolution(plan, group, selected),
+        plan.beats,
+        plan.compatibility && plan.compatibility.stringCount,
+    );
     group.validationError = validation.error;
     if (!validation.ok) {
         group.resolution = null;
@@ -568,10 +704,32 @@ function materializeNote(entry, beats) {
     return note;
 }
 
+function prepareCompositeEntries(entries, beats) {
+    const prepared = (entries || []).map(entry => ({
+        ...entry,
+        sources: [...entrySources(entry)],
+        duplicateEntryIds: [...(entry.duplicateEntryIds || [])],
+        note: clone(entry.note),
+        timingAdjustment: clone(entry.timingAdjustment),
+    })).sort(compareEntries);
+    normalizeTinySourceBoundaries(prepared, beats, { preserveConnections: true });
+    return prepared.sort(compareEntries);
+}
+
 export function materializeCompositeArrangement(plan, name) {
     if (!plan || !plan.ok) throw new Error('A valid merge plan is required.');
     const unresolved = plan.conflicts.filter(c => !c.resolution);
     if (unresolved.length) throw new Error(`${unresolved.length} merge conflict(s) remain unresolved.`);
+    // Work on plan-entry clones so both imported tracks and the review plan
+    // preserve their authored timing. The generated composite alone receives
+    // any final cross-source sub-tolerance boundary clamps.
+    const resolvedEntries = prepareCompositeEntries(compositeResolvedEntries(plan), plan.beats);
+    const validation = validateCompositeSelection(
+        resolvedEntries,
+        plan.beats,
+        plan.compatibility && plan.compatibility.stringCount,
+    );
+    if (!validation.ok) throw new Error(`The merged arrangement is not playable: ${validation.error}`);
     const primary = plan.primary || {};
     const resultName = String(name || '').trim();
     if (!resultName) throw new Error('The composite arrangement needs a name.');
@@ -580,7 +738,7 @@ export function materializeCompositeArrangement(plan, name) {
         type: plan.compatibility.kind === 'bass' ? 'bass' : 'guitar',
         tuning: clone(primary.tuning || new Array(plan.compatibility.stringCount).fill(0)),
         capo: finite(primary.capo),
-        notes: compositeResolvedEntries(plan).map(entry => materializeNote(entry, plan.beats)),
+        notes: resolvedEntries.map(entry => materializeNote(entry, plan.beats)),
         chords: [],
         chord_templates: [],
         anchors: [],
