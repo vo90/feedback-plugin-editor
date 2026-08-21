@@ -261,6 +261,28 @@ empty** to chart from scratch — no source file needed — or **Import from a
 file** for Guitar Pro / MIDI / MusicXML). An empty track lands selected and
 ready: double-click the chart to add notes, and save to commit.
 
+### Composite guitar/bass arrangements
+
+Use **Track ▸ Create Composite Arrangement…** to turn two synchronized guitar
+or bass parts into a new, ordinary playable track while keeping both sources
+unchanged. The source parts must have the same instrument family, string count,
+tuning, capo, and pitch-cent offset.
+
+Choose one of two strategies:
+
+- **Gap Fill** keeps the primary part and adds the secondary only during the
+  primary's rests. It is the quick way to fill long lead/rhythm gaps.
+- **Full Union** keeps all compatible notes. When both parts ask the same string
+  to play incompatible notes at the same time, the resolver shows that beat
+  range as a conflict.
+
+Exact duplicates — same string, fret, onset, duration, and techniques — are
+removed automatically. For each remaining conflict, choose the primary notes,
+the secondary notes, the primary plus any physically compatible secondary
+notes, or a custom note set. **Finish Merge** stays unavailable until every
+conflict has a valid decision. Creating the result is undoable; save the song
+to commit the new arrangement to the feedpak.
+
 The **Tracks column** down the left side lists every track — the master mix,
 any studio stems, and each transcription part — beside a matching timeline lane.
 From a track's row you can:

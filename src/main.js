@@ -109,6 +109,9 @@ import {
     editorShowNewTrackModal
 } from './new-track.js';
 import {
+    editorHideCompositeArrangementModal, editorShowCompositeArrangementModal
+} from './composite/resolver-ui.js';
+import {
     _editorTogglePartsView, _partsViewDraw, _partsViewOnDblClick, _partsViewOnMouseDown,
     _partsViewRegionDelete, _partsViewRegionDrag, _partsViewRegionDrop, _refreshPartsViewButton
 } from './parts-view.js';
@@ -682,6 +685,8 @@ window.editorNewTrackSetType = editorNewTrackSetType;
 window.editorNewTrackSetInstrument = editorNewTrackSetInstrument;
 window.editorNewTrackSetSource = editorNewTrackSetSource;
 window.editorNewTrackCreate = editorNewTrackCreate;
+window.editorShowCompositeArrangementModal = editorShowCompositeArrangementModal;
+window.editorHideCompositeArrangementModal = editorHideCompositeArrangementModal;
 
 // Save-format modal (file-ops.js owns the logic; HTML calls these by name).
 window.editorHideSaveFormatModal = editorHideSaveFormatModal;

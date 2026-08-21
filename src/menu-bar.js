@@ -150,6 +150,7 @@ export const EDITOR_MENUS = Object.freeze([
     ] },
     { title: 'Track', items: [
         { label: 'New Track…', fn: 'editorShowNewTrackModal' },
+        { label: 'Create Composite Arrangement…', fn: 'editorShowCompositeArrangementModal' },
         { cmd: 'renamePart' },
         { cmd: 'movePartEarlier' },
         { cmd: 'movePartLater' },
