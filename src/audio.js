@@ -50,6 +50,10 @@ let rafId = null;
 let audioLoadController = null;
 let audioLoadGeneration = 0;
 let activeSourceGeneration = 0;
+// A resolver audition is an explicit, temporary guide source. `null` means
+// normal Editor playback; an object with an empty event list intentionally
+// means song audio without any arrangement guide.
+let _editorGuidePreview = null;
 
 // Lazily create the shared AudioContext. Compose mode never decodes a
 // recording (loadAudio is the only other creation site), yet the transport
@@ -965,7 +969,9 @@ export function startPlayback() {
     // _restartPlaybackAt and stay immediate.
     let preRoll = 0;
     let countClicks = null;
-    const countBars = editorCountInBars();
+    // Focused preview tools own their short loop and should start immediately;
+    // an unrelated count-in preference would make A/B comparison confusing.
+    const countBars = _editorGuidePreview ? 0 : editorCountInBars();
     if (countBars > 0) {
         const plan = _countInPlanPure(S.beats, S.cursorTime, countBars);
         if (plan) { preRoll = plan.duration; countClicks = plan.clicks; }
@@ -1796,6 +1802,9 @@ export function _auditionPitch(midi) {
 // Event times for the active editing surface: the drum grid claps drum hits,
 // every other view claps the current arrangement's (time-sorted) notes.
 function _guideSourceTimes() {
+    if (typeof _editorGuidePreview !== 'undefined' && _editorGuidePreview) {
+        return _editorGuidePreview.events.map(event => event.t);
+    }
     // NB: NOT gated by per-part mute/solo — this is the surface's raw event
     // set, also consumed by _composeSongDuration() to bound the song. The
     // mixer's audible gate lives at the clap scheduler (below), so muting a
@@ -1826,6 +1835,7 @@ function _guideSourceTimes() {
 // The current part's GM program for the pitched guide (null = keep
 // clapping: no arrangements, or the drum grid — drums keep their clap).
 function _guideGmProgram() {
+    if (_editorGuidePreview) return _editorGuidePreview.gm;
     if (S.drumEditMode || !S.arrangements.length) return null;
     const arr = S.arrangements[S.currentArr];
     if (!arr) return null;
@@ -1837,6 +1847,7 @@ function _guideGmProgram() {
 // parts, capo-aware sounding pitch for fretted (the ONE shared converter,
 // _rollMidiForNote, so the guide can never disagree with the roll/strip).
 function _guidePitchedEvents() {
+    if (_editorGuidePreview) return _editorGuidePreview.events;
     if (S.drumEditMode || !S.arrangements.length) return [];
     const rctx = _rollPitchCtx();
     return _gmSanitizeEventsPure(notes().map(n => ({
@@ -2503,15 +2514,40 @@ function _guideResetSchedule() {
     if (typeof _bandFiredKeys !== 'undefined') _bandFiredKeys.clear();
 }
 
+// Temporary pitched source used by focused tools such as the composite
+// resolver. It never mutates S.arrangements, the active part, or persisted
+// guide preferences. An empty list is significant: suppress all chart guides
+// while retaining the imported song audio and optional metronome.
+export function editorSetGuidePreview(events = [], kind = 'guitar') {
+    const sanitized = _gmSanitizeEventsPure(events);
+    _editorGuidePreview = {
+        events: sanitized,
+        gm: sanitized.length ? editorGmVoiceFor(_gmKindPure(kind)) : null,
+    };
+    _guideResetSchedule();
+    _abApplyRefGain();
+    _guideTimerSync();
+}
+
+export function editorClearGuidePreview() {
+    if (!_editorGuidePreview) return;
+    _editorGuidePreview = null;
+    _guideResetSchedule();
+    _abApplyRefGain();
+    _guideTimerSync();
+}
+
 function _guideTick() {
+    const previewActive = !!_editorGuidePreview;
     // A/B overrides the claps pref while active: guide passes clap even
     // with the pref off; recording passes stay clean even with it on.
-    const claps = _abClapsEnabledPure(_abActive(), _abPhase, editorGuideClapEnabled());
+    const claps = previewActive
+        || _abClapsEnabledPure(_abActive(), _abPhase, editorGuideClapEnabled());
     const metro = editorMetronomeEnabled();
     // Band tracks are real DAW channels, not a flavor of the old guide-clap
     // toggle. They stay live beside stems until their own strip is muted.
     // A/B's recording-only pass remains an intentional global audition mute.
-    const bandParts = (editorPlayAllTracksEnabled() && !S.drumEditMode
+    const bandParts = (!previewActive && editorPlayAllTracksEnabled() && !S.drumEditMode
         && (!_abActive() || claps)) ? _bandPartsPure(S.arrangements, S.drumTab) : null;
     const bandLive = !!(bandParts && bandParts.length);
     if (!S.playing || !S.audioCtx || (!claps && !metro && !bandLive)) return;
@@ -2596,11 +2632,11 @@ function _guideTick() {
                 }
             }
         }
-    } else if (claps && host.partClapState().audible) {
+    } else if (claps && (previewActive || host.partClapState().audible)) {
         // Pitched GM mode (DAW 1.2): same charted times, instrument voices.
         // Falls back to the clap whenever the preset isn't ready (loading,
         // offline, no source) — the guide is never silent while enabled.
-        const gm = editorGuideVoiceMode() === 'gm' ? _guideGmProgram() : null;
+        const gm = (previewActive || editorGuideVoiceMode() === 'gm') ? _guideGmProgram() : null;
         if (gm !== null && gmPresetReady(gm)) {
             const bus = _ensureMasterBus();
             const groups = _gmEventsInWindowPure(_guidePitchedEvents(), from, to, 4);
@@ -2790,7 +2826,12 @@ export let _abPhase = 'recording';   // every play starts by hearing the real th
 // A/B compares the recording against the guide — meaningless with no reference
 // buffer (compose mode), where it would only gate half of each loop's claps to
 // silence. Require a buffer so compose loops keep every clap.
-function _abActive() { return _abOn && !!S.loopEnabled && !!S.audioBuffer; }
+function _abActive() {
+    // typeof keeps the function compatible with the repository's isolated
+    // pure-function transport harness, which extracts it without module state.
+    const previewInactive = typeof _editorGuidePreview === 'undefined' || !_editorGuidePreview;
+    return _abOn && previewInactive && !!S.loopEnabled && !!S.audioBuffer;
+}
 
 // Disarm A/B and restore the reference gain. main.js calls this from the loop
 // disarm and the song-change reset — the only A/B state writes outside this
@@ -2864,10 +2905,11 @@ export function _editorToggleLoopAB() {
 // Start/stop the scheduler to match "playing AND enabled". Called from
 // startPlayback/stopPlayback and from the toggle (mid-play enable works).
 export function _guideTimerSync() {
-    const bandLive = editorPlayAllTracksEnabled() && !S.drumEditMode
+    const previewActive = !!_editorGuidePreview;
+    const bandLive = !previewActive && editorPlayAllTracksEnabled() && !S.drumEditMode
         && _bandPartsPure(S.arrangements, S.drumTab).length > 0;
     const want = S.playing
-        && (editorGuideClapEnabled() || editorMetronomeEnabled() || _abActive() || bandLive);
+        && (previewActive || editorGuideClapEnabled() || editorMetronomeEnabled() || _abActive() || bandLive);
     if (want && !_guideTimer) {
         _guideScheduledUntil = _transportChartTimePure(
             S.playStartTime, S.playStartWall, S.audioCtx.currentTime, _auditionRate());

@@ -6,19 +6,37 @@
  */
 
 import { arrKind, _isFrettedKind } from '../instrument.js';
+import {
+    editorClearGuidePreview,
+    editorSetGuidePreview,
+    startPlayback,
+    stopPlayback,
+} from '../audio.js';
+import { _setBarSel, _setLoopRegionEnabled } from '../loop.js';
 import { S } from '../state.js';
 import { host } from '../host.js';
 import { _editorEscHtml, _installModalKeyboard, setStatus } from '../ui.js';
 import {
     analyzeCompositeMerge,
+    clearCompositeConflictResolution,
     compositeGapFillDefaultsForUnit,
     materializeCompositeArrangement,
     normalizeCompositeGapFillOptions,
     resolveCompositeConflict,
 } from './merge-engine.js';
+import {
+    buildCompositeConflictViewModel,
+    compositeTechniqueLabels,
+    renderCompositeConflictTabSvg,
+    renderCompositeDifferenceTable,
+} from './conflict-view.js';
+import { compositePreviewEventsPure, compositePreviewRegionPure } from './preview.js';
 
 let activePlan = null;
 let activeConflictIndex = 0;
+let activePreviewMode = '';
+let compositePreviewPlaying = false;
+let compositePreviewRestore = null;
 const customDrafts = new Map();
 const COMPOSITE_GAP_FILL_PREFS_KEY = 'editorCompositeGapFill';
 const COMPOSITE_GAP_FILL_CONTROL_CONFIG = Object.freeze({
@@ -111,6 +129,50 @@ function byId(id) {
     return document.getElementById(id);
 }
 
+function cloneLoopRegion(region) {
+    return region ? { ...region } : null;
+}
+
+function rememberCompositePreviewSession() {
+    if (compositePreviewRestore) return;
+    compositePreviewRestore = {
+        barSel: cloneLoopRegion(S.barSel),
+        loopEnabled: !!S.loopEnabled,
+        cursorTime: Number(S.cursorTime) || 0,
+    };
+}
+
+function updateCompositePreviewButtons() {
+    for (const button of document.querySelectorAll('[data-composite-preview]')) {
+        const active = button.dataset.compositePreview === activePreviewMode;
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        button.classList.toggle('ring-2', active);
+        button.classList.toggle('ring-emerald-400', active);
+    }
+    const stop = byId('editor-composite-preview-stop');
+    if (stop) stop.disabled = !compositePreviewPlaying;
+}
+
+function endCompositePreviewPlayback() {
+    const hadPreview = compositePreviewPlaying || !!activePreviewMode;
+    if (compositePreviewPlaying && S.playing) stopPlayback();
+    editorClearGuidePreview();
+    compositePreviewPlaying = false;
+    activePreviewMode = '';
+    updateCompositePreviewButtons();
+    if (hadPreview) setStatus('Composite preview stopped.');
+}
+
+function restoreCompositePreviewSession() {
+    endCompositePreviewPlayback();
+    if (!compositePreviewRestore) return;
+    const restore = compositePreviewRestore;
+    compositePreviewRestore = null;
+    _setBarSel(restore.barSel);
+    _setLoopRegionEnabled(restore.loopEnabled);
+    host.editorSeekToTime(restore.cursorTime);
+}
+
 function clearTransientState() {
     activePlan = null;
     activeConflictIndex = 0;
@@ -118,6 +180,7 @@ function clearTransientState() {
 }
 
 function resetResult(message = 'Choose two source tracks and analyze the merge.') {
+    restoreCompositePreviewSession();
     clearTransientState();
     const result = byId('editor-composite-result');
     if (result) result.innerHTML = `<p class="text-xs text-gray-400">${_editorEscHtml(message)}</p>`;
@@ -125,22 +188,20 @@ function resetResult(message = 'Choose two source tracks and analyze the merge.'
     if (finish) finish.disabled = true;
 }
 
+function setCompositeReviewMode(reviewing) {
+    const workspace = byId('editor-composite-workspace');
+    const setup = byId('editor-composite-setup');
+    if (setup) setup.hidden = reviewing;
+    if (workspace) workspace.style.gridTemplateColumns = reviewing
+        ? 'minmax(0, 1fr)' : '18rem minmax(0, 1fr)';
+}
+
 function optionMarkup(source) {
     return `<option value="${source.index}">${_editorEscHtml(source.arrangement.name || `Track ${source.index + 1}`)}</option>`;
 }
 
 function noteTechLabel(note) {
-    const tech = note && note.techniques || {};
-    const labels = [];
-    if (tech.palm_mute) labels.push('PM');
-    if (tech.hammer_on) labels.push('HO');
-    if (tech.pull_off) labels.push('PO');
-    if (tech.slide_to !== undefined && tech.slide_to !== null && Number(tech.slide_to) >= 0) labels.push('slide');
-    if (tech.bend) labels.push('bend');
-    if (tech.vibrato) labels.push('vibrato');
-    if (tech.harmonic || tech.harmonic_pinch) labels.push('harmonic');
-    if (tech.mute || tech.fret_hand_mute) labels.push('mute');
-    return labels.join(', ');
+    return compositeTechniqueLabels(note).join(', ');
 }
 
 function entryMarkup(entry, checkboxName = '') {
@@ -181,7 +242,8 @@ function renderOverview(plan) {
         const left = ((conflict.startBeat - start) / (end - start)) * 100;
         const width = Math.max(0.7, ((conflict.endBeat - conflict.startBeat) / (end - start)) * 100);
         const resolved = !!conflict.resolution;
-        return `<button type="button" data-conflict-index="${index}" class="absolute top-0 h-3 rounded-sm ${resolved ? 'bg-emerald-500' : 'bg-red-500'}"`
+        const current = index === activeConflictIndex;
+        return `<button type="button" data-conflict-index="${index}" aria-label="${resolved ? 'Resolved' : 'Unresolved'} conflict ${index + 1}" aria-current="${current ? 'true' : 'false'}" class="absolute top-0 h-3 rounded-sm ${resolved ? 'bg-emerald-500' : 'bg-red-500'} ${current ? 'ring-2 ring-white ring-inset' : ''}"`
             + ` style="left:${left}%;width:${width}%" title="${resolved ? 'Resolved' : 'Unresolved'} conflict ${index + 1}"></button>`;
     }).join('');
     return `<div class="mb-3"><div class="flex justify-between text-[10px] text-gray-500 mb-1"><span>Merge overview</span><span>red unresolved · green resolved</span></div>`
@@ -195,34 +257,127 @@ function customMarkup(group) {
     const render = (entry) => entryMarkup(entry, `custom-${group.id}`).replace(
         `data-entry-id="${entry.id}"`, `data-entry-id="${entry.id}"${checked.has(entry.id) ? ' checked' : ''}`);
     return `<div class="mt-3 border-t border-gray-700 pt-2">`
-        + `<p class="text-[11px] text-gray-400 mb-1">Choose individual notes. Cross-source notes may not overlap on one string.</p>`
+        + `<p class="text-[11px] text-gray-400 mb-1">Choose notes here or click them directly in either source tab. Cross-source notes may not overlap on one string.</p>`
         + [...group.primaryEntries, ...group.secondaryEntries].map(render).join('')
         + `<div id="editor-composite-custom-error" class="text-[11px] text-red-300 mt-1">${_editorEscHtml(group.validationError || '')}</div></div>`;
 }
 
+function renderPreviewControls(view) {
+    const resultReady = !!view.conflict.resolution;
+    const buttonClass = 'px-2.5 py-1.5 rounded border border-gray-600 bg-dark-700 hover:border-gray-400 text-[11px] disabled:opacity-40 disabled:cursor-not-allowed';
+    return `<div class="mb-3 rounded-lg border border-gray-700 bg-dark-900/70 px-3 py-2">`
+        + `<div class="flex flex-wrap items-center gap-2"><span class="text-[10px] uppercase tracking-wide text-gray-400 font-semibold mr-1">Audition this section</span>`
+        + `<button type="button" data-composite-preview="song" aria-pressed="false" class="${buttonClass}" ${S.audioBuffer ? '' : 'disabled'}>▶ Song audio</button>`
+        + `<button type="button" data-composite-preview="primary" aria-pressed="false" class="${buttonClass} text-sky-200">▶ ${_editorEscHtml(view.names.primary)} guide</button>`
+        + `<button type="button" data-composite-preview="secondary" aria-pressed="false" class="${buttonClass} text-violet-200">▶ ${_editorEscHtml(view.names.secondary)} guide</button>`
+        + `<button type="button" data-composite-preview="result" aria-pressed="false" class="${buttonClass} text-emerald-200" ${resultReady ? '' : 'disabled'}>▶ Result guide</button>`
+        + `<button type="button" id="editor-composite-preview-stop" class="${buttonClass}" disabled>■ Stop</button>`
+        + `<button type="button" id="editor-composite-keep-loop" class="ml-auto ${buttonClass}">Send section to Editor loop</button></div>`
+        + `<p class="mt-1.5 text-[10px] text-gray-500">The selected bars loop automatically. Pitched guides play over the imported song audio; Song audio suppresses arrangement guides. Your metronome setting remains active.</p></div>`;
+}
+
+function currentConflictView() {
+    if (!activePlan || !activePlan.conflicts.length) return null;
+    const group = activePlan.conflicts[activeConflictIndex];
+    const names = selectedSourceNames();
+    const draft = customDrafts.get(group.id);
+    return buildCompositeConflictViewModel({
+        plan: activePlan,
+        conflictIndex: activeConflictIndex,
+        primaryName: names.primary,
+        secondaryName: names.secondary,
+        customEntryIds: Array.isArray(draft) ? draft : null,
+    });
+}
+
+function setCompositeContextLoop(view) {
+    const region = compositePreviewRegionPure(view.context, activePlan.beats);
+    _setBarSel(region);
+    _setLoopRegionEnabled(true);
+    host.editorSeekToTime(region.startTime);
+    return region;
+}
+
+function startCompositePreview(mode) {
+    const view = currentConflictView();
+    if (!view) return;
+    rememberCompositePreviewSession();
+    if (S.playing) stopPlayback();
+    editorClearGuidePreview();
+    const lane = view.lanes.find(candidate => candidate.id === mode);
+    const events = mode === 'song' ? [] : compositePreviewEventsPure(
+        lane ? lane.entries : [], activePlan.primary, activePlan.beats,
+        activePlan.compatibility.stringCount);
+    editorSetGuidePreview(events, arrKind(activePlan.primary));
+    setCompositeContextLoop(view);
+    activePreviewMode = mode;
+    startPlayback();
+    compositePreviewPlaying = !!S.playing;
+    updateCompositePreviewButtons();
+    const label = mode === 'song' ? 'song audio' : `${mode} guide over song audio`;
+    setStatus(`Composite preview: looping ${label}.`);
+}
+
+function keepCompositeContextLoop() {
+    const view = currentConflictView();
+    if (!view) return;
+    rememberCompositePreviewSession();
+    endCompositePreviewPlayback();
+    setCompositeContextLoop(view);
+    // This button is an explicit handoff: do not restore the user's previous
+    // loop when the resolver closes.
+    compositePreviewRestore = null;
+    const button = byId('editor-composite-keep-loop');
+    if (button) button.textContent = 'Editor loop set ✓';
+    setStatus('Conflict context sent to the Editor loop. It will remain after you close the resolver.');
+}
+
 function renderConflict(plan) {
     if (!plan.conflicts.length) {
-        return `<div class="rounded border border-emerald-700/50 bg-emerald-950/20 p-3 text-xs text-emerald-200">No manual conflicts. The merge is ready to finish.</div>`;
+        return `<div class="rounded border border-emerald-700/50 bg-emerald-950/20 p-4 text-xs text-emerald-200 flex flex-wrap items-center justify-between gap-3">`
+            + `<div><b class="block text-sm mb-1">No manual conflicts</b>The analyzed merge is ready to finish.</div>`
+            + `<button type="button" id="editor-composite-edit-settings" class="px-2.5 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs text-gray-200">Edit setup</button></div>`;
     }
     activeConflictIndex = Math.max(0, Math.min(activeConflictIndex, plan.conflicts.length - 1));
     const group = plan.conflicts[activeConflictIndex];
     const names = selectedSourceNames();
+    const draft = customDrafts.get(group.id);
+    const view = buildCompositeConflictViewModel({
+        plan,
+        conflictIndex: activeConflictIndex,
+        primaryName: names.primary,
+        secondaryName: names.secondary,
+        customEntryIds: Array.isArray(draft) ? draft : null,
+    });
     const resolvedClass = group.resolution ? 'border-emerald-700/60' : 'border-red-700/60';
+    const unresolved = plan.conflicts.filter(conflict => !conflict.resolution).length;
     return `<section class="rounded border ${resolvedClass} bg-dark-800/70 p-3">`
-        + `<div class="flex items-center justify-between gap-3 mb-2">`
-        + `<div><h4 class="text-sm font-semibold">Conflict ${activeConflictIndex + 1} of ${plan.conflicts.length}</h4>`
-        + `<p class="text-[11px] text-gray-400">Beats ${group.startBeat.toFixed(3)}–${group.endBeat.toFixed(3)} · ${_editorEscHtml(conflictReason(group))}</p></div>`
-        + `<div class="flex gap-1"><button type="button" id="editor-composite-prev" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${activeConflictIndex === 0 ? 'disabled' : ''}>←</button>`
-        + `<button type="button" id="editor-composite-next" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${activeConflictIndex >= plan.conflicts.length - 1 ? 'disabled' : ''}>→</button></div></div>`
-        + `<div class="grid grid-cols-1 lg:grid-cols-2 gap-2">`
-        + `<div class="rounded bg-sky-950/20 border border-sky-800/40 p-2"><div class="text-xs font-medium text-sky-300 mb-1">${_editorEscHtml(names.primary)}</div><ul class="text-[11px]">${group.primaryEntries.map(e => entryMarkup(e)).join('')}</ul></div>`
-        + `<div class="rounded bg-violet-950/20 border border-violet-800/40 p-2"><div class="text-xs font-medium text-violet-300 mb-1">${_editorEscHtml(names.secondary)}</div><ul class="text-[11px]">${group.secondaryEntries.map(e => entryMarkup(e)).join('')}</ul></div>`
-        + `</div><div class="flex flex-wrap gap-2 mt-3">`
-        + `<button type="button" data-resolution="primary" class="px-2.5 py-1 rounded text-xs ${group.resolution === 'primary' ? 'bg-sky-600 text-white' : 'bg-dark-700 hover:bg-dark-600'}">Use ${_editorEscHtml(names.primary)}</button>`
-        + `<button type="button" data-resolution="secondary" class="px-2.5 py-1 rounded text-xs ${group.resolution === 'secondary' ? 'bg-violet-600 text-white' : 'bg-dark-700 hover:bg-dark-600'}">Use ${_editorEscHtml(names.secondary)}</button>`
-        + `<button type="button" data-resolution="compatible" class="px-2.5 py-1 rounded text-xs ${group.resolution === 'compatible' ? 'bg-emerald-700 text-white' : 'bg-dark-700 hover:bg-dark-600'}">Keep primary + compatible secondary</button>`
-        + `<button type="button" data-resolution="custom" class="px-2.5 py-1 rounded text-xs ${customDrafts.has(group.id) ? 'bg-amber-700 text-white' : 'bg-dark-700 hover:bg-dark-600'}">Custom notes…</button>`
-        + `</div>${customMarkup(group)}</section>`;
+        + `<div class="flex flex-wrap items-start justify-between gap-3 mb-3">`
+        + `<div><div class="flex flex-wrap items-center gap-2"><h4 class="text-sm font-semibold">Conflict ${activeConflictIndex + 1} of ${plan.conflicts.length}</h4>`
+        + `<span class="rounded-full px-2 py-0.5 text-[10px] ${group.resolution ? 'bg-emerald-900/70 text-emerald-200' : 'bg-red-900/70 text-red-200'}">${group.resolution ? 'Resolved' : 'Needs a choice'}</span>`
+        + `<span class="text-[10px] text-gray-500">${unresolved} unresolved</span></div>`
+        + `<p class="text-[11px] text-gray-400 mt-1">Beats ${group.startBeat.toFixed(3)}–${group.endBeat.toFixed(3)} · ${_editorEscHtml(conflictReason(group))}</p></div>`
+        + `<div class="flex flex-wrap gap-1"><button type="button" id="editor-composite-edit-settings" class="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 rounded text-xs">Edit setup</button>`
+        + `<button type="button" id="editor-composite-prev" aria-label="Previous conflict" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${activeConflictIndex === 0 ? 'disabled' : ''}>←</button>`
+        + `<button type="button" id="editor-composite-next" aria-label="Next conflict" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${activeConflictIndex >= plan.conflicts.length - 1 ? 'disabled' : ''}>→</button></div></div>`
+        + renderPreviewControls(view)
+        + `<div class="overflow-x-auto rounded-xl border border-gray-700/70 bg-slate-950">${renderCompositeConflictTabSvg(view)}</div>`
+        + `<div class="mt-3 rounded-lg border border-red-800/40 bg-red-950/20 px-3 py-2">`
+        + `<div class="text-[10px] uppercase tracking-wide text-red-300 font-semibold">Why this needs a choice</div>`
+        + `<p class="text-xs text-gray-200 mt-1">${_editorEscHtml(view.explanation)}</p>${renderCompositeDifferenceTable(view)}</div>`
+        + `<div class="mt-3"><div class="text-[10px] uppercase tracking-wide text-gray-500 mb-1.5">Build the merged result</div>`
+        + `<div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">`
+        + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Keep ${_editorEscHtml(names.primary)}</b><span class="text-[10px] text-gray-400">Use the complete primary gesture</span></button>`
+        + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}</b><span class="text-[10px] text-gray-400">Use the complete secondary gesture</span></button>`
+        + `<button type="button" data-resolution="compatible" aria-pressed="${group.resolution === 'compatible'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'compatible' ? 'bg-emerald-900/70 border-emerald-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-emerald-500'}"><b class="block text-emerald-300">Combine compatible</b><span class="text-[10px] text-gray-400">Primary plus safe secondary notes</span></button>`
+        + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id)}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection</b><span class="text-[10px] text-gray-400">Pick notes directly from either tab</span></button>`
+        + `</div></div>${customMarkup(group)}`
+        + `<div class="flex flex-wrap justify-between items-center gap-2 mt-3 pt-3 border-t border-gray-700">`
+        + `<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">`
+        + `<div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b><ul>${group.primaryEntries.map(e => entryMarkup(e)).join('')}</ul></div>`
+        + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e)).join('')}</ul></div></div></details>`
+        + `<div class="flex gap-2"><button type="button" id="editor-composite-reset-choice" class="px-2.5 py-1.5 rounded bg-dark-700 hover:bg-dark-600 text-xs disabled:opacity-40" ${group.resolution || customDrafts.has(group.id) ? '' : 'disabled'}>Reset choice</button>`
+        + `<button type="button" id="editor-composite-apply-next" class="px-3 py-1.5 rounded bg-accent hover:bg-accent-light text-xs font-medium disabled:opacity-40" ${group.resolution ? '' : 'disabled'}>Apply &amp; Next →</button></div></div></section>`;
 }
 
 function bindResultEvents() {
@@ -234,8 +389,18 @@ function bindResultEvents() {
             renderResult();
         });
     }
+    byId('editor-composite-edit-settings')?.addEventListener('click', () => {
+        endCompositePreviewPlayback();
+        setCompositeReviewMode(false);
+        byId('editor-composite-primary')?.focus();
+    });
     byId('editor-composite-prev')?.addEventListener('click', () => { activeConflictIndex--; renderResult(); });
     byId('editor-composite-next')?.addEventListener('click', () => { activeConflictIndex++; renderResult(); });
+    for (const button of result.querySelectorAll('[data-composite-preview]')) {
+        button.addEventListener('click', () => startCompositePreview(button.dataset.compositePreview));
+    }
+    byId('editor-composite-preview-stop')?.addEventListener('click', endCompositePreviewPlayback);
+    byId('editor-composite-keep-loop')?.addEventListener('click', keepCompositeContextLoop);
     for (const button of result.querySelectorAll('[data-resolution]')) {
         button.addEventListener('click', () => {
             const conflict = activePlan.conflicts[activeConflictIndex];
@@ -253,25 +418,54 @@ function bindResultEvents() {
             renderResult();
         });
     }
+    const toggleCustomEntry = entryId => {
+        const conflict = activePlan.conflicts[activeConflictIndex];
+        const draft = new Set(customDrafts.get(conflict.id) || []);
+        if (draft.has(entryId)) draft.delete(entryId);
+        else draft.add(entryId);
+        customDrafts.set(conflict.id, [...draft]);
+        resolveCompositeConflict(activePlan, conflict.id, 'custom', [...draft]);
+        renderResult();
+    };
     for (const checkbox of result.querySelectorAll('[data-entry-id]')) {
         checkbox.addEventListener('change', () => {
-            const conflict = activePlan.conflicts[activeConflictIndex];
-            const draft = new Set(customDrafts.get(conflict.id) || []);
-            if (checkbox.checked) draft.add(checkbox.dataset.entryId);
-            else draft.delete(checkbox.dataset.entryId);
-            customDrafts.set(conflict.id, [...draft]);
-            resolveCompositeConflict(activePlan, conflict.id, 'custom', [...draft]);
-            renderResult();
+            toggleCustomEntry(checkbox.dataset.entryId);
         });
     }
+    for (const note of result.querySelectorAll('[data-composite-entry-id]')) {
+        note.addEventListener('click', () => toggleCustomEntry(note.dataset.compositeEntryId));
+        note.addEventListener('keydown', event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            toggleCustomEntry(note.dataset.compositeEntryId);
+        });
+    }
+    byId('editor-composite-reset-choice')?.addEventListener('click', () => {
+        const conflict = activePlan.conflicts[activeConflictIndex];
+        customDrafts.delete(conflict.id);
+        clearCompositeConflictResolution(activePlan, conflict.id);
+        renderResult();
+    });
+    byId('editor-composite-apply-next')?.addEventListener('click', () => {
+        const total = activePlan.conflicts.length;
+        let next = -1;
+        for (let offset = 1; offset < total; offset++) {
+            const candidate = (activeConflictIndex + offset) % total;
+            if (!activePlan.conflicts[candidate].resolution) { next = candidate; break; }
+        }
+        if (next < 0 && activeConflictIndex < total - 1) next = activeConflictIndex + 1;
+        if (next >= 0) activeConflictIndex = next;
+        renderResult();
+    });
 }
 
 function renderResult() {
+    if (activePreviewMode) endCompositePreviewPlayback();
     const result = byId('editor-composite-result');
     if (!result || !activePlan) return;
     const stats = activePlan.stats;
     const unresolved = activePlan.conflicts.filter(c => !c.resolution).length;
-    result.innerHTML = `<div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-3 text-center text-[11px]">`
+    result.innerHTML = `<div class="grid gap-2 mb-3 text-center text-[11px]" style="grid-template-columns:repeat(5,minmax(0,1fr))">`
         + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
         + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryAddedCleanly}</b>clean additions</div>`
         + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates removed</div>`
@@ -284,6 +478,7 @@ function renderResult() {
 }
 
 function analyzeFromDialog() {
+    restoreCompositePreviewSession();
     const primaryIndex = Number(byId('editor-composite-primary')?.value);
     const secondaryIndex = Number(byId('editor-composite-secondary')?.value);
     const strategy = byId('editor-composite-strategy')?.value || 'gap-fill';
@@ -317,6 +512,7 @@ function analyzeFromDialog() {
     activePlan = plan;
     activeConflictIndex = 0;
     customDrafts.clear();
+    setCompositeReviewMode(true);
     renderResult();
 }
 
@@ -412,6 +608,7 @@ async function finishMerge() {
 }
 
 export function editorHideCompositeArrangementModal() {
+    restoreCompositePreviewSession();
     byId('editor-composite-modal')?.remove();
     clearTransientState();
 }
@@ -438,12 +635,12 @@ export function editorShowCompositeArrangementModal() {
     const modal = document.createElement('div');
     modal.id = 'editor-composite-modal';
     modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4';
-    modal.innerHTML = `<div class="w-[68rem] max-w-full flex flex-col rounded-xl border border-gray-600 bg-dark-800 shadow-2xl" style="height:min(46rem, calc(100vh - 2rem))" role="dialog" aria-modal="true" aria-labelledby="editor-composite-title">`
+    modal.innerHTML = `<div class="max-w-full flex flex-col rounded-xl border border-gray-600 bg-dark-800 shadow-2xl" style="width:min(90rem, calc(100vw - 2rem));height:min(54rem, calc(100vh - 2rem))" role="dialog" aria-modal="true" aria-labelledby="editor-composite-title">`
         + `<header class="flex items-start justify-between gap-4 border-b border-gray-700 px-5 py-3"><div><h3 id="editor-composite-title" class="text-base font-semibold">Create Composite Arrangement</h3>`
         + `<p class="text-xs text-gray-400 mt-0.5">Combine two synchronized fretted tracks. Both sources stay unchanged.</p></div>`
         + `<button type="button" id="editor-composite-close" class="text-gray-400 hover:text-white text-xl leading-none" aria-label="Close">×</button></header>`
-        + `<div class="grid grid-cols-1 md:grid-cols-[18rem_1fr] min-h-0 flex-1 overflow-hidden">`
-        + `<aside class="border-r border-gray-700 p-4 space-y-3 overflow-y-auto">`
+        + `<div id="editor-composite-workspace" class="grid min-h-0 flex-1 overflow-hidden" style="grid-template-columns:18rem minmax(0,1fr)">`
+        + `<aside id="editor-composite-setup" class="border-r border-gray-700 p-4 space-y-3 overflow-y-auto">`
         + `<label class="block text-xs text-gray-300">Primary track<select id="editor-composite-primary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
         + `<label class="block text-xs text-gray-300">Secondary track<select id="editor-composite-secondary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
         + `<label class="block text-xs text-gray-300">Merge strategy<select id="editor-composite-strategy" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="gap-fill">Gap Fill — secondary during rests</option><option value="full-union">Full Union — all compatible notes</option></select></label>`

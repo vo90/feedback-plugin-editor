@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
     analyzeCompositeMerge,
+    clearCompositeConflictResolution,
     COMPOSITE_GAP_FILL_DEFAULTS,
     compositeGapFillDefaultsForUnit,
     compositeCompatibility,
@@ -277,6 +278,9 @@ test('primary, secondary, and compatible conflict choices resolve deterministica
     assert.equal(result.type, 'guitar');
     assert.deepEqual(result.notes.map(n => [n.string, n.fret]), [[0, 3], [2, 7], [3, 9]]);
     assert.equal(result.chords.length, 0);
+    assert.equal(clearCompositeConflictResolution(plan, plan.conflicts[0].id).ok, true);
+    assert.equal(plan.conflicts[0].resolution, null);
+    assert.equal(plan.stats.unresolvedConflicts, 1);
 });
 
 test('custom resolution refuses cross-source same-string collisions', () => {

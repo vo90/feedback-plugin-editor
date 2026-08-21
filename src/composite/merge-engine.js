@@ -453,6 +453,13 @@ export function analyzeCompositeMerge({
         primary,
         secondary,
         beats,
+        // Preserve both flattened sources for synchronized resolver context.
+        // These entries are immutable plan data; the visual layer must not
+        // reconstruct a source track from only accepted merge material.
+        sourceEntries: {
+            primary: primaryEntries,
+            secondary: allSecondary,
+        },
         fixedEntries,
         conflicts,
         duplicates,
@@ -519,6 +526,16 @@ export function resolveCompositeConflict(plan, conflictId, resolution, selectedE
     group.selectedEntryIds = selected.map(e => e.id);
     plan.stats.unresolvedConflicts = plan.conflicts.filter(c => !c.resolution).length;
     return { ok: true, selected };
+}
+
+export function clearCompositeConflictResolution(plan, conflictId) {
+    const group = plan && plan.conflicts && plan.conflicts.find(c => c.id === conflictId);
+    if (!group) return { ok: false, error: 'Conflict not found.' };
+    group.resolution = null;
+    group.selectedEntryIds = [];
+    group.validationError = '';
+    plan.stats.unresolvedConflicts = plan.conflicts.filter(c => !c.resolution).length;
+    return { ok: true };
 }
 
 export function compositeResolvedEntries(plan) {
