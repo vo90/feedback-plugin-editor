@@ -3,7 +3,13 @@ import test from 'node:test';
 
 import {
     analyzeGuidedComposite,
+    clearGuidedRepeatGroup,
+    detachGuidedRepeatOccurrence,
+    GUIDED_REPEAT_MODE_MATCHING,
+    guidedReviewGroups,
+    resolveGuidedRepeatGroup,
     splitGuidedDecisionBlock,
+    splitGuidedRepeatGroup,
 } from '../src/composite/guided-engine.js';
 import {
     materializeCompositeArrangement,
@@ -195,4 +201,124 @@ test('choices that collide across decision blocks become explicit transition err
     assert.equal(transition.ok, false);
     assert.equal(plan.conflicts[1].validationKind, 'transition');
     assert.match(plan.conflicts[1].validationError, /^Transition conflict:/);
+});
+
+test('matching Guided repetitions become one review decision and resolve together', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 0, 3), note(9, 0, 3)]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9, 1, 5)]),
+        beats,
+        sections: [{ name: 'Chorus', number: 2, start_time: 4 }],
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(plan.conflicts.length, 2);
+    assert.equal(guidedReviewGroups(plan).length, 1);
+    assert.equal(plan.stats.reviewDecisions, 1);
+    assert.equal(plan.stats.repeatedOccurrences, 1);
+
+    const result = resolveGuidedRepeatGroup(plan, plan.conflicts[0].id, 'primary');
+    assert.equal(result.ok, true);
+    assert.equal(result.applied.length, 2);
+    assert.ok(plan.conflicts.every(block => block.resolution === 'primary'));
+    assert.deepEqual(plan.conflicts.map(block => block.selectedEntryIds.length), [1, 1]);
+
+    const cleared = clearGuidedRepeatGroup(plan, plan.conflicts[1].id);
+    assert.equal(cleared.ok, true);
+    assert.ok(plan.conflicts.every(block => block.resolution === null));
+});
+
+test('repetition matching rejects a musical or technique difference', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 0, 3),
+            note(9, 0, 3, 0, { bend: true }),
+        ]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9, 1, 5)]),
+        beats,
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(plan.conflicts.length, 2);
+    assert.equal(guidedReviewGroups(plan).length, 2);
+    assert.equal(plan.stats.repeatedOccurrences, 0);
+});
+
+test('custom selections map to occurrence-specific note ids', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 0, 3, 0, { link_next: true }), note(2, 0, 5),
+            note(9.003, 0, 3, 0, { link_next: true }), note(10.003, 0, 5),
+        ]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9.003, 1, 5)]),
+        beats,
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(guidedReviewGroups(plan).length, 1,
+        'tiny relative timing differences stay inside the existing safety tolerance');
+    const first = plan.conflicts[0];
+    const result = resolveGuidedRepeatGroup(plan, first.id, 'custom', [first.primaryEntries[0].id]);
+    assert.equal(result.ok, true);
+    assert.equal(new Set(plan.conflicts.flatMap(block => block.selectedEntryIds)).size, 4);
+    assert.deepEqual(plan.conflicts.map(block => block.selectedEntryIds), [
+        ['primary:0', 'primary:1'],
+        ['primary:2', 'primary:3'],
+    ]);
+});
+
+test('an unsafe repeated occurrence falls back to individual transition review', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 0, 3), note(9, 0, 3)]),
+        secondary: arrangement('Rhythm', [
+            note(1, 1, 5),
+            note(7, 0, 7, 3),
+            note(9, 1, 5),
+        ]),
+        beats,
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(guidedReviewGroups(plan).length, 1);
+    const result = resolveGuidedRepeatGroup(plan, plan.conflicts[0].id, 'primary');
+    assert.equal(result.partial, true);
+    assert.equal(result.applied.length, 1);
+    assert.equal(result.failed.length, 1);
+    assert.equal(plan.conflicts[0].resolution, 'primary');
+    assert.equal(plan.conflicts[1].resolution, null);
+    assert.equal(plan.conflicts[1].repeatDetached, true);
+    assert.equal(plan.conflicts[1].validationKind, 'transition');
+    assert.equal(guidedReviewGroups(plan).length, 2);
+});
+
+test('grouped bar splitting mirrors the relative split across repetitions', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 0, 3), note(5, 0, 4),
+            note(13, 0, 3), note(17, 0, 4),
+        ]),
+        secondary: arrangement('Rhythm', [
+            note(1, 1, 5), note(5, 1, 6),
+            note(13, 1, 5), note(17, 1, 6),
+        ]),
+        beats,
+        sections: [{ name: 'Chorus', number: 2, start_time: 6 }],
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    assert.equal(plan.conflicts.length, 2);
+    assert.equal(guidedReviewGroups(plan).length, 1);
+    const split = splitGuidedRepeatGroup(plan, plan.conflicts[0].id, 4);
+    assert.equal(split.ok, true);
+    assert.equal(plan.conflicts.length, 4);
+    assert.equal(guidedReviewGroups(plan).length, 2);
+    assert.deepEqual(plan.conflicts.map(block => block.rangeEndBeat - block.startBeat), [4, 4, 4, 4]);
+});
+
+test('a matching occurrence can be detached for individual review', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 0, 3), note(9, 0, 3)]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9, 1, 5)]),
+        beats,
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    const detached = detachGuidedRepeatOccurrence(plan, plan.conflicts[1].id);
+    assert.equal(detached.ok, true);
+    assert.equal(plan.conflicts[1].repeatDetached, true);
+    assert.equal(guidedReviewGroups(plan).length, 2);
 });

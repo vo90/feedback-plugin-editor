@@ -26,7 +26,18 @@ import {
     normalizeCompositeGapFillOptions,
     resolveCompositeConflict,
 } from './merge-engine.js';
-import { analyzeGuidedComposite, splitGuidedDecisionBlock } from './guided-engine.js';
+import {
+    analyzeGuidedComposite,
+    clearGuidedRepeatGroup,
+    detachGuidedRepeatOccurrence,
+    GUIDED_REPEAT_MODE_EVERY,
+    GUIDED_REPEAT_MODE_MATCHING,
+    guidedRepeatGroupForBlock,
+    guidedReviewGroups,
+    normalizeGuidedRepeatMode,
+    resolveGuidedRepeatGroup,
+    splitGuidedRepeatGroup,
+} from './guided-engine.js';
 import {
     buildCompositeConflictViewModel,
     compositeTechniqueLabels,
@@ -42,6 +53,7 @@ let compositePreviewPlaying = false;
 let compositePreviewRestore = null;
 const customDrafts = new Map();
 const COMPOSITE_GAP_FILL_PREFS_KEY = 'editorCompositeGapFill';
+const COMPOSITE_GUIDED_PREFS_KEY = 'editorCompositeGuided';
 const COMPOSITE_GAP_FILL_CONTROL_CONFIG = Object.freeze({
     beats: Object.freeze({ minimumMax: 16, minimumStep: 0.25, marginMax: 8, marginStep: 0.125 }),
     seconds: Object.freeze({ minimumMax: 30, minimumStep: 0.05, marginMax: 10, marginStep: 0.025 }),
@@ -77,6 +89,25 @@ function loadCompositeGapFillPreferences() {
 
 function saveCompositeGapFillPreferences(preferences) {
     try { localStorage.setItem(COMPOSITE_GAP_FILL_PREFS_KEY, JSON.stringify(preferences)); } catch (_) { /* blocked storage */ }
+}
+
+export function _compositeGuidedPreferencesPure(raw) {
+    let parsed = raw;
+    if (typeof raw === 'string') {
+        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+    }
+    if (!parsed || typeof parsed !== 'object') parsed = {};
+    return { repeatMode: normalizeGuidedRepeatMode(parsed.repeatMode) };
+}
+
+function loadCompositeGuidedPreferences() {
+    let raw = null;
+    try { raw = localStorage.getItem(COMPOSITE_GUIDED_PREFS_KEY); } catch (_) { /* blocked storage */ }
+    return _compositeGuidedPreferencesPure(raw);
+}
+
+function saveCompositeGuidedPreferences(preferences) {
+    try { localStorage.setItem(COMPOSITE_GUIDED_PREFS_KEY, JSON.stringify(preferences)); } catch (_) { /* blocked storage */ }
 }
 
 function inputNumber(id) {
@@ -244,6 +275,59 @@ function selectedSourceNames() {
     };
 }
 
+function guidedRepeatContext(plan, block) {
+    if (!plan || plan.strategy !== 'guided' || !block) return null;
+    const groups = guidedReviewGroups(plan);
+    const group = guidedRepeatGroupForBlock(plan, block);
+    const memberIds = new Set(group && group.memberIds || [block.id]);
+    const members = plan.conflicts.map((candidate, index) => ({ block: candidate, index }))
+        .filter(candidate => memberIds.has(candidate.block.id));
+    const groupIndex = Math.max(0, groups.findIndex(candidate => candidate.id === group?.id));
+    return {
+        group,
+        groups,
+        members,
+        groupIndex,
+        grouped: members.length > 1,
+        allResolved: members.every(candidate => !!candidate.block.resolution),
+        unresolvedDecisions: groups.filter(candidate => candidate.memberIds.some(id => {
+            const candidateBlock = plan.conflicts.find(item => item.id === id);
+            return candidateBlock && !candidateBlock.resolution;
+        })).length,
+    };
+}
+
+function guidedOccurrenceMarkup(context, activeBlock) {
+    if (!context || !context.grouped) return '';
+    const chips = context.members.map(({ block, index }, occurrenceIndex) => {
+        const active = block.id === activeBlock.id;
+        const stateClass = block.validationError ? 'border-red-500 text-red-200'
+            : block.resolution ? 'border-emerald-600 text-emerald-200'
+                : 'border-amber-600 text-amber-100';
+        return `<button type="button" data-conflict-index="${index}" aria-current="${active ? 'true' : 'false'}" class="px-2 py-1 rounded border ${stateClass} ${active ? 'ring-2 ring-white/70' : 'bg-dark-700'}">`
+            + `${occurrenceIndex + 1}. ${_editorEscHtml(block.label)}</button>`;
+    }).join('');
+    return `<div class="mb-3 rounded-lg border border-sky-800/50 bg-sky-950/20 px-3 py-2">`
+        + `<div class="flex flex-wrap items-center justify-between gap-2"><div><b class="text-xs text-sky-100">Matching repetition group</b>`
+        + `<p class="text-[10px] text-sky-200/70">This choice applies to ${context.members.length} musically matching occurrences. Select one below to inspect or audition its surrounding context.</p></div>`
+        + `<button type="button" id="editor-composite-detach-occurrence" class="px-2 py-1 rounded bg-dark-700 hover:bg-dark-600 text-[10px]">Review this occurrence separately</button></div>`
+        + `<div class="flex flex-wrap gap-1.5 mt-2">${chips}</div></div>`;
+}
+
+function activateGuidedReviewGroup(plan, group, preferUnresolved = true) {
+    if (!plan || !group) return false;
+    let index = -1;
+    for (const memberId of group.memberIds) {
+        const candidate = plan.conflicts.findIndex(block => block.id === memberId
+            && (!preferUnresolved || !block.resolution));
+        if (candidate >= 0) { index = candidate; break; }
+    }
+    if (index < 0) index = plan.conflicts.findIndex(block => group.memberIds.includes(block.id));
+    if (index < 0) return false;
+    activeConflictIndex = index;
+    return true;
+}
+
 function renderOverview(plan) {
     if (plan.strategy === 'guided') {
         const start = Number.isFinite(plan.timelineStartBeat) ? plan.timelineStartBeat : 0;
@@ -292,7 +376,8 @@ function renderOverview(plan) {
 }
 
 function customMarkup(group) {
-    const draft = customDrafts.get(group.id);
+    const draft = customDrafts.get(group.id)
+        || (group.resolution === 'custom' ? group.selectedEntryIds : null);
     if (!draft) return '';
     const checked = new Set(draft);
     const stringCount = activePlan?.compatibility?.stringCount || 6;
@@ -383,6 +468,8 @@ function renderConflict(plan) {
     }
     activeConflictIndex = Math.max(0, Math.min(activeConflictIndex, plan.conflicts.length - 1));
     const group = plan.conflicts[activeConflictIndex];
+    const repeatContext = guided ? guidedRepeatContext(plan, group) : null;
+    const repeatCountSuffix = repeatContext?.grouped ? ` for all ${repeatContext.members.length}` : '';
     const names = selectedSourceNames();
     const draft = customDrafts.get(group.id);
     const view = buildCompositeConflictViewModel({
@@ -394,7 +481,9 @@ function renderConflict(plan) {
     });
     const resolvedClass = group.validationError ? 'border-red-700/60'
         : group.resolution ? 'border-emerald-700/60' : guided ? 'border-amber-700/60' : 'border-red-700/60';
-    const unresolved = plan.conflicts.filter(conflict => !conflict.resolution).length;
+    const unresolved = repeatContext
+        ? repeatContext.unresolvedDecisions
+        : plan.conflicts.filter(conflict => !conflict.resolution).length;
     const stateClass = group.validationError ? 'bg-red-900/70 text-red-200'
         : group.resolution ? 'bg-emerald-900/70 text-emerald-200'
             : guided ? 'bg-amber-900/70 text-amber-100' : 'bg-red-900/70 text-red-200';
@@ -405,26 +494,33 @@ function renderConflict(plan) {
         : `Beats ${group.startBeat.toFixed(3)}–${group.endBeat.toFixed(3)} · ${conflictReason(group)}`;
     const resolutionButtons = guided
         ? `<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">`
-            + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Use ${_editorEscHtml(names.primary)}</b><span class="text-[10px] text-gray-400">Choose this arrangement for the complete block</span></button>`
-            + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}</b><span class="text-[10px] text-gray-400">Choose this arrangement for the complete block</span></button>`
-            + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id)}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection</b><span class="text-[10px] text-gray-400">Pick complete notes and gestures from either track</span></button></div>`
+            + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Use ${_editorEscHtml(names.primary)}${repeatCountSuffix}</b><span class="text-[10px] text-gray-400">Choose this arrangement for the complete ${repeatContext?.grouped ? 'repetition group' : 'block'}</span></button>`
+            + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}${repeatCountSuffix}</b><span class="text-[10px] text-gray-400">Choose this arrangement for the complete ${repeatContext?.grouped ? 'repetition group' : 'block'}</span></button>`
+            + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id) || group.resolution === 'custom'}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) || group.resolution === 'custom' ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection${repeatCountSuffix}</b><span class="text-[10px] text-gray-400">Pick complete notes and gestures from either track</span></button></div>`
         : `<div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">`
             + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Keep ${_editorEscHtml(names.primary)}</b><span class="text-[10px] text-gray-400">Use the complete primary gesture</span></button>`
             + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}</b><span class="text-[10px] text-gray-400">Use the complete secondary gesture</span></button>`
             + `<button type="button" data-resolution="compatible" aria-pressed="${group.resolution === 'compatible'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'compatible' ? 'bg-emerald-900/70 border-emerald-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-emerald-500'}"><b class="block text-emerald-300">Combine compatible</b><span class="text-[10px] text-gray-400">Primary plus safe secondary notes</span></button>`
             + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id)}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection</b><span class="text-[10px] text-gray-400">Pick notes directly from either tab</span></button></div>`;
     const splitMarkup = guided && group.splitPoints && group.splitPoints.length
-        ? `<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Split this block at a bar</summary><div class="flex flex-wrap gap-1 mt-2">${group.splitPoints.map(point => `<button type="button" data-guided-split-beat="${point.beat}" class="px-2 py-1 rounded border border-gray-600 bg-dark-700 hover:border-gray-400">${_editorEscHtml(point.label)}</button>`).join('')}</div></details>`
+        ? `<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Split ${repeatContext?.grouped ? `all ${repeatContext.members.length} matching occurrences` : 'this block'} at a bar</summary><div class="flex flex-wrap gap-1 mt-2">${group.splitPoints.map(point => `<button type="button" data-guided-split-beat="${point.beat}" class="px-2 py-1 rounded border border-gray-600 bg-dark-700 hover:border-gray-400">${_editorEscHtml(point.label)}</button>`).join('')}</div></details>`
         : '';
+    const decisionNumber = repeatContext ? repeatContext.groupIndex + 1 : activeConflictIndex + 1;
+    const decisionTotal = repeatContext ? repeatContext.groups.length : plan.conflicts.length;
+    const canReset = repeatContext
+        ? repeatContext.members.some(candidate => candidate.block.resolution
+            || customDrafts.has(candidate.block.id))
+        : group.resolution || customDrafts.has(group.id);
     return `<section class="rounded border ${resolvedClass} bg-dark-800/70 p-3">`
         + `<div class="flex flex-wrap items-start justify-between gap-3 mb-3">`
-        + `<div><div class="flex flex-wrap items-center gap-2"><h4 class="text-sm font-semibold">${guided ? 'Decision block' : 'Conflict'} ${activeConflictIndex + 1} of ${plan.conflicts.length}</h4>`
+        + `<div><div class="flex flex-wrap items-center gap-2"><h4 class="text-sm font-semibold">${guided ? 'Review decision' : 'Conflict'} ${decisionNumber} of ${decisionTotal}</h4>`
         + `<span class="rounded-full px-2 py-0.5 text-[10px] ${stateClass}">${stateLabel}</span>`
-        + `<span class="text-[10px] text-gray-500">${unresolved} unresolved</span></div>`
+        + `<span class="text-[10px] text-gray-500">${unresolved} ${guided ? 'decisions left' : 'unresolved'}</span></div>`
         + `<p class="text-[11px] text-gray-400 mt-1">${_editorEscHtml(rangeLabel)}</p></div>`
         + `<div class="flex flex-wrap gap-1"><button type="button" id="editor-composite-edit-settings" class="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 rounded text-xs">Edit setup</button>`
-        + `<button type="button" id="editor-composite-prev" aria-label="Previous conflict" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${activeConflictIndex === 0 ? 'disabled' : ''}>←</button>`
-        + `<button type="button" id="editor-composite-next" aria-label="Next conflict" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${activeConflictIndex >= plan.conflicts.length - 1 ? 'disabled' : ''}>→</button></div></div>`
+        + `<button type="button" id="editor-composite-prev" aria-label="Previous review decision" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${decisionNumber <= 1 ? 'disabled' : ''}>←</button>`
+        + `<button type="button" id="editor-composite-next" aria-label="Next review decision" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${decisionNumber >= decisionTotal ? 'disabled' : ''}>→</button></div></div>`
+        + guidedOccurrenceMarkup(repeatContext, group)
         + renderPreviewControls(view)
         + `<div class="overflow-x-auto rounded-xl border border-gray-700/70 bg-slate-950">${renderCompositeConflictTabSvg(view)}</div>`
         + `<div class="mt-3 rounded-lg border ${guided ? 'border-amber-800/40 bg-amber-950/20' : 'border-red-800/40 bg-red-950/20'} px-3 py-2">`
@@ -436,7 +532,7 @@ function renderConflict(plan) {
         + `<div class="space-y-2">${splitMarkup}<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">`
         + `<div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b><ul>${group.primaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div>`
         + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div></div></details></div>`
-        + `<div class="flex gap-2"><button type="button" id="editor-composite-reset-choice" class="px-2.5 py-1.5 rounded bg-dark-700 hover:bg-dark-600 text-xs disabled:opacity-40" ${group.resolution || customDrafts.has(group.id) ? '' : 'disabled'}>Reset choice</button>`
+        + `<div class="flex gap-2"><button type="button" id="editor-composite-reset-choice" class="px-2.5 py-1.5 rounded bg-dark-700 hover:bg-dark-600 text-xs disabled:opacity-40" ${canReset ? '' : 'disabled'}>Reset ${repeatContext?.grouped ? 'group ' : ''}choice</button>`
         + `<button type="button" id="editor-composite-apply-next" class="px-3 py-1.5 rounded bg-accent hover:bg-accent-light text-xs font-medium disabled:opacity-40" ${group.resolution ? '' : 'disabled'}>Apply &amp; Next →</button></div></div></section>`;
 }
 
@@ -452,14 +548,14 @@ function bindResultEvents() {
     for (const button of result.querySelectorAll('[data-guided-split-beat]')) {
         button.addEventListener('click', () => {
             const block = activePlan.conflicts[activeConflictIndex];
-            const split = splitGuidedDecisionBlock(activePlan, block.id,
+            const split = splitGuidedRepeatGroup(activePlan, block.id,
                 Number(button.dataset.guidedSplitBeat));
             if (!split.ok) {
                 block.validationError = split.error;
                 renderResult();
                 return;
             }
-            customDrafts.delete(block.id);
+            for (const replacedId of split.replacedBlockIds || [block.id]) customDrafts.delete(replacedId);
             activeConflictIndex = split.index;
             renderResult();
         });
@@ -469,8 +565,19 @@ function bindResultEvents() {
         setCompositeReviewMode(false);
         byId('editor-composite-primary')?.focus();
     });
-    byId('editor-composite-prev')?.addEventListener('click', () => { activeConflictIndex--; renderResult(); });
-    byId('editor-composite-next')?.addEventListener('click', () => { activeConflictIndex++; renderResult(); });
+    const moveDecision = offset => {
+        if (activePlan.strategy !== 'guided') {
+            activeConflictIndex += offset;
+        } else {
+            const block = activePlan.conflicts[activeConflictIndex];
+            const context = guidedRepeatContext(activePlan, block);
+            const target = context?.groups[context.groupIndex + offset];
+            if (target) activateGuidedReviewGroup(activePlan, target, false);
+        }
+        renderResult();
+    };
+    byId('editor-composite-prev')?.addEventListener('click', () => moveDecision(-1));
+    byId('editor-composite-next')?.addEventListener('click', () => moveDecision(1));
     for (const button of result.querySelectorAll('[data-composite-preview]')) {
         button.addEventListener('click', () => startCompositePreview(button.dataset.compositePreview));
     }
@@ -482,20 +589,35 @@ function bindResultEvents() {
             const resolution = button.dataset.resolution;
             if (resolution === 'custom') {
                 if (!customDrafts.has(conflict.id)) {
-                    customDrafts.set(conflict.id, conflict.primaryEntries.map(e => e.id));
+                    customDrafts.set(conflict.id, conflict.resolution === 'custom'
+                        ? [...conflict.selectedEntryIds]
+                        : conflict.primaryEntries.map(e => e.id));
                 }
                 const draft = customDrafts.get(conflict.id);
-                resolveCompositeConflict(activePlan, conflict.id, 'custom', draft);
+                if (activePlan.strategy === 'guided') {
+                    resolveGuidedRepeatGroup(activePlan, conflict.id, 'custom', draft);
+                } else {
+                    resolveCompositeConflict(activePlan, conflict.id, 'custom', draft);
+                }
             } else {
-                customDrafts.delete(conflict.id);
-                resolveCompositeConflict(activePlan, conflict.id, resolution);
+                const repeatContext = activePlan.strategy === 'guided'
+                    ? guidedRepeatContext(activePlan, conflict) : null;
+                for (const member of repeatContext?.members || [{ block: conflict }]) {
+                    customDrafts.delete(member.block.id);
+                }
+                if (activePlan.strategy === 'guided') {
+                    resolveGuidedRepeatGroup(activePlan, conflict.id, resolution);
+                } else {
+                    resolveCompositeConflict(activePlan, conflict.id, resolution);
+                }
             }
             renderResult();
         });
     }
     const toggleCustomEntry = entryId => {
         const conflict = activePlan.conflicts[activeConflictIndex];
-        const draft = new Set(customDrafts.get(conflict.id) || []);
+        const draft = new Set(customDrafts.get(conflict.id)
+            || (conflict.resolution === 'custom' ? conflict.selectedEntryIds : []));
         const unitIds = compositeSelectionUnitIds(conflict, entryId);
         const selected = unitIds.length && unitIds.every(unitId => draft.has(unitId));
         for (const unitId of unitIds) {
@@ -503,7 +625,11 @@ function bindResultEvents() {
             else draft.add(unitId);
         }
         customDrafts.set(conflict.id, [...draft]);
-        resolveCompositeConflict(activePlan, conflict.id, 'custom', [...draft]);
+        if (activePlan.strategy === 'guided') {
+            resolveGuidedRepeatGroup(activePlan, conflict.id, 'custom', [...draft]);
+        } else {
+            resolveCompositeConflict(activePlan, conflict.id, 'custom', [...draft]);
+        }
         renderResult();
     };
     for (const checkbox of result.querySelectorAll('[data-entry-id]')) {
@@ -521,19 +647,45 @@ function bindResultEvents() {
     }
     byId('editor-composite-reset-choice')?.addEventListener('click', () => {
         const conflict = activePlan.conflicts[activeConflictIndex];
+        if (activePlan.strategy === 'guided') {
+            const context = guidedRepeatContext(activePlan, conflict);
+            for (const member of context?.members || [{ block: conflict }]) customDrafts.delete(member.block.id);
+            clearGuidedRepeatGroup(activePlan, conflict.id);
+        } else {
+            customDrafts.delete(conflict.id);
+            clearCompositeConflictResolution(activePlan, conflict.id);
+        }
+        renderResult();
+    });
+    byId('editor-composite-detach-occurrence')?.addEventListener('click', () => {
+        const conflict = activePlan.conflicts[activeConflictIndex];
         customDrafts.delete(conflict.id);
-        clearCompositeConflictResolution(activePlan, conflict.id);
+        const detached = detachGuidedRepeatOccurrence(activePlan, conflict.id);
+        if (!detached.ok) conflict.validationError = detached.error;
         renderResult();
     });
     byId('editor-composite-apply-next')?.addEventListener('click', () => {
-        const total = activePlan.conflicts.length;
-        let next = -1;
-        for (let offset = 1; offset < total; offset++) {
-            const candidate = (activeConflictIndex + offset) % total;
-            if (!activePlan.conflicts[candidate].resolution) { next = candidate; break; }
+        if (activePlan.strategy === 'guided') {
+            const context = guidedRepeatContext(activePlan, activePlan.conflicts[activeConflictIndex]);
+            let target = null;
+            for (let offset = 1; offset < context.groups.length; offset++) {
+                const candidate = context.groups[(context.groupIndex + offset) % context.groups.length];
+                if (candidate.memberIds.some(id => {
+                    const block = activePlan.conflicts.find(item => item.id === id);
+                    return block && !block.resolution;
+                })) { target = candidate; break; }
+            }
+            if (target) activateGuidedReviewGroup(activePlan, target);
+        } else {
+            const total = activePlan.conflicts.length;
+            let next = -1;
+            for (let offset = 1; offset < total; offset++) {
+                const candidate = (activeConflictIndex + offset) % total;
+                if (!activePlan.conflicts[candidate].resolution) { next = candidate; break; }
+            }
+            if (next < 0 && activeConflictIndex < total - 1) next = activeConflictIndex + 1;
+            if (next >= 0) activeConflictIndex = next;
         }
-        if (next < 0 && activeConflictIndex < total - 1) next = activeConflictIndex + 1;
-        if (next >= 0) activeConflictIndex = next;
         renderResult();
     });
 }
@@ -542,27 +694,42 @@ function renderResult() {
     if (activePreviewMode) endCompositePreviewPlayback();
     const result = byId('editor-composite-result');
     if (!result || !activePlan) return;
+    if (activePlan.strategy === 'guided') guidedReviewGroups(activePlan);
     const stats = activePlan.stats;
-    const unresolved = activePlan.conflicts.filter(c => !c.resolution).length;
+    const unresolvedBlocks = activePlan.conflicts.filter(c => !c.resolution).length;
+    const unresolved = activePlan.strategy === 'guided'
+        ? stats.unresolvedReviewDecisions : unresolvedBlocks;
     const normalized = stats.timingAdjustments || 0;
     const normalizationNotice = normalized ? `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-[11px] text-sky-100">`
         + `<b>${normalized} tiny imported note ${normalized === 1 ? 'boundary was' : 'boundaries were'} normalized</b> within the tempo-aware ${Math.round(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS * 1000)} ms safety limit. `
         + `Only the new composite will use the trimmed trail; both source tracks remain unchanged.</div>` : '';
+    const repeatNotice = activePlan.repeatNotice;
+    let repeatNoticeMarkup = '';
+    if (repeatNotice && (repeatNotice.requested > 1 || repeatNotice.kind !== 'applied')) {
+        if (repeatNotice.kind === 'partial') {
+            const failures = repeatNotice.failed.map(failure => `${failure.label}: ${failure.error}`).join(' ');
+            repeatNoticeMarkup = `<div class="mb-3 rounded border border-amber-700/60 bg-amber-950/25 px-3 py-2 text-[11px] text-amber-100"><b>Applied to ${repeatNotice.applied} of ${repeatNotice.requested} matching occurrences.</b> ${repeatNotice.failed.length} exceptional occurrence${repeatNotice.failed.length === 1 ? '' : 's'} remains for individual review. ${_editorEscHtml(failures)}</div>`;
+        } else if (repeatNotice.kind === 'detached') {
+            repeatNoticeMarkup = `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-[11px] text-sky-100"><b>${_editorEscHtml(repeatNotice.label)} is now reviewed separately.</b></div>`;
+        } else {
+            repeatNoticeMarkup = `<div class="mb-3 rounded border border-emerald-800/50 bg-emerald-950/20 px-3 py-2 text-[11px] text-emerald-100"><b>Choice applied to all ${repeatNotice.applied} matching occurrences.</b> Every occurrence passed its own transition validation.</div>`;
+        }
+    }
     const statCards = activePlan.strategy === 'guided'
         ? `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
             + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryNotes}</b>secondary notes</div>`
             + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates collapsed</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.decisionBlocks}</b>decision blocks</div>`
-            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-amber-300' : 'text-emerald-300'}">${unresolved}</b>left to review</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.reviewDecisions}</b>review decisions <span class="block text-[9px] text-gray-500">${stats.decisionBlocks} occurrences</span></div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-amber-300' : 'text-emerald-300'}">${unresolved}</b>decisions left</div>`
         : `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
             + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryAddedCleanly}</b>clean additions</div>`
             + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates removed</div>`
             + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondarySkippedByStrategy}</b>strategy skips</div>`
             + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-red-300' : 'text-emerald-300'}">${unresolved}</b>unresolved</div>`;
     result.innerHTML = `<div class="grid gap-2 mb-3 text-center text-[11px]" style="grid-template-columns:repeat(5,minmax(0,1fr))">${statCards}</div>`
-        + normalizationNotice + renderOverview(activePlan) + renderConflict(activePlan);
+        + normalizationNotice + repeatNoticeMarkup + renderOverview(activePlan) + renderConflict(activePlan);
     const finish = byId('editor-composite-finish');
-    if (finish) finish.disabled = unresolved > 0;
+    if (finish) finish.disabled = unresolvedBlocks > 0;
     bindResultEvents();
 }
 
@@ -571,6 +738,7 @@ function analyzeFromDialog() {
     const primaryIndex = Number(byId('editor-composite-primary')?.value);
     const secondaryIndex = Number(byId('editor-composite-secondary')?.value);
     const strategy = byId('editor-composite-strategy')?.value || 'gap-fill';
+    const repeatMode = normalizeGuidedRepeatMode(byId('editor-composite-repeat-mode')?.value);
     const gapFill = gapFillOptionsFromDialog();
     if (strategy === 'gap-fill') {
         const preferences = loadCompositeGapFillPreferences();
@@ -580,6 +748,8 @@ function analyzeFromDialog() {
             transitionMargin: gapFill.transitionMargin,
         };
         saveCompositeGapFillPreferences(preferences);
+    } else if (strategy === 'guided') {
+        saveCompositeGuidedPreferences({ repeatMode });
     }
     const error = byId('editor-composite-error');
     if (primaryIndex === secondaryIndex) {
@@ -593,7 +763,7 @@ function analyzeFromDialog() {
         beats: S.beats,
     };
     const plan = strategy === 'guided'
-        ? analyzeGuidedComposite({ ...sources, sections: S.sections })
+        ? analyzeGuidedComposite({ ...sources, sections: S.sections, repeatMode })
         : analyzeCompositeMerge({ ...sources, strategy: 'gap-fill', gapFill });
     if (!plan.ok) {
         if (error) error.textContent = plan.compatibility.errors.join(' ');
@@ -724,6 +894,7 @@ export function editorShowCompositeArrangementModal() {
     const gapFillUnit = gapFillPreferences.unit;
     const gapFillValues = gapFillPreferences[gapFillUnit]
         || compositeGapFillDefaultsForUnit(gapFillUnit);
+    const guidedPreferences = loadCompositeGuidedPreferences();
     const modal = document.createElement('div');
     modal.id = 'editor-composite-modal';
     modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4';
@@ -736,6 +907,9 @@ export function editorShowCompositeArrangementModal() {
         + `<label class="block text-xs text-gray-300">Primary track<select id="editor-composite-primary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
         + `<label class="block text-xs text-gray-300">Secondary track<select id="editor-composite-secondary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
         + `<label class="block text-xs text-gray-300">Hybrid mode<select id="editor-composite-strategy" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="gap-fill">Quick Hybrid — fill primary rests</option><option value="guided">Guided Hybrid — choose musical blocks</option></select></label>`
+        + `<fieldset id="editor-composite-guided-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Guided repetition review</legend>`
+        + `<label class="block text-xs text-gray-300">Repeated material<select id="editor-composite-repeat-mode" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="${GUIDED_REPEAT_MODE_EVERY}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_EVERY ? ' selected' : ''}>Review every occurrence</option><option value="${GUIDED_REPEAT_MODE_MATCHING}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_MATCHING ? ' selected' : ''}>Group matching repetitions</option></select></label>`
+        + `<p class="text-[10px] text-gray-500">Matching repetitions are compared note-for-note in both tracks. Every occurrence still receives its own transition safety check.</p></fieldset>`
         + `<fieldset id="editor-composite-gap-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Gap Fill safety</legend>`
         + `<label class="block text-xs text-gray-300">Timing unit<select id="editor-composite-gap-unit" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="beats"${gapFillUnit === 'beats' ? ' selected' : ''}>Beats — follows song tempo</option><option value="seconds"${gapFillUnit === 'seconds' ? ' selected' : ''}>Seconds — fixed real time</option></select></label>`
         + `<label class="block text-xs text-gray-300"><span id="editor-composite-min-gap-label">Minimum usable gap (${gapFillUnit})</span><input id="editor-composite-min-gap" type="number" min="0" value="${gapFillValues.minimumGap}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
@@ -743,7 +917,7 @@ export function editorShowCompositeArrangementModal() {
         + `<p class="text-[10px] text-gray-500">Every complete note, chord, trail, and connected gesture must fit inside the protected gap.</p></fieldset>`
         + `<label class="block text-xs text-gray-300">New track name<input id="editor-composite-name" maxlength="60" value="${_editorEscHtml(name)}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
         + `<button type="button" id="editor-composite-analyze" class="w-full px-3 py-2 rounded bg-accent hover:bg-accent-light text-xs font-medium">Analyze merge</button>`
-        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Quick Hybrid</b> adds complete secondary gestures only inside protected primary rests. <b class="text-gray-300">Guided Hybrid</b> skips identical and unambiguous material, then asks you to choose only where both arrangements differ.</div>`
+        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Quick Hybrid</b> adds complete secondary gestures only inside protected primary rests. <b class="text-gray-300">Guided Hybrid</b> skips identical and unambiguous material, then asks you to choose only where both arrangements differ. Matching-repetition mode can reuse one reviewed choice across musically identical occurrences.</div>`
         + `</aside><main class="p-4 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-xs text-gray-400">Choose two source tracks and analyze the merge.</p></div></main></div>`
         + `<footer class="border-t border-gray-700 px-5 py-3 flex items-center gap-3"><div id="editor-composite-error" class="text-xs text-red-300 flex-1"></div>`
         + `<button type="button" id="editor-composite-cancel" class="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs">Cancel</button>`
@@ -757,12 +931,14 @@ export function editorShowCompositeArrangementModal() {
     byId('editor-composite-finish').addEventListener('click', finishMerge);
     const strategySelect = byId('editor-composite-strategy');
     const unitSelect = byId('editor-composite-gap-unit');
+    const repeatModeSelect = byId('editor-composite-repeat-mode');
     let currentGapFillUnit = gapFillUnit;
     const syncGapControls = () => {
-        const disabled = strategySelect?.value !== 'gap-fill';
+        const gapDisabled = strategySelect?.value !== 'gap-fill';
         for (const input of [unitSelect, byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
-            if (input) input.disabled = disabled;
+            if (input) input.disabled = gapDisabled;
         }
+        if (repeatModeSelect) repeatModeSelect.disabled = strategySelect?.value !== 'guided';
     };
     const rememberCurrentGapFillValues = () => {
         const options = gapFillOptionsFromDialog(currentGapFillUnit);
@@ -779,6 +955,11 @@ export function editorShowCompositeArrangementModal() {
             resetResult('Sources or merge settings changed. Analyze the merge again.');
         });
     }
+    repeatModeSelect.addEventListener('change', () => {
+        guidedPreferences.repeatMode = normalizeGuidedRepeatMode(repeatModeSelect.value);
+        saveCompositeGuidedPreferences(guidedPreferences);
+        resetResult('Guided repetition review changed. Analyze the merge again.');
+    });
     unitSelect.addEventListener('change', () => {
         rememberCurrentGapFillValues();
         currentGapFillUnit = unitSelect.value === 'seconds' ? 'seconds' : 'beats';

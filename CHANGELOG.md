@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guided Hybrid can review matching repetitions once.** A remembered setup
+  option keeps the existing occurrence-by-occurrence workflow or groups strict
+  note-for-note repetitions across the song. Grouped Lead, Rhythm, and Custom
+  choices map to each occurrence's own note IDs; bar splits mirror at the same
+  relative boundary. Every copy still receives independent whole-trail
+  transition validation, and an unsafe copy automatically falls back to its
+  own review instead of blocking or weakening the safe copies. The review UI
+  exposes every grouped location for context audition and can detach any one
+  occurrence on demand.
 - **Guided Hybrid replaces the impractical Full Union workflow.** The composite
   resolver now builds adaptive decision blocks from real bars and named song
   sections, automatically collapses identical/empty/single-source regions, and

@@ -275,6 +275,10 @@ Choose one of two hybrid modes:
 - **Guided Hybrid** divides the song into adaptive musical blocks. Named song
   sections are hard landmarks, blocks are at most four bars, and you can split
   any block down to one bar before choosing either source or a custom result.
+  Its **Repeated material** setting can either review every occurrence
+  independently (the safe default) or group note-for-note matching repetitions
+  into one review decision. A grouped choice is applied to every occurrence;
+  use the occurrence chips to inspect or audition their different song contexts.
 
 Exact duplicates — same string, fret, onset, duration, and techniques — are
 included once. Guided Hybrid also accepts empty and single-source regions
@@ -284,6 +288,16 @@ neighboring blocks create an unplayable handoff, the resolver marks the
 transition instead of clipping it. **Finish Merge** stays unavailable until
 every decision is valid. Creating the result is undoable; save the song to
 commit the new arrangement to the feedpak.
+
+Repetition grouping compares both source alternatives, including relative
+timing, complete trails, techniques, chords, and connected gestures; a shared
+section name alone is never enough. Custom selections and bar splits are mapped
+to the matching relative notes and bars. Every occurrence still receives its
+own transition check. If one copy is unsafe in its surrounding context, the
+safe copies keep the shared choice while the exception returns to individual
+review. You can also detach any occurrence manually with **Review this
+occurrence separately**. The repetition setting is remembered for the next
+Guided Hybrid analysis.
 
 The **Tracks column** down the left side lists every track — the master mix,
 any studio stems, and each transcription part — beside a matching timeline lane.

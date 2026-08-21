@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
     _compositeEligibleSourcesPure,
     _compositeGapFillPreferencesPure,
+    _compositeGuidedPreferencesPure,
     _compositeUniqueNamePure,
     CreateCompositeArrangementCmd,
 } from '../src/composite/resolver-ui.js';
@@ -40,6 +41,20 @@ test('composite Gap Fill preferences remember separate beat and second values', 
         unit: 'seconds',
         beats: { minimumGap: 2, transitionMargin: 0.5 },
         seconds: { minimumGap: 0.8, transitionMargin: 0.2 },
+    });
+});
+
+test('Guided repetition preferences default safely and remember grouped review', () => {
+    assert.deepEqual(_compositeGuidedPreferencesPure(null), {
+        repeatMode: 'every-occurrence',
+    });
+    assert.deepEqual(_compositeGuidedPreferencesPure(JSON.stringify({
+        repeatMode: 'matching-repetitions',
+    })), {
+        repeatMode: 'matching-repetitions',
+    });
+    assert.deepEqual(_compositeGuidedPreferencesPure('{broken'), {
+        repeatMode: 'every-occurrence',
     });
 });
 

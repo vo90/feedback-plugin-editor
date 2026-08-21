@@ -9,13 +9,22 @@
 import { beatOf, timeOf } from '../beats.js';
 import {
     COMPOSITE_BEAT_EPS,
+    clearCompositeConflictResolution,
     compositeCollisionReason,
     compositeEntryHasSource,
     compositeTimingToleranceSeconds,
     prepareCompositeSources,
+    resolveCompositeConflict,
 } from './merge-engine.js';
 
 export const GUIDED_MAX_REVIEW_BARS = 4;
+export const GUIDED_REPEAT_MODE_EVERY = 'every-occurrence';
+export const GUIDED_REPEAT_MODE_MATCHING = 'matching-repetitions';
+
+export function normalizeGuidedRepeatMode(value) {
+    return value === GUIDED_REPEAT_MODE_MATCHING
+        ? GUIDED_REPEAT_MODE_MATCHING : GUIDED_REPEAT_MODE_EVERY;
+}
 
 function finite(value, fallback = 0) {
     const number = Number(value);
@@ -25,6 +34,14 @@ function finite(value, fallback = 0) {
 function compareEntries(left, right) {
     return left.startBeat - right.startBeat || left.string - right.string
         || left.fret - right.fret || left.id.localeCompare(right.id);
+}
+
+function stable(value) {
+    if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value === undefined ? null : value);
 }
 
 function near(left, right) {
@@ -314,12 +331,279 @@ function decisionBlock(cells, id) {
         selectedEntryIds: [],
         validationError: '',
         validationKind: '',
+        repeatDetached: false,
+        repeatAppliedFromId: '',
         cells,
         splitPoints: cells.slice(1).filter(cell => cell.barBoundary).map(cell => ({
             beat: cell.startBeat,
             label: `Split before bar ${cell.measure}`,
         })),
     };
+}
+
+function uniqueEntries(entries) {
+    const unique = new Map();
+    for (const entry of entries || []) unique.set(entry.id, entry);
+    return [...unique.values()].sort(compareEntries);
+}
+
+function commonEntriesForBlock(block) {
+    return uniqueEntries((block.cells || []).flatMap(cell => cell.commonEntries || []));
+}
+
+function repeatLaneEntries(block, lane, includeCommon = true) {
+    const laneEntries = lane === 'secondary'
+        ? block.secondaryEntries || [] : block.primaryEntries || [];
+    return uniqueEntries([
+        ...(includeCommon ? commonEntriesForBlock(block) : []),
+        ...laneEntries,
+    ]);
+}
+
+function entrySemanticKey(entry) {
+    const target = entry.connectedTarget;
+    return stable({
+        string: entry.string,
+        fret: entry.fret,
+        technique: entry.techniqueSignature,
+        connectedTarget: target ? {
+            string: target.string,
+            fret: target.fret,
+            technique: target.techniqueSignature,
+        } : null,
+    });
+}
+
+function blockRepeatFingerprint(block) {
+    const semanticKeys = lane => repeatLaneEntries(block, lane).map(entrySemanticKey);
+    return stable({
+        cells: (block.cells || []).map(cell => ({
+            barBoundary: !!cell.barBoundary,
+            common: (cell.commonEntries || []).length,
+            primary: (cell.primaryEntries || []).length,
+            secondary: (cell.secondaryEntries || []).length,
+        })),
+        transition: (block.reasons || []).includes('transition'),
+        primary: semanticKeys('primary'),
+        secondary: semanticKeys('secondary'),
+    });
+}
+
+function localBeatTolerance(beats, beat) {
+    const seconds = Math.abs(timeOf(beats, beat + 0.5) - timeOf(beats, beat - 0.5));
+    if (!Number.isFinite(seconds) || seconds <= 1e-9) return COMPOSITE_BEAT_EPS;
+    return Math.max(COMPOSITE_BEAT_EPS,
+        compositeTimingToleranceSeconds(beats, beat) / seconds);
+}
+
+function relativeTimingNear(leftValue, rightValue, leftBase, rightBase, beats) {
+    const leftRelative = finite(leftValue) - leftBase;
+    const rightRelative = finite(rightValue) - rightBase;
+    const tolerance = Math.max(
+        localBeatTolerance(beats, finite(leftValue)),
+        localBeatTolerance(beats, finite(rightValue)),
+    );
+    return Math.abs(leftRelative - rightRelative) <= tolerance + COMPOSITE_BEAT_EPS;
+}
+
+function repeatEntriesEquivalent(left, right, leftBase, rightBase, beats) {
+    if (!left || !right || entrySemanticKey(left) !== entrySemanticKey(right)) return false;
+    for (const field of ['startBeat', 'endBeat', 'effectiveEndBeat', 'playableStartBeat', 'playableEndBeat']) {
+        if (!relativeTimingNear(left[field], right[field], leftBase, rightBase, beats)) return false;
+    }
+    const leftTarget = left.connectedTarget;
+    const rightTarget = right.connectedTarget;
+    if (!!leftTarget !== !!rightTarget) return false;
+    if (leftTarget && (!relativeTimingNear(leftTarget.startBeat, rightTarget.startBeat,
+        leftBase, rightBase, beats)
+        || !relativeTimingNear(leftTarget.endBeat, rightTarget.endBeat,
+            leftBase, rightBase, beats))) return false;
+    return true;
+}
+
+function repeatEntryListsEquivalent(leftEntries, rightEntries, leftBase, rightBase, beats) {
+    if (leftEntries.length !== rightEntries.length) return false;
+    for (let index = 0; index < leftEntries.length; index++) {
+        if (!repeatEntriesEquivalent(leftEntries[index], rightEntries[index],
+            leftBase, rightBase, beats)) return false;
+    }
+    return true;
+}
+
+function repeatBlocksEquivalent(left, right, beats) {
+    if (!left || !right || left.repeatFingerprint !== right.repeatFingerprint) return false;
+    if ((left.cells || []).length !== (right.cells || []).length) return false;
+    for (let index = 0; index < left.cells.length; index++) {
+        const leftCell = left.cells[index];
+        const rightCell = right.cells[index];
+        if (!relativeTimingNear(leftCell.startBeat, rightCell.startBeat,
+            left.startBeat, right.startBeat, beats)
+            || !relativeTimingNear(leftCell.endBeat, rightCell.endBeat,
+                left.startBeat, right.startBeat, beats)) return false;
+    }
+    return repeatEntryListsEquivalent(repeatLaneEntries(left, 'primary'),
+        repeatLaneEntries(right, 'primary'), left.startBeat, right.startBeat, beats)
+        && repeatEntryListsEquivalent(repeatLaneEntries(left, 'secondary'),
+            repeatLaneEntries(right, 'secondary'), left.startBeat, right.startBeat, beats);
+}
+
+export function refreshGuidedRepeatGroups(plan) {
+    if (!plan || plan.strategy !== 'guided') return [];
+    const matching = normalizeGuidedRepeatMode(plan.repeatMode) === GUIDED_REPEAT_MODE_MATCHING;
+    const groups = [];
+    for (const block of plan.conflicts || []) {
+        block.repeatFingerprint = blockRepeatFingerprint(block);
+        let group = null;
+        if (matching && !block.repeatDetached) {
+            group = groups.find(candidate => !candidate.detached
+                && candidate.fingerprint === block.repeatFingerprint
+                && repeatBlocksEquivalent(
+                    plan.conflicts.find(item => item.id === candidate.representativeId),
+                    block,
+                    plan.beats,
+                ));
+        }
+        if (!group) {
+            group = {
+                id: `repeat:${groups.length + 1}`,
+                fingerprint: block.repeatFingerprint,
+                representativeId: block.id,
+                memberIds: [],
+                detached: !!block.repeatDetached,
+            };
+            groups.push(group);
+        }
+        group.memberIds.push(block.id);
+        block.repeatGroupId = group.id;
+    }
+    plan.repeatGroups = groups;
+    const unresolvedGroups = groups.filter(group => group.memberIds.some(id => {
+        const block = plan.conflicts.find(candidate => candidate.id === id);
+        return block && !block.resolution;
+    })).length;
+    plan.stats.reviewDecisions = groups.length;
+    plan.stats.repeatedOccurrences = Math.max(0, (plan.conflicts || []).length - groups.length);
+    plan.stats.unresolvedReviewDecisions = unresolvedGroups;
+    plan.stats.unresolvedConflicts = (plan.conflicts || []).filter(block => !block.resolution).length;
+    return groups;
+}
+
+export function guidedReviewGroups(plan) {
+    return plan && plan.strategy === 'guided'
+        ? refreshGuidedRepeatGroups(plan) : [];
+}
+
+export function guidedRepeatGroupForBlock(plan, blockOrId) {
+    if (!plan || plan.strategy !== 'guided') return null;
+    const blockId = typeof blockOrId === 'string' ? blockOrId : blockOrId && blockOrId.id;
+    refreshGuidedRepeatGroups(plan);
+    return plan.repeatGroups.find(group => group.memberIds.includes(blockId)) || null;
+}
+
+function blocksForRepeatGroup(plan, group) {
+    const ids = new Set(group && group.memberIds || []);
+    return (plan.conflicts || []).filter(block => ids.has(block.id));
+}
+
+function mapCustomSelection(fromBlock, toBlock, selectedEntryIds, beats) {
+    if (fromBlock === toBlock) return [...(selectedEntryIds || [])];
+    const selected = new Set(selectedEntryIds || []);
+    const mapped = [];
+    for (const lane of ['primary', 'secondary']) {
+        const fromEntries = repeatLaneEntries(fromBlock, lane, false);
+        const toEntries = repeatLaneEntries(toBlock, lane, false);
+        if (fromEntries.length !== toEntries.length) return null;
+        for (let index = 0; index < fromEntries.length; index++) {
+            if (!repeatEntriesEquivalent(fromEntries[index], toEntries[index],
+                fromBlock.startBeat, toBlock.startBeat, beats)) return null;
+            if (selected.has(fromEntries[index].id)) mapped.push(toEntries[index].id);
+        }
+    }
+    return mapped;
+}
+
+export function resolveGuidedRepeatGroup(plan, blockId, resolution, selectedEntryIds = []) {
+    const sourceBlock = plan && plan.conflicts && plan.conflicts.find(block => block.id === blockId);
+    if (!sourceBlock || plan.strategy !== 'guided') {
+        return { ok: false, error: 'Guided decision block not found.', applied: [], failed: [] };
+    }
+    const group = guidedRepeatGroupForBlock(plan, sourceBlock);
+    const members = blocksForRepeatGroup(plan, group);
+    for (const block of members) {
+        clearCompositeConflictResolution(plan, block.id);
+        block.repeatAppliedFromId = '';
+    }
+    const applied = [];
+    const failed = [];
+    for (const block of members) {
+        const mappedIds = resolution === 'custom'
+            ? mapCustomSelection(sourceBlock, block, selectedEntryIds, plan.beats)
+            : selectedEntryIds;
+        if (mappedIds === null) {
+            block.validationKind = 'repetition';
+            block.validationError = 'This occurrence no longer matches the repeated custom selection.';
+            failed.push({ id: block.id, label: block.label, error: block.validationError });
+            block.repeatDetached = true;
+            continue;
+        }
+        const result = resolveCompositeConflict(plan, block.id, resolution, mappedIds);
+        if (result.ok) {
+            block.repeatAppliedFromId = block.id === sourceBlock.id ? '' : sourceBlock.id;
+            applied.push({ id: block.id, label: block.label });
+        } else {
+            failed.push({ id: block.id, label: block.label, error: block.validationError || result.error });
+            block.repeatDetached = true;
+        }
+    }
+    plan.repeatNotice = {
+        kind: failed.length ? 'partial' : 'applied',
+        requested: members.length,
+        applied: applied.length,
+        failed,
+    };
+    refreshGuidedRepeatGroups(plan);
+    return {
+        ok: failed.length === 0,
+        partial: applied.length > 0 && failed.length > 0,
+        applied,
+        failed,
+        error: failed.length && !applied.length ? failed[0].error : '',
+    };
+}
+
+export function clearGuidedRepeatGroup(plan, blockId) {
+    const block = plan && plan.conflicts && plan.conflicts.find(candidate => candidate.id === blockId);
+    if (!block || plan.strategy !== 'guided') return { ok: false, error: 'Guided decision block not found.' };
+    const group = guidedRepeatGroupForBlock(plan, block);
+    const members = blocksForRepeatGroup(plan, group);
+    for (const member of members) {
+        clearCompositeConflictResolution(plan, member.id);
+        member.repeatAppliedFromId = '';
+    }
+    plan.repeatNotice = null;
+    refreshGuidedRepeatGroups(plan);
+    return { ok: true, cleared: members.map(member => member.id) };
+}
+
+export function detachGuidedRepeatOccurrence(plan, blockId) {
+    const block = plan && plan.conflicts && plan.conflicts.find(candidate => candidate.id === blockId);
+    if (!block || plan.strategy !== 'guided') return { ok: false, error: 'Guided decision block not found.' };
+    const group = guidedRepeatGroupForBlock(plan, block);
+    if (!group || group.memberIds.length < 2) {
+        return { ok: false, error: 'This occurrence is already reviewed separately.' };
+    }
+    clearCompositeConflictResolution(plan, block.id);
+    block.repeatDetached = true;
+    block.repeatAppliedFromId = '';
+    plan.repeatNotice = {
+        kind: 'detached',
+        requested: group.memberIds.length,
+        applied: 0,
+        failed: [],
+        label: block.label,
+    };
+    refreshGuidedRepeatGroups(plan);
+    return { ok: true, blockId: block.id };
 }
 
 function automaticRegions(cells) {
@@ -381,7 +665,7 @@ function fixedEntriesForCells(cells) {
 }
 
 export function analyzeGuidedComposite({
-    primary, secondary, beats = [], sections = [],
+    primary, secondary, beats = [], sections = [], repeatMode = GUIDED_REPEAT_MODE_EVERY,
 } = {}) {
     const prepared = prepareCompositeSources({ primary, secondary, beats });
     if (!prepared.ok) {
@@ -400,9 +684,10 @@ export function analyzeGuidedComposite({
     const conflicts = buildDecisionBlocks(cells);
     const fixedEntries = fixedEntriesForCells(cells);
     const automatic = automaticRegions(cells);
-    return {
+    const plan = {
         ok: true,
         strategy: 'guided',
+        repeatMode: normalizeGuidedRepeatMode(repeatMode),
         compatibility: prepared.compatibility,
         primary,
         secondary,
@@ -436,23 +721,67 @@ export function analyzeGuidedComposite({
             unresolvedConflicts: conflicts.length,
         },
     };
+    refreshGuidedRepeatGroups(plan);
+    return plan;
+}
+
+function splitGuidedBlocks(plan, blocks, splitPoints, activeBlockId) {
+    const replacements = new Map();
+    for (let index = 0; index < blocks.length; index++) {
+        const block = blocks[index];
+        const point = splitPoints[index];
+        const leftCells = block.cells.filter(cell => cell.startBeat < point.beat - COMPOSITE_BEAT_EPS);
+        const rightCells = block.cells.filter(cell => cell.startBeat >= point.beat - COMPOSITE_BEAT_EPS);
+        if (!leftCells.length || !rightCells.length) {
+            return { ok: false, error: 'The split would create an empty block.' };
+        }
+        const left = decisionBlock(leftCells, `guided:${plan.nextGuidedBlockId++}`);
+        const right = decisionBlock(rightCells, `guided:${plan.nextGuidedBlockId++}`);
+        left.repeatDetached = !!block.repeatDetached;
+        right.repeatDetached = !!block.repeatDetached;
+        replacements.set(block.id, [left, right]);
+    }
+    plan.conflicts = plan.conflicts.flatMap(block => replacements.get(block.id) || [block]);
+    plan.stats.decisionBlocks = plan.conflicts.length;
+    plan.stats.conflictHunks = plan.conflicts.length;
+    plan.stats.unresolvedConflicts = plan.conflicts.filter(candidate => !candidate.resolution).length;
+    plan.repeatNotice = null;
+    refreshGuidedRepeatGroups(plan);
+    const activeBlocks = replacements.get(activeBlockId);
+    const activeIndex = activeBlocks ? plan.conflicts.findIndex(block => block.id === activeBlocks[0].id) : 0;
+    return {
+        ok: true,
+        index: activeIndex,
+        blocks: activeBlocks || [],
+        allBlocks: [...replacements.values()].flat(),
+        replacedBlockIds: [...replacements.keys()],
+    };
 }
 
 export function splitGuidedDecisionBlock(plan, blockId, splitBeat) {
     if (!plan || plan.strategy !== 'guided') return { ok: false, error: 'A Guided Hybrid plan is required.' };
-    const index = plan.conflicts.findIndex(block => block.id === blockId);
-    if (index < 0) return { ok: false, error: 'Decision block not found.' };
-    const block = plan.conflicts[index];
+    const block = plan.conflicts.find(candidate => candidate.id === blockId);
+    if (!block) return { ok: false, error: 'Decision block not found.' };
     const point = (block.splitPoints || []).find(candidate => near(candidate.beat, finite(splitBeat, NaN)));
     if (!point) return { ok: false, error: 'That bar is not a valid split point.' };
-    const leftCells = block.cells.filter(cell => cell.startBeat < point.beat - COMPOSITE_BEAT_EPS);
-    const rightCells = block.cells.filter(cell => cell.startBeat >= point.beat - COMPOSITE_BEAT_EPS);
-    if (!leftCells.length || !rightCells.length) return { ok: false, error: 'The split would create an empty block.' };
-    const left = decisionBlock(leftCells, `guided:${plan.nextGuidedBlockId++}`);
-    const right = decisionBlock(rightCells, `guided:${plan.nextGuidedBlockId++}`);
-    plan.conflicts.splice(index, 1, left, right);
-    plan.stats.decisionBlocks = plan.conflicts.length;
-    plan.stats.conflictHunks = plan.conflicts.length;
-    plan.stats.unresolvedConflicts = plan.conflicts.filter(candidate => !candidate.resolution).length;
-    return { ok: true, index, blocks: [left, right] };
+    return splitGuidedBlocks(plan, [block], [point], block.id);
+}
+
+export function splitGuidedRepeatGroup(plan, blockId, splitBeat) {
+    if (!plan || plan.strategy !== 'guided') return { ok: false, error: 'A Guided Hybrid plan is required.' };
+    const block = plan.conflicts.find(candidate => candidate.id === blockId);
+    if (!block) return { ok: false, error: 'Decision block not found.' };
+    const activePoint = (block.splitPoints || []).find(candidate => near(candidate.beat, finite(splitBeat, NaN)));
+    if (!activePoint) return { ok: false, error: 'That bar is not a valid split point.' };
+    const relativeBeat = activePoint.beat - block.startBeat;
+    const group = guidedRepeatGroupForBlock(plan, block);
+    const members = blocksForRepeatGroup(plan, group);
+    const points = members.map(member => (member.splitPoints || []).find(candidate => near(
+        candidate.beat - member.startBeat,
+        relativeBeat,
+    )));
+    if (points.some(point => !point)) {
+        return { ok: false, error: 'Not every matching occurrence has that bar boundary.' };
+    }
+    return splitGuidedBlocks(plan, members, points, block.id);
 }
