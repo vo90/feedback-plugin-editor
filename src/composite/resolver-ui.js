@@ -508,11 +508,12 @@ function renderConflict(plan) {
         + `<p class="text-xs text-gray-200 mt-2">${_editorEscHtml(view.explanation)}</p>${renderCompositeDifferenceTable(view)}</details>`
         + `<div class="mt-3"><div class="text-xs font-semibold text-gray-300 mb-1.5">Choose what to play</div>`
         + `${resolutionButtons}</div>${customMarkup(group)}`
+        + `<div class="flex flex-wrap justify-end gap-2 mt-3 p-3 border border-gray-700 rounded-lg bg-dark-800 shadow-lg"><button type="button" id="editor-composite-reset-choice" class="px-3 py-2 rounded bg-dark-700 hover:bg-dark-600 text-sm disabled:opacity-40" ${canReset ? '' : 'disabled'}>Clear choice</button>`
+        + `<button type="button" id="editor-composite-apply-next" class="px-4 py-2 rounded bg-accent hover:bg-accent-light text-sm font-medium disabled:opacity-40" ${group.resolution ? '' : 'disabled'}>Confirm choice &amp; continue →</button></div>`
         + `<details class="mt-3 text-xs text-gray-400"><summary class="cursor-pointer hover:text-gray-200">More options and technical details</summary><div class="space-y-3 mt-2">${splitMarkup}<details class="text-xs text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">`
         + `<div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b><ul>${group.primaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div>`
         + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div></div></details></div></details>`
-        + `<div class="sticky bottom-0 flex flex-wrap justify-end gap-2 mt-3 p-3 border border-gray-700 rounded-lg bg-dark-800/95 shadow-lg"><button type="button" id="editor-composite-reset-choice" class="px-3 py-2 rounded bg-dark-700 hover:bg-dark-600 text-sm disabled:opacity-40" ${canReset ? '' : 'disabled'}>Clear choice</button>`
-        + `<button type="button" id="editor-composite-apply-next" class="px-4 py-2 rounded bg-accent hover:bg-accent-light text-sm font-medium disabled:opacity-40" ${group.resolution ? '' : 'disabled'}>Confirm choice &amp; continue →</button></div></section>`;
+        + `</section>`;
 }
 
 function bindResultEvents() {
