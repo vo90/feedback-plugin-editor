@@ -650,7 +650,7 @@ export function _compositeAutomaticSummaryPure(stats = {}, names = {}) {
     };
 }
 
-function renderAutomaticOverview(plan, names) {
+export function _compositeAutomaticOverviewPure(plan, names) {
     const all = [...(plan.sourceEntries?.primary || []), ...(plan.sourceEntries?.secondary || [])];
     if (!all.length) return '';
     const start = Math.min(...all.map(entry => entry.startBeat));
@@ -658,7 +658,7 @@ function renderAutomaticOverview(plan, names) {
     const additions = plan.fixedEntries.filter(entry => entry.source === 'secondary').map(entry => {
         const left = ((entry.startBeat - start) / (end - start)) * 100;
         const width = Math.max(0.25, ((entryLastBeat(entry) - entry.startBeat) / (end - start)) * 100);
-        return `<span class="absolute inset-y-0 rounded bg-violet-400" style="left:${left}%;width:${width}%" title="Added from ${_editorEscHtml(names.secondary)}"></span>`;
+        return `<span aria-hidden="true" class="absolute inset-y-0 rounded" style="left:${left}%;width:${width}%;min-width:3px;background:#c084fc" title="Added from ${_editorEscHtml(names.secondary)}"></span>`;
     }).join('');
     return `<div class="rounded-lg border border-gray-700 bg-dark-900/60 px-3 py-3 mb-3" aria-label="Where fill-track notes were added">`
         + `<div class="flex flex-wrap justify-between gap-2 text-xs mb-2"><b class="text-gray-200">Where notes were added</b><span class="text-gray-400"><span aria-hidden="true" class="text-violet-300">●</span> ${_editorEscHtml(names.secondary)} added to the hybrid</span></div>`
@@ -674,7 +674,7 @@ function renderAutomaticResult(plan, names, normalizationDetails) {
         + `<div class="flex flex-wrap items-start justify-between gap-3"><div><b class="block text-lg text-emerald-100">${summary.title}</b>`
         + `<p class="text-sm text-gray-200 mt-1 max-w-3xl">${_editorEscHtml(summary.description)}</p></div>`
         + `<button type="button" id="editor-composite-edit-settings" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm text-gray-200">Back and adjust</button></div></div>`
-        + renderAutomaticOverview(plan, names)
+        + _compositeAutomaticOverviewPure(plan, names)
         + renderPreviewControls(preview, true)
         + normalizationDetails
         + `<p class="text-sm text-gray-400 mt-3">When the preview sounds right, choose <b class="text-gray-200">Create Hybrid Track</b> below. Your original tracks will remain unchanged.</p></section>`;

@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
     _compositeEligibleSourcesPure,
     _compositeAutomaticSummaryPure,
+    _compositeAutomaticOverviewPure,
     _compositeGapFillPreferencesPure,
     _compositeGuidedPreferencesPure,
     _compositeUniqueNamePure,
@@ -69,6 +70,20 @@ test('automatic result summary uses player-facing track names and outcomes', () 
         added: 1,
         skipped: 2,
     });
+});
+
+test('automatic overview renders visible, escaped fill-note marks', () => {
+    const html = _compositeAutomaticOverviewPure({
+        sourceEntries: {
+            primary: [{ startBeat: 0, endBeat: 1 }],
+            secondary: [{ startBeat: 8, endBeat: 9 }],
+        },
+        fixedEntries: [{ source: 'secondary', startBeat: 4, endBeat: 5 }],
+    }, { secondary: '<Rhythm>' });
+    assert.match(html, /min-width:3px;background:#c084fc/);
+    assert.match(html, /left:44\.444/);
+    assert.match(html, /Added from &lt;Rhythm&gt;/);
+    assert.doesNotMatch(html, /Added from <Rhythm>/);
 });
 
 test('composite creation inserts before drums and rolls back without touching sources', t => {
