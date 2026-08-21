@@ -268,20 +268,22 @@ or bass parts into a new, ordinary playable track while keeping both sources
 unchanged. The source parts must have the same instrument family, string count,
 tuning, capo, and pitch-cent offset.
 
-Choose one of two strategies:
+Choose one of two hybrid modes:
 
-- **Gap Fill** keeps the primary part and adds the secondary only during the
-  primary's rests. It is the quick way to fill long lead/rhythm gaps.
-- **Full Union** keeps all compatible notes. When both parts ask the same string
-  to play incompatible notes at the same time, the resolver shows that beat
-  range as a conflict.
+- **Quick Hybrid** keeps the primary part and adds the secondary only during
+  protected primary rests. It is the fast way to fill long lead/rhythm gaps.
+- **Guided Hybrid** divides the song into adaptive musical blocks. Named song
+  sections are hard landmarks, blocks are at most four bars, and you can split
+  any block down to one bar before choosing either source or a custom result.
 
 Exact duplicates — same string, fret, onset, duration, and techniques — are
-removed automatically. For each remaining conflict, choose the primary notes,
-the secondary notes, the primary plus any physically compatible secondary
-notes, or a custom note set. **Finish Merge** stays unavailable until every
-conflict has a valid decision. Creating the result is undoable; save the song
-to commit the new arrangement to the feedpak.
+included once. Guided Hybrid also accepts empty and single-source regions
+automatically, so only genuinely different material enters review. Complete
+chords, trails, slides, and linked gestures stay together. If choices in two
+neighboring blocks create an unplayable handoff, the resolver marks the
+transition instead of clipping it. **Finish Merge** stays unavailable until
+every decision is valid. Creating the result is undoable; save the song to
+commit the new arrangement to the feedpak.
 
 The **Tracks column** down the left side lists every track — the master mix,
 any studio stems, and each transcription part — beside a matching timeline lane.

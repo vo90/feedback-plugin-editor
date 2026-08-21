@@ -210,6 +210,15 @@ function propertyDifferences(conflict) {
 }
 
 function conflictExplanation(conflict, names, stringCount) {
+    if ((conflict.reasons || []).includes('guided-choice')) {
+        if ((conflict.reasons || []).includes('transition')) {
+            return `The complete ${names.primary} and ${names.secondary} gestures cross this block boundary. Choose the musical handoff; trails will never be clipped silently.`;
+        }
+        const common = Math.max(0, Math.trunc(finite(conflict.commonCount)));
+        const commonText = common
+            ? ` ${common} identical ${common === 1 ? 'note is' : 'notes are'} already included once.` : '';
+        return `Both tracks contain different playable material in this block.${commonText} Choose one arrangement or build a custom result.`;
+    }
     const pair = overlappingPair(conflict);
     if (!pair.primary || !pair.secondary) return 'These source notes require a choice.';
     const displayString = Math.max(1, stringCount - pair.primary.string);

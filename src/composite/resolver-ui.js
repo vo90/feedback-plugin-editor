@@ -21,10 +21,12 @@ import {
     clearCompositeConflictResolution,
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     compositeGapFillDefaultsForUnit,
+    compositeSelectionUnitIds,
     materializeCompositeArrangement,
     normalizeCompositeGapFillOptions,
     resolveCompositeConflict,
 } from './merge-engine.js';
+import { analyzeGuidedComposite, splitGuidedDecisionBlock } from './guided-engine.js';
 import {
     buildCompositeConflictViewModel,
     compositeTechniqueLabels,
@@ -220,6 +222,11 @@ function entryMarkup(entry, checkboxName = '', stringCount = 6) {
 }
 
 function conflictReason(group) {
+    if ((group.reasons || []).includes('guided-choice')) {
+        return (group.reasons || []).includes('transition')
+            ? 'a source handoff needs a playable transition'
+            : 'both arrangements contain different material';
+    }
     const reasons = [];
     if (group.reasons.includes('same-string-overlap')) reasons.push('different notes overlap on the same string');
     if (group.reasons.includes('note-variant')) reasons.push('the same position has different sustain, technique, or harmony data');
@@ -238,6 +245,36 @@ function selectedSourceNames() {
 }
 
 function renderOverview(plan) {
+    if (plan.strategy === 'guided') {
+        const start = Number.isFinite(plan.timelineStartBeat) ? plan.timelineStartBeat : 0;
+        const end = Math.max(start + 1, Number(plan.timelineEndBeat) || start + 1);
+        const automaticClass = {
+            empty: 'bg-gray-700/50',
+            identical: 'bg-slate-400',
+            'primary-only': 'bg-sky-500',
+            'secondary-only': 'bg-violet-500',
+        };
+        const automatic = (plan.automaticRegions || []).map(region => {
+            const left = ((region.startBeat - start) / (end - start)) * 100;
+            const width = Math.max(0.35, ((region.endBeat - region.startBeat) / (end - start)) * 100);
+            const title = `${region.sectionName} · ${region.measureLabel} · ${region.kind.replace('-', ' ')}`;
+            return `<span class="absolute top-0 h-4 ${automaticClass[region.kind] || 'bg-gray-600'}" style="left:${left}%;width:${width}%" title="${_editorEscHtml(title)}"></span>`;
+        }).join('');
+        const decisions = plan.conflicts.map((block, index) => {
+            const left = ((block.startBeat - start) / (end - start)) * 100;
+            const width = Math.max(0.7, (((block.rangeEndBeat || block.endBeat) - block.startBeat) / (end - start)) * 100);
+            const current = index === activeConflictIndex;
+            const stateClass = block.validationError ? 'bg-red-500'
+                : block.resolution ? 'bg-emerald-500' : 'bg-amber-500';
+            const state = block.validationError ? 'Invalid transition'
+                : block.resolution ? 'Resolved' : 'Needs a choice';
+            return `<button type="button" data-conflict-index="${index}" aria-label="${state}: ${_editorEscHtml(block.label)}" aria-current="${current ? 'true' : 'false'}" class="absolute top-0 h-4 ${stateClass} ${current ? 'ring-2 ring-white ring-inset' : ''}"`
+                + ` style="left:${left}%;width:${width}%" title="${_editorEscHtml(`${block.label} · ${state}`)}"></button>`;
+        }).join('');
+        return `<div class="mb-3"><div class="flex flex-wrap justify-between gap-2 text-[10px] text-gray-500 mb-1"><span>Guided song overview</span>`
+            + `<span>gray identical/empty · blue primary · violet secondary · amber review · green resolved · red invalid</span></div>`
+            + `<div class="relative h-4 rounded bg-dark-900 overflow-hidden">${automatic}${decisions}</div></div>`;
+    }
     if (!plan.conflicts.length) return '';
     const all = [...plan.fixedEntries, ...plan.conflicts.flatMap(c => [...c.primaryEntries, ...c.secondaryEntries])];
     const start = Math.min(...all.map(e => e.startBeat));
@@ -338,9 +375,10 @@ function keepCompositeContextLoop() {
 }
 
 function renderConflict(plan) {
+    const guided = plan.strategy === 'guided';
     if (!plan.conflicts.length) {
         return `<div class="rounded border border-emerald-700/50 bg-emerald-950/20 p-4 text-xs text-emerald-200 flex flex-wrap items-center justify-between gap-3">`
-            + `<div><b class="block text-sm mb-1">No manual conflicts</b>The analyzed merge is ready to finish.</div>`
+            + `<div><b class="block text-sm mb-1">${guided ? 'No review needed' : 'No manual conflicts'}</b>${guided ? 'The two tracks are identical or contain only unambiguous single-source material.' : 'The analyzed merge is ready to finish.'}</div>`
             + `<button type="button" id="editor-composite-edit-settings" class="px-2.5 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs text-gray-200">Edit setup</button></div>`;
     }
     activeConflictIndex = Math.max(0, Math.min(activeConflictIndex, plan.conflicts.length - 1));
@@ -354,33 +392,50 @@ function renderConflict(plan) {
         secondaryName: names.secondary,
         customEntryIds: Array.isArray(draft) ? draft : null,
     });
-    const resolvedClass = group.resolution ? 'border-emerald-700/60' : 'border-red-700/60';
+    const resolvedClass = group.validationError ? 'border-red-700/60'
+        : group.resolution ? 'border-emerald-700/60' : guided ? 'border-amber-700/60' : 'border-red-700/60';
     const unresolved = plan.conflicts.filter(conflict => !conflict.resolution).length;
+    const stateClass = group.validationError ? 'bg-red-900/70 text-red-200'
+        : group.resolution ? 'bg-emerald-900/70 text-emerald-200'
+            : guided ? 'bg-amber-900/70 text-amber-100' : 'bg-red-900/70 text-red-200';
+    const stateLabel = group.validationError ? 'Invalid transition'
+        : group.resolution ? 'Resolved' : 'Needs a choice';
+    const rangeLabel = guided && group.label
+        ? `${group.label} · ${conflictReason(group)}`
+        : `Beats ${group.startBeat.toFixed(3)}–${group.endBeat.toFixed(3)} · ${conflictReason(group)}`;
+    const resolutionButtons = guided
+        ? `<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">`
+            + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Use ${_editorEscHtml(names.primary)}</b><span class="text-[10px] text-gray-400">Choose this arrangement for the complete block</span></button>`
+            + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}</b><span class="text-[10px] text-gray-400">Choose this arrangement for the complete block</span></button>`
+            + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id)}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection</b><span class="text-[10px] text-gray-400">Pick complete notes and gestures from either track</span></button></div>`
+        : `<div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">`
+            + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Keep ${_editorEscHtml(names.primary)}</b><span class="text-[10px] text-gray-400">Use the complete primary gesture</span></button>`
+            + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}</b><span class="text-[10px] text-gray-400">Use the complete secondary gesture</span></button>`
+            + `<button type="button" data-resolution="compatible" aria-pressed="${group.resolution === 'compatible'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'compatible' ? 'bg-emerald-900/70 border-emerald-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-emerald-500'}"><b class="block text-emerald-300">Combine compatible</b><span class="text-[10px] text-gray-400">Primary plus safe secondary notes</span></button>`
+            + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id)}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection</b><span class="text-[10px] text-gray-400">Pick notes directly from either tab</span></button></div>`;
+    const splitMarkup = guided && group.splitPoints && group.splitPoints.length
+        ? `<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Split this block at a bar</summary><div class="flex flex-wrap gap-1 mt-2">${group.splitPoints.map(point => `<button type="button" data-guided-split-beat="${point.beat}" class="px-2 py-1 rounded border border-gray-600 bg-dark-700 hover:border-gray-400">${_editorEscHtml(point.label)}</button>`).join('')}</div></details>`
+        : '';
     return `<section class="rounded border ${resolvedClass} bg-dark-800/70 p-3">`
         + `<div class="flex flex-wrap items-start justify-between gap-3 mb-3">`
-        + `<div><div class="flex flex-wrap items-center gap-2"><h4 class="text-sm font-semibold">Conflict ${activeConflictIndex + 1} of ${plan.conflicts.length}</h4>`
-        + `<span class="rounded-full px-2 py-0.5 text-[10px] ${group.resolution ? 'bg-emerald-900/70 text-emerald-200' : 'bg-red-900/70 text-red-200'}">${group.resolution ? 'Resolved' : 'Needs a choice'}</span>`
+        + `<div><div class="flex flex-wrap items-center gap-2"><h4 class="text-sm font-semibold">${guided ? 'Decision block' : 'Conflict'} ${activeConflictIndex + 1} of ${plan.conflicts.length}</h4>`
+        + `<span class="rounded-full px-2 py-0.5 text-[10px] ${stateClass}">${stateLabel}</span>`
         + `<span class="text-[10px] text-gray-500">${unresolved} unresolved</span></div>`
-        + `<p class="text-[11px] text-gray-400 mt-1">Beats ${group.startBeat.toFixed(3)}–${group.endBeat.toFixed(3)} · ${_editorEscHtml(conflictReason(group))}</p></div>`
+        + `<p class="text-[11px] text-gray-400 mt-1">${_editorEscHtml(rangeLabel)}</p></div>`
         + `<div class="flex flex-wrap gap-1"><button type="button" id="editor-composite-edit-settings" class="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 rounded text-xs">Edit setup</button>`
         + `<button type="button" id="editor-composite-prev" aria-label="Previous conflict" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${activeConflictIndex === 0 ? 'disabled' : ''}>←</button>`
         + `<button type="button" id="editor-composite-next" aria-label="Next conflict" class="px-2 py-1 bg-dark-700 rounded text-xs disabled:opacity-40" ${activeConflictIndex >= plan.conflicts.length - 1 ? 'disabled' : ''}>→</button></div></div>`
         + renderPreviewControls(view)
         + `<div class="overflow-x-auto rounded-xl border border-gray-700/70 bg-slate-950">${renderCompositeConflictTabSvg(view)}</div>`
-        + `<div class="mt-3 rounded-lg border border-red-800/40 bg-red-950/20 px-3 py-2">`
-        + `<div class="text-[10px] uppercase tracking-wide text-red-300 font-semibold">Why this needs a choice</div>`
+        + `<div class="mt-3 rounded-lg border ${guided ? 'border-amber-800/40 bg-amber-950/20' : 'border-red-800/40 bg-red-950/20'} px-3 py-2">`
+        + `<div class="text-[10px] uppercase tracking-wide ${guided ? 'text-amber-300' : 'text-red-300'} font-semibold">${guided ? 'Why this block needs review' : 'Why this needs a choice'}</div>`
         + `<p class="text-xs text-gray-200 mt-1">${_editorEscHtml(view.explanation)}</p>${renderCompositeDifferenceTable(view)}</div>`
         + `<div class="mt-3"><div class="text-[10px] uppercase tracking-wide text-gray-500 mb-1.5">Build the merged result</div>`
-        + `<div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">`
-        + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Keep ${_editorEscHtml(names.primary)}</b><span class="text-[10px] text-gray-400">Use the complete primary gesture</span></button>`
-        + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Use ${_editorEscHtml(names.secondary)}</b><span class="text-[10px] text-gray-400">Use the complete secondary gesture</span></button>`
-        + `<button type="button" data-resolution="compatible" aria-pressed="${group.resolution === 'compatible'}" class="text-left px-3 py-2 rounded-lg border text-xs ${group.resolution === 'compatible' ? 'bg-emerald-900/70 border-emerald-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-emerald-500'}"><b class="block text-emerald-300">Combine compatible</b><span class="text-[10px] text-gray-400">Primary plus safe secondary notes</span></button>`
-        + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id)}" class="text-left px-3 py-2 rounded-lg border text-xs ${customDrafts.has(group.id) ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Custom selection</b><span class="text-[10px] text-gray-400">Pick notes directly from either tab</span></button>`
-        + `</div></div>${customMarkup(group)}`
+        + `${resolutionButtons}</div>${customMarkup(group)}`
         + `<div class="flex flex-wrap justify-between items-center gap-2 mt-3 pt-3 border-t border-gray-700">`
-        + `<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">`
+        + `<div class="space-y-2">${splitMarkup}<details class="text-[11px] text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">`
         + `<div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b><ul>${group.primaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div>`
-        + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div></div></details>`
+        + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(e => entryMarkup(e, '', plan.compatibility.stringCount)).join('')}</ul></div></div></details></div>`
         + `<div class="flex gap-2"><button type="button" id="editor-composite-reset-choice" class="px-2.5 py-1.5 rounded bg-dark-700 hover:bg-dark-600 text-xs disabled:opacity-40" ${group.resolution || customDrafts.has(group.id) ? '' : 'disabled'}>Reset choice</button>`
         + `<button type="button" id="editor-composite-apply-next" class="px-3 py-1.5 rounded bg-accent hover:bg-accent-light text-xs font-medium disabled:opacity-40" ${group.resolution ? '' : 'disabled'}>Apply &amp; Next →</button></div></div></section>`;
 }
@@ -391,6 +446,21 @@ function bindResultEvents() {
     for (const marker of result.querySelectorAll('[data-conflict-index]')) {
         marker.addEventListener('click', () => {
             activeConflictIndex = Number(marker.dataset.conflictIndex) || 0;
+            renderResult();
+        });
+    }
+    for (const button of result.querySelectorAll('[data-guided-split-beat]')) {
+        button.addEventListener('click', () => {
+            const block = activePlan.conflicts[activeConflictIndex];
+            const split = splitGuidedDecisionBlock(activePlan, block.id,
+                Number(button.dataset.guidedSplitBeat));
+            if (!split.ok) {
+                block.validationError = split.error;
+                renderResult();
+                return;
+            }
+            customDrafts.delete(block.id);
+            activeConflictIndex = split.index;
             renderResult();
         });
     }
@@ -426,8 +496,12 @@ function bindResultEvents() {
     const toggleCustomEntry = entryId => {
         const conflict = activePlan.conflicts[activeConflictIndex];
         const draft = new Set(customDrafts.get(conflict.id) || []);
-        if (draft.has(entryId)) draft.delete(entryId);
-        else draft.add(entryId);
+        const unitIds = compositeSelectionUnitIds(conflict, entryId);
+        const selected = unitIds.length && unitIds.every(unitId => draft.has(unitId));
+        for (const unitId of unitIds) {
+            if (selected) draft.delete(unitId);
+            else draft.add(unitId);
+        }
         customDrafts.set(conflict.id, [...draft]);
         resolveCompositeConflict(activePlan, conflict.id, 'custom', [...draft]);
         renderResult();
@@ -474,12 +548,18 @@ function renderResult() {
     const normalizationNotice = normalized ? `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-[11px] text-sky-100">`
         + `<b>${normalized} tiny imported note ${normalized === 1 ? 'boundary was' : 'boundaries were'} normalized</b> within the tempo-aware ${Math.round(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS * 1000)} ms safety limit. `
         + `Only the new composite will use the trimmed trail; both source tracks remain unchanged.</div>` : '';
-    result.innerHTML = `<div class="grid gap-2 mb-3 text-center text-[11px]" style="grid-template-columns:repeat(5,minmax(0,1fr))">`
-        + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
-        + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryAddedCleanly}</b>clean additions</div>`
-        + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates removed</div>`
-        + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondarySkippedByStrategy}</b>strategy skips</div>`
-        + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-red-300' : 'text-emerald-300'}">${unresolved}</b>unresolved</div></div>`
+    const statCards = activePlan.strategy === 'guided'
+        ? `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryNotes}</b>secondary notes</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates collapsed</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.decisionBlocks}</b>decision blocks</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-amber-300' : 'text-emerald-300'}">${unresolved}</b>left to review</div>`
+        : `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.primaryNotes}</b>primary notes</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondaryAddedCleanly}</b>clean additions</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.duplicatesRemoved}</b>duplicates removed</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm text-gray-100">${stats.secondarySkippedByStrategy}</b>strategy skips</div>`
+            + `<div class="rounded bg-dark-900 p-2"><b class="block text-sm ${unresolved ? 'text-red-300' : 'text-emerald-300'}">${unresolved}</b>unresolved</div>`;
+    result.innerHTML = `<div class="grid gap-2 mb-3 text-center text-[11px]" style="grid-template-columns:repeat(5,minmax(0,1fr))">${statCards}</div>`
         + normalizationNotice + renderOverview(activePlan) + renderConflict(activePlan);
     const finish = byId('editor-composite-finish');
     if (finish) finish.disabled = unresolved > 0;
@@ -492,26 +572,29 @@ function analyzeFromDialog() {
     const secondaryIndex = Number(byId('editor-composite-secondary')?.value);
     const strategy = byId('editor-composite-strategy')?.value || 'gap-fill';
     const gapFill = gapFillOptionsFromDialog();
-    const preferences = loadCompositeGapFillPreferences();
-    preferences.unit = gapFill.unit;
-    preferences[gapFill.unit] = {
-        minimumGap: gapFill.minimumGap,
-        transitionMargin: gapFill.transitionMargin,
-    };
-    saveCompositeGapFillPreferences(preferences);
+    if (strategy === 'gap-fill') {
+        const preferences = loadCompositeGapFillPreferences();
+        preferences.unit = gapFill.unit;
+        preferences[gapFill.unit] = {
+            minimumGap: gapFill.minimumGap,
+            transitionMargin: gapFill.transitionMargin,
+        };
+        saveCompositeGapFillPreferences(preferences);
+    }
     const error = byId('editor-composite-error');
     if (primaryIndex === secondaryIndex) {
         if (error) error.textContent = 'Choose two different source tracks.';
         resetResult('The primary and secondary source must be different.');
         return;
     }
-    const plan = analyzeCompositeMerge({
+    const sources = {
         primary: S.arrangements[primaryIndex],
         secondary: S.arrangements[secondaryIndex],
         beats: S.beats,
-        strategy,
-        gapFill,
-    });
+    };
+    const plan = strategy === 'guided'
+        ? analyzeGuidedComposite({ ...sources, sections: S.sections })
+        : analyzeCompositeMerge({ ...sources, strategy: 'gap-fill', gapFill });
     if (!plan.ok) {
         if (error) error.textContent = plan.compatibility.errors.join(' ');
         resetResult('The selected arrangements are not merge-compatible.');
@@ -652,7 +735,7 @@ export function editorShowCompositeArrangementModal() {
         + `<aside id="editor-composite-setup" class="border-r border-gray-700 p-4 space-y-3 overflow-y-auto">`
         + `<label class="block text-xs text-gray-300">Primary track<select id="editor-composite-primary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
         + `<label class="block text-xs text-gray-300">Secondary track<select id="editor-composite-secondary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
-        + `<label class="block text-xs text-gray-300">Merge strategy<select id="editor-composite-strategy" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="gap-fill">Gap Fill — secondary during rests</option><option value="full-union">Full Union — all compatible notes</option></select></label>`
+        + `<label class="block text-xs text-gray-300">Hybrid mode<select id="editor-composite-strategy" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="gap-fill">Quick Hybrid — fill primary rests</option><option value="guided">Guided Hybrid — choose musical blocks</option></select></label>`
         + `<fieldset id="editor-composite-gap-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Gap Fill safety</legend>`
         + `<label class="block text-xs text-gray-300">Timing unit<select id="editor-composite-gap-unit" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="beats"${gapFillUnit === 'beats' ? ' selected' : ''}>Beats — follows song tempo</option><option value="seconds"${gapFillUnit === 'seconds' ? ' selected' : ''}>Seconds — fixed real time</option></select></label>`
         + `<label class="block text-xs text-gray-300"><span id="editor-composite-min-gap-label">Minimum usable gap (${gapFillUnit})</span><input id="editor-composite-min-gap" type="number" min="0" value="${gapFillValues.minimumGap}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
@@ -660,7 +743,7 @@ export function editorShowCompositeArrangementModal() {
         + `<p class="text-[10px] text-gray-500">Every complete note, chord, trail, and connected gesture must fit inside the protected gap.</p></fieldset>`
         + `<label class="block text-xs text-gray-300">New track name<input id="editor-composite-name" maxlength="60" value="${_editorEscHtml(name)}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
         + `<button type="button" id="editor-composite-analyze" class="w-full px-3 py-2 rounded bg-accent hover:bg-accent-light text-xs font-medium">Analyze merge</button>`
-        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Gap Fill</b> adds only complete events whose full trails fit between protected lead passages. <b class="text-gray-300">Full Union</b> keeps all compatible material and exposes physical collisions.</div>`
+        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Quick Hybrid</b> adds complete secondary gestures only inside protected primary rests. <b class="text-gray-300">Guided Hybrid</b> skips identical and unambiguous material, then asks you to choose only where both arrangements differ.</div>`
         + `</aside><main class="p-4 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-xs text-gray-400">Choose two source tracks and analyze the merge.</p></div></main></div>`
         + `<footer class="border-t border-gray-700 px-5 py-3 flex items-center gap-3"><div id="editor-composite-error" class="text-xs text-red-300 flex-1"></div>`
         + `<button type="button" id="editor-composite-cancel" class="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs">Cancel</button>`
