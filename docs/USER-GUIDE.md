@@ -280,6 +280,14 @@ as they were.
 The builder expands with the Song Editor window, including on large displays.
 You can also drag its lower-right corner to make the workspace smaller or larger.
 
+The listening panel keeps comparisons separate: play the **Original song**, the
+**Base track only**, the **Fill track only**, or the current **Hybrid only**.
+Choose **Clean**, **Edge**, or **Distortion** from **Guide tone** for the three
+generated previews. **Preview volume** controls all four playback choices. Tone
+and volume are remembered, and the builder automatically level-matches the
+recording and guide tones so switching sources does not create a large volume
+jump. These listening settings never change the song or the normal Editor mixer.
+
 #### Which method should I choose?
 
 - **Automatic** is the fast choice. It keeps the entire base track and adds

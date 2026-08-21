@@ -234,6 +234,17 @@ export function _gmVoiceDurationPure(sustain) {
     if (!Number.isFinite(s) || s <= 0) return 0.35;
     return Math.min(s, 1.6);
 }
+
+// Constant-power chord scaling for focused arrangement comparisons. Without
+// it every WebAudioFont voice arrives at 0.5, so a four-note rhythm chord can
+// hit the limiter roughly 12 dB above a single lead note and make Track/Hybrid
+// choices sound louder merely because they contain chords. 1/sqrt(N) keeps
+// musical density while avoiding that artificial mode-to-mode jump.
+export function _gmChordVoiceGainPure(voiceCount, baseGain = 0.5) {
+    const count = Math.max(1, Math.min(16, Math.trunc(Number(voiceCount) || 1)));
+    const base = Math.max(0, Math.min(1, Number.isFinite(Number(baseGain)) ? Number(baseGain) : 0.5));
+    return base / Math.sqrt(count);
+}
 /* @pure:gm-guide:end */
 
 // ── Prefs (editor-side, never the pack) ───────────────────────────────
@@ -397,12 +408,14 @@ export function gmDrumVoiceAt(ctx, target, note, when, velocity) {
 // guide gain, so the mixer fader + limiter apply). Returns a cancel adapter
 // shaped like the clap bookkeeping ({osc.stop, gain.disconnect}) or null
 // when not ready — the caller claps instead.
-export function gmVoiceAt(ctx, target, gm, when, midi, durSec) {
+export function gmVoiceAt(ctx, target, gm, when, midi, durSec, volume = 0.5) {
     const preset = _presets.get(gm);
     if (!preset || !_player || !ctx || !target) return null;
     let env = null;
+    const voiceVolume = Math.max(0.001, Math.min(1,
+        Number.isFinite(Number(volume)) ? Number(volume) : 0.5));
     try {
-        env = _player.queueWaveTable(ctx, target, preset, when, midi, durSec, 0.5);
+        env = _player.queueWaveTable(ctx, target, preset, when, midi, durSec, voiceVolume);
     } catch (_) { return null; }
     return {
         osc: { stop() { try { env.cancel(); } catch (_) {} } },

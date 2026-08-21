@@ -2,10 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+    COMPOSITE_PREVIEW_TARGET_RMS,
     compositePreviewAudioPolicyPure,
     compositePreviewEventsPure,
+    compositePreviewMixPure,
     compositePreviewModesPure,
     compositePreviewRegionPure,
+    compositePreviewVolumeGainPure,
+    compositeRecordingPreviewLevelPure,
 } from '../src/composite/preview.js';
 
 const beats = Array.from({ length: 12 }, (_, index) => ({ time: index * 0.5 }));
@@ -88,4 +92,60 @@ test('composite preview explains unavailable recording, empty lanes, and unresol
         'Lead has no notes in this section.');
     assert.equal(modes.find(mode => mode.id === 'result').unavailableReason,
         'Choose what to play first.');
+});
+
+test('one shared preview volume feeds exactly one of the four isolated paths', () => {
+    assert.equal(compositePreviewVolumeGainPure(75), 0.75);
+    assert.equal(compositePreviewVolumeGainPure(-10), 0);
+    assert.equal(compositePreviewVolumeGainPure(999), 1);
+    assert.deepEqual(compositePreviewMixPure('song', {
+        volume: 80, recordingGain: 0.25, toneTrimGain: 0.5,
+    }), { referenceGain: 0.2, guideGain: 0 });
+    for (const mode of ['primary', 'secondary', 'result']) {
+        assert.deepEqual(compositePreviewMixPure(mode, {
+            volume: 80, recordingGain: 0.25, toneTrimGain: 0.5,
+        }), { referenceGain: 0, guideGain: 0.4 });
+    }
+    assert.deepEqual(compositePreviewMixPure('unknown'), { referenceGain: 0, guideGain: 0 });
+});
+
+function fakeBuffer(values, sampleRate = 1000, channels = 1) {
+    const data = Array.from({ length: channels }, (_, channel) => Float32Array.from(
+        values.map((value, index) => channel && index % 2 ? -value : value)));
+    return {
+        sampleRate,
+        numberOfChannels: channels,
+        length: values.length,
+        duration: values.length / sampleRate,
+        getChannelData: channel => data[channel],
+    };
+}
+
+test('recording level matching ignores silence and targets the guide loudness', () => {
+    const values = [
+        ...Array(500).fill(0),
+        ...Array(1500).fill(0.2),
+    ];
+    const level = compositeRecordingPreviewLevelPure(fakeBuffer(values), 0, 2);
+    assert.equal(level.silent, false);
+    assert.ok(Math.abs(level.rms - 0.2) < 1e-6);
+    assert.ok(Math.abs(level.gain - COMPOSITE_PREVIEW_TARGET_RMS / 0.2) < 1e-6);
+});
+
+test('recording level matching is stereo-safe, peak-safe, bounded, and silence-safe', () => {
+    const stereo = compositeRecordingPreviewLevelPure(
+        fakeBuffer(Array(1000).fill(0.1), 1000, 2), 0, 1,
+        { targetRms: 0.5, peakCeiling: 0.25, maximumGain: 10 });
+    assert.ok(Math.abs(stereo.rms - 0.1) < 1e-6, 'opposite channel signs never cancel');
+    assert.ok(Math.abs(stereo.gain - 2.5) < 1e-6, 'peak ceiling wins over wanted gain');
+
+    const belowGate = compositeRecordingPreviewLevelPure(
+        fakeBuffer(Array(1000).fill(0.001)), 0, 1);
+    assert.equal(belowGate.gain, 1);
+    assert.equal(belowGate.rms, 0);
+    assert.equal(belowGate.silent, true);
+    assert.ok(Math.abs(belowGate.peak - 0.001) < 1e-8);
+    assert.deepEqual(compositeRecordingPreviewLevelPure(null, 0, 1), {
+        gain: 1, rms: 0, peak: 0, silent: true,
+    });
 });

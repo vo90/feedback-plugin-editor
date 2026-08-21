@@ -10,6 +10,7 @@ import {
     editorClearGuidePreview,
     editorPrepareGuidePreview,
     editorSetGuidePreview,
+    editorUpdateGuidePreviewMix,
     editorWarmGuidePreview,
     startPlayback,
     stopPlayback,
@@ -48,24 +49,31 @@ import {
 import {
     compositePreviewAudioPolicyPure,
     compositePreviewEventsPure,
+    compositePreviewMixPure,
     compositePreviewModesPure,
     compositePreviewRegionPure,
+    compositeRecordingPreviewLevelPure,
 } from './preview.js';
 import { createHybridBuilderSession, resetHybridBuilderReview } from './session.js';
 import { renderHybridSetupView } from './setup-view.js';
 import {
     HYBRID_GAP_FILL_CONTROL_CONFIG,
+    HYBRID_PREVIEW_TONES,
     hybridGapFillPreferencesPure,
     hybridGuidedPreferencesPure,
+    hybridPreviewPreferencesPure,
     loadHybridGapFillPreferences,
     loadHybridGuidedPreferences,
+    loadHybridPreviewPreferences,
     saveHybridGapFillPreferences,
     saveHybridGuidedPreferences,
+    saveHybridPreviewPreferences,
 } from './preferences.js';
 
 export {
     hybridGapFillPreferencesPure as _compositeGapFillPreferencesPure,
     hybridGuidedPreferencesPure as _compositeGuidedPreferencesPure,
+    hybridPreviewPreferencesPure as _compositePreviewPreferencesPure,
 };
 
 export const HYBRID_DIALOG_STYLE = [
@@ -80,6 +88,7 @@ export const HYBRID_DIALOG_STYLE = [
 ].join(';');
 
 const hybridSession = createHybridBuilderSession();
+let hybridPreviewPreferences = hybridPreviewPreferencesPure(null);
 
 function inputNumber(id) {
     const raw = byId(id)?.value;
@@ -139,6 +148,39 @@ function byId(id) {
     return document.getElementById(id);
 }
 
+function selectedHybridPreviewTone() {
+    return HYBRID_PREVIEW_TONES.find(tone => tone.id === hybridPreviewPreferences.tone)
+        || HYBRID_PREVIEW_TONES[0];
+}
+
+function hybridPreviewMixFor(mode) {
+    return compositePreviewMixPure(mode, {
+        volume: hybridPreviewPreferences.volume,
+        toneTrimGain: selectedHybridPreviewTone().trimGain,
+        recordingGain: hybridSession.previewRecordingGain,
+    });
+}
+
+let recordingPreviewLevelCache = null;
+function recordingPreviewGainFor(view) {
+    if (!S.audioBuffer || !view || !hybridSession.plan) return 1;
+    const region = compositePreviewRegionPure(view.context, hybridSession.plan.beats);
+    const shift = (Number(S.audioShift) || 0) + (Number(S.activeAudioSourceOffset) || 0);
+    const startTime = region.startTime - shift;
+    const endTime = region.endTime - shift;
+    const cached = recordingPreviewLevelCache;
+    if (cached && cached.buffer === S.audioBuffer
+            && cached.startTime === startTime && cached.endTime === endTime) return cached.gain;
+    const gain = compositeRecordingPreviewLevelPure(S.audioBuffer, startTime, endTime).gain;
+    recordingPreviewLevelCache = { buffer: S.audioBuffer, startTime, endTime, gain };
+    return gain;
+}
+
+function updateActiveHybridPreviewMix() {
+    if (!hybridSession.previewMode) return false;
+    return editorUpdateGuidePreviewMix(hybridPreviewMixFor(hybridSession.previewMode));
+}
+
 function cloneLoopRegion(region) {
     return region ? { ...region } : null;
 }
@@ -180,8 +222,9 @@ function endCompositePreviewPlayback() {
     hybridSession.previewPlaying = false;
     hybridSession.previewLoading = false;
     hybridSession.previewMode = '';
+    hybridSession.previewRecordingGain = 1;
     updateCompositePreviewButtons();
-    setCompositePreviewHelp('Only one source plays at a time. Track buttons use a clean guide instrument.');
+    setCompositePreviewHelp('Only one source plays at a time. The recording and all three guide tones are automatically level matched.');
     if (hadPreview) setStatus('Composite preview stopped.');
 }
 
@@ -385,12 +428,16 @@ function renderPreviewControls(view, wholeSong = false) {
         resultReady,
     });
     const buttons = modes.map(mode => `<button type="button" data-composite-preview="${mode.id}" data-composite-preview-available="${mode.available ? 'true' : 'false'}" aria-pressed="false" class="${buttonClass}${colors[mode.id]}" ${mode.available ? '' : 'disabled'}${mode.unavailableReason ? ` title="${_editorEscHtml(mode.unavailableReason)}"` : ''}>▶ ${_editorEscHtml(mode.label)}</button>`).join('');
+    const toneOptions = HYBRID_PREVIEW_TONES.map(tone => `<option value="${tone.id}"${tone.id === hybridPreviewPreferences.tone ? ' selected' : ''}>${_editorEscHtml(tone.label)}</option>`).join('');
     return `<div class="mb-3 rounded-lg border border-gray-700 bg-dark-900/70 px-3 py-2">`
         + `<div class="flex flex-wrap items-center gap-2"><span class="text-xs text-gray-300 font-semibold mr-1">${wholeSong ? 'Preview the hybrid' : 'Listen to this section'}</span>`
         + buttons
         + `<button type="button" id="editor-composite-preview-stop" class="${buttonClass}" disabled>■ Stop</button>`
         + (wholeSong ? '' : `<button type="button" id="editor-composite-keep-loop" class="ml-auto ${buttonClass}">Keep this section looped in the editor</button>`)
-        + `</div><p id="editor-composite-preview-help" class="mt-1.5 text-xs text-gray-400" aria-live="polite">Only one source plays at a time. Track buttons use a clean guide instrument.${wholeSong ? ' Nothing is created until you press Create Hybrid Track.' : ' The selected bars repeat while you compare them.'}</p></div>`;
+        + `</div><div class="mt-2 flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-gray-700/70 pt-2">`
+        + `<label class="flex items-center gap-2 text-xs text-gray-300"><span class="font-semibold">Guide tone</span><select id="editor-composite-preview-tone" class="rounded border border-gray-600 bg-dark-700 px-2 py-1 text-xs text-gray-100" title="Used for Lead, Rhythm, and Hybrid previews">${toneOptions}</select></label>`
+        + `<label class="flex min-w-56 flex-1 items-center gap-2 text-xs text-gray-300"><span class="whitespace-nowrap font-semibold">Preview volume</span><input id="editor-composite-preview-volume" type="range" min="0" max="100" step="1" value="${hybridPreviewPreferences.volume}" class="min-w-32 flex-1 accent-accent" aria-describedby="editor-composite-preview-help"><output id="editor-composite-preview-volume-value" for="editor-composite-preview-volume" class="w-10 text-right tabular-nums text-gray-200">${hybridPreviewPreferences.volume}%</output></label>`
+        + `</div><p id="editor-composite-preview-help" class="mt-1.5 text-xs text-gray-400" aria-live="polite">Only one source plays at a time. The recording and all three guide tones are automatically level matched.${wholeSong ? ' Nothing is created until you press Create Hybrid Track.' : ' The selected bars repeat while you compare them.'}</p></div>`;
 }
 
 function currentConflictView() {
@@ -464,6 +511,7 @@ async function startCompositePreview(mode) {
     const arrangement = mode === 'secondary'
         ? hybridSession.plan.secondary
         : hybridSession.plan.primary;
+    const tone = selectedHybridPreviewTone();
     // A new choice replaces the sound already playing immediately; do not let
     // the previous Original/guide mode continue underneath a loading message.
     if (hybridSession.previewPlaying && S.playing) stopPlayback();
@@ -474,17 +522,17 @@ async function startCompositePreview(mode) {
     hybridSession.previewLoading = mode !== 'song';
     updateCompositePreviewButtons();
     if (mode !== 'song') {
-        setCompositePreviewHelp(`Loading the clean sound for ${modeModel.label}…`);
-        setStatus(`Hybrid preview: loading the clean sound for ${modeModel.label}.`);
+        setCompositePreviewHelp(`Loading the ${tone.label} tone for ${modeModel.label}…`);
+        setStatus(`Hybrid preview: loading the ${tone.label} tone for ${modeModel.label}.`);
         let ready = false;
-        try { ready = await editorPrepareGuidePreview(arrKind(arrangement)); }
+        try { ready = await editorPrepareGuidePreview(arrKind(arrangement), { gm: tone.gm }); }
         catch (_) { ready = false; }
         if (requestId !== hybridSession.previewRequestId || !hybridSession.plan) return;
         hybridSession.previewLoading = false;
         if (!ready) {
             hybridSession.previewMode = '';
             updateCompositePreviewButtons();
-            const message = 'The clean guide sound could not be loaded. The Original song preview is still available.';
+            const message = `The ${tone.label} guide tone could not be loaded. The Original song preview is still available.`;
             setCompositePreviewHelp(message);
             setStatus(`Hybrid preview: ${message}`);
             return;
@@ -497,7 +545,12 @@ async function startCompositePreview(mode) {
     const events = mode === 'song' ? [] : compositePreviewEventsPure(
         lane ? lane.entries : [], arrangement, hybridSession.plan.beats,
         hybridSession.plan.compatibility.stringCount);
-    editorSetGuidePreview(events, arrKind(arrangement), compositePreviewAudioPolicyPure(mode));
+    hybridSession.previewRecordingGain = mode === 'song' ? recordingPreviewGainFor(view) : 1;
+    editorSetGuidePreview(events, arrKind(arrangement), {
+        ...compositePreviewAudioPolicyPure(mode),
+        ...hybridPreviewMixFor(mode),
+        gm: tone.gm,
+    });
     setCompositeContextLoop(view);
     startPlayback();
     hybridSession.previewPlaying = !!S.playing;
@@ -510,8 +563,8 @@ async function startCompositePreview(mode) {
         return;
     }
     const help = mode === 'song'
-        ? 'Playing the original recording only. Generated parts and metronome are muted.'
-        : `Playing ${modeModel.label} with a clean guide sound. The original recording and metronome are muted.`;
+        ? 'Playing the level-matched original recording only. Generated parts and metronome are muted.'
+        : `Playing ${modeModel.label} with the level-matched ${tone.label} tone. The original recording and metronome are muted.`;
     setCompositePreviewHelp(help);
     setStatus(`Hybrid preview: playing ${modeModel.label}.`);
 }
@@ -641,6 +694,28 @@ function bindResultEvents() {
     }
     byId('editor-composite-preview-stop')?.addEventListener('click', endCompositePreviewPlayback);
     byId('editor-composite-keep-loop')?.addEventListener('click', keepCompositeContextLoop);
+    byId('editor-composite-preview-tone')?.addEventListener('change', event => {
+        hybridPreviewPreferences = saveHybridPreviewPreferences({
+            ...hybridPreviewPreferences,
+            tone: event.target.value,
+        });
+        const activeMode = hybridSession.previewMode;
+        if (activeMode && activeMode !== 'song') {
+            startCompositePreview(activeMode);
+        } else {
+            const tone = selectedHybridPreviewTone();
+            setCompositePreviewHelp(`Guide tone set to ${tone.label}. It is used for Lead, Rhythm, and Hybrid previews.`);
+        }
+    });
+    byId('editor-composite-preview-volume')?.addEventListener('input', event => {
+        hybridPreviewPreferences = saveHybridPreviewPreferences({
+            ...hybridPreviewPreferences,
+            volume: event.target.value,
+        });
+        const value = byId('editor-composite-preview-volume-value');
+        if (value) value.textContent = `${hybridPreviewPreferences.volume}%`;
+        updateActiveHybridPreviewMix();
+    });
     for (const button of result.querySelectorAll('[data-resolution]')) {
         button.addEventListener('click', () => {
             const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
@@ -849,7 +924,7 @@ function analyzeFromDialog() {
     hybridSession.plan = plan;
     hybridSession.conflictIndex = 0;
     hybridSession.customDrafts.clear();
-    editorWarmGuidePreview(arrKind(plan.primary));
+    editorWarmGuidePreview(arrKind(plan.primary), { gm: selectedHybridPreviewTone().gm });
     setCompositeReviewMode(true);
     renderResult();
 }
@@ -970,6 +1045,8 @@ export function editorShowCompositeArrangementModal() {
     const gapFillValues = gapFillPreferences[gapFillUnit]
         || compositeGapFillDefaultsForUnit(gapFillUnit);
     const guidedPreferences = loadHybridGuidedPreferences();
+    hybridPreviewPreferences = loadHybridPreviewPreferences();
+    recordingPreviewLevelCache = null;
     const modal = document.createElement('div');
     modal.id = 'editor-composite-modal';
     modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4';

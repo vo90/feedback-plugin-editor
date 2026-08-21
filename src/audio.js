@@ -24,8 +24,8 @@ import { _trackRegionsResolvePure } from './region.js';
 import { DPR, canvas } from './canvas.js';
 import { LABEL_W, timeToX } from './geometry.js';
 import {
-    DRUM_PIECE_GM_NOTE, _drumHitGainPure, _gmEventsInWindowPure, _gmGuideModePure,
-    _gmKindPure, _gmSanitizeEventsPure, _gmVoiceDurationPure, editorGmVoiceFor,
+    DRUM_PIECE_GM_NOTE, _drumHitGainPure, _gmChordVoiceGainPure, _gmEventsInWindowPure,
+    _gmGuideModePure, _gmKindPure, _gmSanitizeEventsPure, _gmVoiceDurationPure, editorGmVoiceFor,
     ensureGmDrum, ensureGmPreset, gmDrumReady, gmDrumVoiceAt, gmPresetReady, gmVoiceAt,
 } from './gm-guide.js';
 import { host } from './host.js';
@@ -1508,8 +1508,19 @@ function _mixFirstPlayStartGainPure(target) {
 // ordinary playback/A-B behavior; only the explicit `muted` policy gates the
 // recording. Kept pure because first-play, fader moves, starts, seeks and A/B
 // must all agree on the same answer.
-function _previewRefTargetPure(previewReferenceAudio, fallbackGain) {
-    return previewReferenceAudio === 'muted' ? 0 : fallbackGain;
+function _previewGainValuePure(raw, fallback = 1) {
+    const value = Number(raw);
+    return Number.isFinite(value) ? Math.max(0, Math.min(4, value)) : fallback;
+}
+function _previewRefTargetPure(previewReferenceAudio, fallbackGain, previewGain = null) {
+    if (previewReferenceAudio === 'muted') return 0;
+    return previewReferenceAudio === 'audible'
+        ? (previewGain === null || previewGain === undefined
+            ? fallbackGain : _previewGainValuePure(previewGain, 1))
+        : fallbackGain;
+}
+function _previewGuideTargetPure(preview) {
+    return preview ? _previewGainValuePure(preview.guideGain, 1) : 0;
 }
 function _previewMetronomeEnabledPure(previewActive, previewMetronome, preference) {
     return previewActive ? !!previewMetronome : !!preference;
@@ -1621,6 +1632,13 @@ function _ensureMasterBus() {
     const ctx = S.audioCtx;
     const guideGain = ctx.createGain();
     guideGain.gain.value = _mixGainForPctPure(_mixLoadPct().guide);
+    // Focused tools (currently the Hybrid Track builder) get a separate guide
+    // input. It bypasses the persisted Guide fader so a user's ordinary 35%
+    // workspace setting cannot make comparison playback misleadingly quiet.
+    // Both inputs still share the same safety limiter and Master fader.
+    const previewGuideGain = ctx.createGain();
+    previewGuideGain.gain.value = _previewGuideTargetPure(
+        typeof _editorGuidePreview !== 'undefined' ? _editorGuidePreview : null);
     // Click sits well under the reference/guide by default (≈ -12 dB) — the
     // metronome should be felt, not fought with. Both levels come from the
     // mixer prefs; the defaults preserve the shipped balance.
@@ -1639,14 +1657,31 @@ function _ensureMasterBus() {
     const masterGain = ctx.createGain();
     masterGain.gain.value = _mixGainForPctPure(_mixLoadPct().master);
     guideGain.connect(limiter);
+    previewGuideGain.connect(limiter);
     clickGain.connect(limiter);
     limiter.connect(masterGain);
     masterGain.connect(ctx.destination);
-    _masterBus = { guideGain, clickGain, limiter, masterGain };
+    _masterBus = { guideGain, previewGuideGain, clickGain, limiter, masterGain };
     _attachMeterTap(guideGain, 'guide');
     _attachMeterTap(clickGain, 'click');
     _attachMeterTap(masterGain, 'master');
     return _masterBus;
+}
+
+function _applyPreviewGuideGain(immediate = false) {
+    const bus = _ensureMasterBus();
+    if (!bus || !bus.previewGuideGain || !S.audioCtx) return;
+    const target = _previewGuideTargetPure(
+        typeof _editorGuidePreview !== 'undefined' ? _editorGuidePreview : null);
+    const gain = bus.previewGuideGain.gain;
+    if (immediate) {
+        if (typeof gain.cancelScheduledValues === 'function') {
+            gain.cancelScheduledValues(S.audioCtx.currentTime);
+        }
+        gain.setValueAtTime(target, S.audioCtx.currentTime);
+    } else {
+        gain.setTargetAtTime(target, S.audioCtx.currentTime, 0.02);
+    }
 }
 
 // Fader percents, cached so audio paths never read localStorage
@@ -1703,7 +1738,9 @@ function _mixApplyFirstPlayFade() {
         : fader;
     const previewReference = typeof _editorGuidePreview !== 'undefined' && _editorGuidePreview
         ? _editorGuidePreview.referenceAudio : null;
-    const target = _previewRefTargetPure(previewReference, abTarget);
+    const previewGain = typeof _editorGuidePreview !== 'undefined' && _editorGuidePreview
+        ? _editorGuidePreview.referenceGain : 1;
+    const target = _previewRefTargetPure(previewReference, abTarget, previewGain);
     // A muted guide-only audition starts the reference source for clock/stem
     // alignment, but it is not the recording's first audible play. Preserve
     // the hearing-safety fade for the first later Original-song audition.
@@ -2541,18 +2578,26 @@ function _guideResetSchedule() {
 // Warm a focused preview's pitched instrument as soon as its result exists.
 // This is deliberately fire-and-forget and never creates/resumes a context:
 // opening a modal must not start audio or violate browser gesture rules.
-export function editorWarmGuidePreview(kind = 'guitar') {
-    const gm = editorGmVoiceFor(_gmKindPure(kind));
+function _guidePreviewProgram(kind, options = {}) {
+    const raw = options && options.gm;
+    const requested = raw === null || raw === undefined || typeof raw === 'boolean'
+        ? Number.NaN : Number(raw);
+    return Number.isInteger(requested) && requested >= 0 && requested <= 127
+        ? requested : editorGmVoiceFor(_gmKindPure(kind));
+}
+
+export function editorWarmGuidePreview(kind = 'guitar', options = {}) {
+    const gm = _guidePreviewProgram(kind, options);
     if (gm === null || !S.audioCtx) return false;
     if (!gmPresetReady(gm)) ensureGmPreset(gm, S.audioCtx);
     return gmPresetReady(gm);
 }
 
 // User-gesture preparation for a focused pitched preview. The promise resolves
-// only after the requested clean instrument is available; callers can refuse
+// only after the requested instrument is available; callers can refuse
 // to start rather than misrepresenting a clap fallback as a guitar/bass part.
-export async function editorPrepareGuidePreview(kind = 'guitar') {
-    const gm = editorGmVoiceFor(_gmKindPure(kind));
+export async function editorPrepareGuidePreview(kind = 'guitar', options = {}) {
+    const gm = _guidePreviewProgram(kind, options);
     const ctx = _ensureAudioCtx();
     if (gm === null || !ctx) return false;
     const loading = ensureGmPreset(gm, ctx);
@@ -2580,8 +2625,10 @@ export function editorSetGuidePreview(events = [], kind = 'guitar', options = {}
     const sanitized = _gmSanitizeEventsPure(events);
     _editorGuidePreview = {
         events: sanitized,
-        gm: sanitized.length ? editorGmVoiceFor(_gmKindPure(kind)) : null,
+        gm: sanitized.length ? _guidePreviewProgram(kind, options) : null,
         referenceAudio: options.referenceAudio === 'muted' ? 'muted' : 'audible',
+        referenceGain: _previewGainValuePure(options.referenceGain, 1),
+        guideGain: _previewGainValuePure(options.guideGain, 1),
         metronome: options.metronome !== false,
         allowClapFallback: options.allowClapFallback !== false,
     };
@@ -2591,7 +2638,24 @@ export function editorSetGuidePreview(events = [], kind = 'guitar', options = {}
     // stopped and even a tiny fade from audible → zero would leak recording
     // into a guide-only audition.
     _abApplyRefGain(true);
+    _applyPreviewGuideGain(true);
     _guideTimerSync();
+}
+
+// Live level changes for a focused preview. The Hybrid builder's shared
+// slider calls this without restarting transport; both paths use the same
+// ~20 ms smoothing rule as the Editor mixer.
+export function editorUpdateGuidePreviewMix(options = {}) {
+    if (!_editorGuidePreview) return false;
+    if (Object.prototype.hasOwnProperty.call(options, 'referenceGain')) {
+        _editorGuidePreview.referenceGain = _previewGainValuePure(options.referenceGain, 1);
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'guideGain')) {
+        _editorGuidePreview.guideGain = _previewGainValuePure(options.guideGain, 1);
+    }
+    _abApplyRefGain();
+    _applyPreviewGuideGain();
+    return true;
 }
 
 export function editorClearGuidePreview() {
@@ -2599,6 +2663,7 @@ export function editorClearGuidePreview() {
     _editorGuidePreview = null;
     _guideResetSchedule();
     _abApplyRefGain();
+    _applyPreviewGuideGain();
     _guideTimerSync();
 }
 
@@ -2714,14 +2779,17 @@ function _guideTick() {
                 if (gp.key === _guideLastFiredKey) continue;
                 _guideLastFiredKey = gp.key;
                 const when = _guideChartToCtxPure(gp.t, S.playStartWall, S.playStartTime, _auditionRate());
+                const target = bus && (previewActive ? bus.previewGuideGain : bus.guideGain);
+                const voiceGain = previewActive
+                    ? _gmChordVoiceGainPure(gp.voices.length, 0.5) : 0.5;
                 for (const v of gp.voices) {
                     // The sustain is in CHART seconds; gmVoiceAt schedules in WALL
                     // seconds. At 0.5x a note must ring twice as long to still cover
                     // its note in the slowed audio — divide by the rate, same as the
                     // chart→ctx mapping above.
-                    const voice = bus && gmVoiceAt(
-                        S.audioCtx, bus.guideGain, gm, when, v.midi,
-                        _gmVoiceDurationPure(v.sus) / _auditionRate());
+                    const voice = target && gmVoiceAt(
+                        S.audioCtx, target, gm, when, v.midi,
+                        _gmVoiceDurationPure(v.sus) / _auditionRate(), voiceGain);
                     if (voice) { _guideVoices.push(voice); continue; }
                     // Race: preset dropped mid-tick — ONE clap for the whole
                     // bucket (never a stacked clap per chord note), then on.
@@ -2928,8 +2996,10 @@ export function _abApplyRefGain(immediate = false) {
         _mixGainForPctPure(_mixLoadPct().ref));
     const previewReference = typeof _editorGuidePreview !== 'undefined' && _editorGuidePreview
         ? _editorGuidePreview.referenceAudio : null;
+    const previewGain = typeof _editorGuidePreview !== 'undefined' && _editorGuidePreview
+        ? _editorGuidePreview.referenceGain : 1;
     const target = _previewRefTargetPure(
-        previewReference, abTarget);
+        previewReference, abTarget, previewGain);
     if (immediate) {
         if (typeof rg.gain.cancelScheduledValues === 'function') {
             rg.gain.cancelScheduledValues(S.audioCtx.currentTime);

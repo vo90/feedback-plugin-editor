@@ -7,10 +7,12 @@ import {
     _compositeAutomaticOverviewPure,
     _compositeGapFillPreferencesPure,
     _compositeGuidedPreferencesPure,
+    _compositePreviewPreferencesPure,
     _compositeUniqueNamePure,
     CreateCompositeArrangementCmd,
     HYBRID_DIALOG_STYLE,
 } from '../src/composite/resolver-ui.js';
+import { HYBRID_PREVIEW_TONES } from '../src/composite/preferences.js';
 import { host } from '../src/host.js';
 import { S } from '../src/state.js';
 
@@ -67,6 +69,30 @@ test('Guided repetition preferences default safely and remember grouped review',
     assert.deepEqual(_compositeGuidedPreferencesPure('{broken'), {
         repeatMode: 'matching-repetitions',
     });
+});
+
+test('Hybrid audition preferences remember a safe shared tone and volume', () => {
+    assert.deepEqual(_compositePreviewPreferencesPure(null), { tone: 'clean', volume: 75 });
+    assert.deepEqual(_compositePreviewPreferencesPure('{broken'), { tone: 'clean', volume: 75 });
+    assert.deepEqual(_compositePreviewPreferencesPure({ tone: 'edge', volume: 82.6 }), {
+        tone: 'edge', volume: 83,
+    });
+    assert.deepEqual(_compositePreviewPreferencesPure({ tone: 'unknown', volume: 999 }), {
+        tone: 'clean', volume: 100,
+    });
+    assert.deepEqual(_compositePreviewPreferencesPure({ tone: 'distortion', volume: null }), {
+        tone: 'distortion', volume: 75,
+    });
+});
+
+test('Hybrid audition exposes the three level-matched local guitar programs', () => {
+    assert.deepEqual(HYBRID_PREVIEW_TONES.map(({ id, label, gm }) => ({ id, label, gm })), [
+        { id: 'clean', label: 'Clean', gm: 27 },
+        { id: 'edge', label: 'Edge', gm: 29 },
+        { id: 'distortion', label: 'Distortion', gm: 30 },
+    ]);
+    assert.ok(Math.abs(20 * Math.log10(HYBRID_PREVIEW_TONES[1].trimGain) + 3.25) < 1e-9);
+    assert.ok(Math.abs(20 * Math.log10(HYBRID_PREVIEW_TONES[2].trimGain) + 4.62) < 1e-9);
 });
 
 test('automatic result summary uses player-facing track names and outcomes', () => {

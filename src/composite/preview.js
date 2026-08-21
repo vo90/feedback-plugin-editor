@@ -13,6 +13,115 @@ function finite(value, fallback = 0) {
     return Number.isFinite(number) ? number : fallback;
 }
 
+// FluidR3's clean-electric samples average about -16.6 dBFS while active.
+// WebAudioFont voices are scheduled at 0.5 (-6 dB), so -22.6 dBFS is the
+// stable reference target shared by generated tones and the real recording.
+// The recording analysis is deliberately conservative: it may turn a mastered
+// mix down substantially, but it never chases silence or boosts beyond +6 dB.
+export const COMPOSITE_PREVIEW_TARGET_RMS = 10 ** (-22.6 / 20);
+const COMPOSITE_PREVIEW_GATE_RMS = 10 ** (-50 / 20);
+const COMPOSITE_PREVIEW_PEAK_CEILING = 10 ** (-1 / 20);
+const COMPOSITE_PREVIEW_MIN_RECORDING_GAIN = 10 ** (-18 / 20);
+const COMPOSITE_PREVIEW_MAX_RECORDING_GAIN = 10 ** (6 / 20);
+const COMPOSITE_PREVIEW_ANALYSIS_WINDOW_SECONDS = 0.05;
+const COMPOSITE_PREVIEW_MAX_ANALYSIS_SAMPLES = 250000;
+
+export function compositePreviewVolumeGainPure(volume) {
+    const value = Number(volume);
+    if (!Number.isFinite(value)) return 0.75;
+    return Math.max(0, Math.min(100, value)) / 100;
+}
+
+export function compositePreviewMixPure(mode, {
+    volume = 75,
+    toneTrimGain = 1,
+    recordingGain = 1,
+} = {}) {
+    const output = compositePreviewVolumeGainPure(volume);
+    const tone = Math.max(0, Math.min(4, finite(toneTrimGain, 1)));
+    const recording = Math.max(0, Math.min(4, finite(recordingGain, 1)));
+    const guideOnly = mode === 'primary' || mode === 'secondary' || mode === 'result';
+    return {
+        referenceGain: mode === 'song' ? output * recording : 0,
+        guideGain: guideOnly ? output * tone : 0,
+    };
+}
+
+// Measure one fixed preview region without playing it.  Fifty-millisecond
+// windows below -50 dBFS are gated out, so an intro/rest does not make the
+// next real note jump in level.  Long whole-song previews are sampled with a
+// bounded stride; short review sections still inspect every sample.  The
+// returned gain is constant for the whole loop (no compressor pumping).
+export function compositeRecordingPreviewLevelPure(buffer, startTime, endTime, options = {}) {
+    const sampleRate = Number(buffer && buffer.sampleRate);
+    const channelCount = Math.max(0, Math.trunc(Number(buffer && buffer.numberOfChannels) || 0));
+    const frameCount = Math.max(0, Math.trunc(Number(buffer && buffer.length) || 0));
+    if (!(sampleRate > 0) || !channelCount || !frameCount
+            || typeof buffer.getChannelData !== 'function') {
+        return { gain: 1, rms: 0, peak: 0, silent: true };
+    }
+    const rawStart = Number(startTime);
+    const rawEnd = Number(endTime);
+    const from = Math.max(0, Math.min(frameCount,
+        Math.floor((Number.isFinite(rawStart) ? rawStart : 0) * sampleRate)));
+    const fallbackEnd = frameCount / sampleRate;
+    const to = Math.max(from, Math.min(frameCount,
+        Math.ceil((Number.isFinite(rawEnd) ? rawEnd : fallbackEnd) * sampleRate)));
+    if (to <= from) return { gain: 1, rms: 0, peak: 0, silent: true };
+
+    const channels = [];
+    try {
+        for (let channel = 0; channel < channelCount; channel++) {
+            const data = buffer.getChannelData(channel);
+            if (data && typeof data.length === 'number') channels.push(data);
+        }
+    } catch (_) {
+        return { gain: 1, rms: 0, peak: 0, silent: true };
+    }
+    if (!channels.length) return { gain: 1, rms: 0, peak: 0, silent: true };
+
+    const maximumSamples = Math.max(1000,
+        Math.trunc(finite(options.maximumSamples, COMPOSITE_PREVIEW_MAX_ANALYSIS_SAMPLES)));
+    const stride = Math.max(1, Math.floor((to - from) * channels.length / maximumSamples));
+    const windowFrames = Math.max(stride,
+        Math.floor(sampleRate * COMPOSITE_PREVIEW_ANALYSIS_WINDOW_SECONDS));
+    let activeSquares = 0;
+    let activeSamples = 0;
+    let peak = 0;
+    for (let windowStart = from; windowStart < to; windowStart += windowFrames) {
+        const windowEnd = Math.min(to, windowStart + windowFrames);
+        let squares = 0;
+        let samples = 0;
+        for (let frame = windowStart; frame < windowEnd; frame += stride) {
+            for (const channel of channels) {
+                const sample = Number(channel[frame]) || 0;
+                const magnitude = Math.abs(sample);
+                if (magnitude > peak) peak = magnitude;
+                squares += sample * sample;
+                samples++;
+            }
+        }
+        if (!samples) continue;
+        const windowRms = Math.sqrt(squares / samples);
+        if (windowRms >= COMPOSITE_PREVIEW_GATE_RMS) {
+            activeSquares += squares;
+            activeSamples += samples;
+        }
+    }
+    if (!activeSamples) return { gain: 1, rms: 0, peak, silent: true };
+
+    const rms = Math.sqrt(activeSquares / activeSamples);
+    const targetRms = Math.max(0.001, finite(options.targetRms, COMPOSITE_PREVIEW_TARGET_RMS));
+    const minimumGain = Math.max(0, finite(options.minimumGain, COMPOSITE_PREVIEW_MIN_RECORDING_GAIN));
+    const maximumGain = Math.max(minimumGain,
+        finite(options.maximumGain, COMPOSITE_PREVIEW_MAX_RECORDING_GAIN));
+    const peakCeiling = Math.max(0.1, Math.min(1,
+        finite(options.peakCeiling, COMPOSITE_PREVIEW_PEAK_CEILING)));
+    const wanted = Math.max(minimumGain, Math.min(maximumGain, targetRms / rms));
+    const peakSafe = peak > 0 ? peakCeiling / peak : maximumGain;
+    return { gain: Math.max(0, Math.min(wanted, peakSafe)), rms, peak, silent: false };
+}
+
 function entryEndBeat(entry) {
     const start = finite(entry && entry.startBeat);
     return Math.max(start, finite(entry && entry.endBeat, start),

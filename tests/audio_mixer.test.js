@@ -35,7 +35,8 @@ const busBlock = extract('audio-bus');
 const P = new Function(
     '"use strict";' + mixBlock
     + '\nreturn { MIX_DEFAULT_PCT, _mixPctFromStoredPure, _mixGainForPctPure,'
-    + ' _mixFirstPlayStartGainPure, _previewRefTargetPure, _previewMetronomeEnabledPure,'
+    + ' _mixFirstPlayStartGainPure, _previewGainValuePure, _previewRefTargetPure,'
+    + ' _previewGuideTargetPure, _previewMetronomeEnabledPure,'
     + ' _mixBlipAllowedPure, _mixDragChangedPitchPure };'
 )();
 
@@ -47,6 +48,7 @@ function stubParam() {
         exponentialRampToValueAtTime(v, t) { this.calls.push(['exp', v, t]); },
         linearRampToValueAtTime(v, t) { this.calls.push(['lin', v, t]); },
         setTargetAtTime(v, t, c) { this.calls.push(['target', v, t, c]); },
+        cancelScheduledValues(t) { this.calls.push(['cancel', t]); },
     };
 }
 function stubCtx(state = 'running') {
@@ -84,7 +86,7 @@ function stubStorage(seed = {}) {
         map,
     };
 }
-function makeEnv({ ctxState = 'running', storage = {} } = {}) {
+function makeEnv({ ctxState = 'running', storage = {}, preview = null } = {}) {
     const ls = stubStorage(storage);
     const S = { audioCtx: stubCtx(ctxState) };
     const voices = [];
@@ -92,10 +94,12 @@ function makeEnv({ ctxState = 'running', storage = {} } = {}) {
         'S', 'localStorage', '_guideVoices', '_attachMeterTap', '_editorGuidePreview',
         '"use strict";' + mixBlock + '\n' + busBlock
         + '\nreturn { _ensureMasterBus, _ensureRefGain, _mixLoadPct, _mixSetBusGain,'
-        + ' _mixApplyFirstPlayFade, _mixResetFirstPlay, _editBlipAt, editorEditBlipEnabled,'
-        + ' setPreviewReference: (referenceAudio) => { _editorGuidePreview = referenceAudio ? { referenceAudio } : null; },'
+        + ' _mixApplyFirstPlayFade, _mixResetFirstPlay, _applyPreviewGuideGain,'
+        + ' _editBlipAt, editorEditBlipEnabled,'
+        + ' setPreviewReference: (referenceAudio, referenceGain) => { _editorGuidePreview = referenceAudio ? { referenceAudio, referenceGain } : null; },'
+        + ' setPreview: (value) => { _editorGuidePreview = value; },'
         + ' voices: () => _guideVoices };'
-    )(S, ls, voices, () => {}, null);   // meter taps are a no-op in the sliced env
+    )(S, ls, voices, () => {}, preview);   // meter taps are a no-op in the sliced env
     return { ...env, S, ls, initialVoices: voices };
 }
 
@@ -151,7 +155,11 @@ t('first-play start gain: reduced but never inaudible, never above target', () =
 t('focused preview reference policy is explicit and leaves ordinary gain untouched', () => {
     assert.strictEqual(P._previewRefTargetPure('muted', 0.8), 0);
     assert.strictEqual(P._previewRefTargetPure('audible', 0.8), 0.8);
+    assert.strictEqual(P._previewRefTargetPure('audible', 0.8, 0.25), 0.25,
+        'focused preview gain overrides the Recording fader');
     assert.strictEqual(P._previewRefTargetPure(null, 0.8), 0.8);
+    assert.strictEqual(P._previewGuideTargetPure({ guideGain: 0.6 }), 0.6);
+    assert.strictEqual(P._previewGuideTargetPure(null), 0);
 });
 
 t('focused preview suppresses the metronome without changing its stored preference', () => {
@@ -263,6 +271,24 @@ t('first-play fade re-arms after a new recording loads (_mixResetFirstPlay)', ()
     env._mixApplyFirstPlayFade();
     const kinds = rg.gain.calls.slice(2).map(c => c[0]);
     assert.deepStrictEqual(kinds, ['set', 'lin'], 'fades again for the new recording');
+});
+
+t('focused preview gets a separate guide input, independent of the persisted Guide fader', () => {
+    const env = makeEnv({
+        storage: { editorMixGuide: '0' },
+        preview: { guideGain: 0.6 },
+    });
+    const bus = env._ensureMasterBus();
+    assert.strictEqual(bus.guideGain.gain.value, 0, 'ordinary Guide fader remains muted');
+    assert.strictEqual(bus.previewGuideGain.gain.value, 0.6, 'focused preview keeps its own level');
+    assert.strictEqual(bus.previewGuideGain.to, bus.limiter, 'preview still uses the safety limiter');
+    env.setPreview({ guideGain: 0.25 });
+    env._applyPreviewGuideGain();
+    const last = bus.previewGuideGain.gain.calls.at(-1);
+    assert.deepStrictEqual(last, ['target', 0.25, env.S.audioCtx.currentTime, 0.02]);
+    env.setPreview(null);
+    env._applyPreviewGuideGain(true);
+    assert.strictEqual(bus.previewGuideGain.gain.value, 0, 'clearing preview seats silence immediately');
 });
 
 t('muted focused preview does not consume the recording first-play safety fade', () => {

@@ -29,6 +29,7 @@ globalThis.window = globalThis.window || globalThis;
 const { editorGuideClapEnabled, editorGuideVoiceMode, _editorToggleGuideClap } =
     await import('../src/audio.js');
 const { GM_VOICE_CHOICES, _gmFilePure, _gmGuideModePure } = await import('../src/gm-guide.js');
+const { HYBRID_PREVIEW_TONES } = await import('../src/composite/preferences.js');
 const { S } = await import('../src/state.js');
 
 let pass = 0, fail = 0;
@@ -78,6 +79,21 @@ t('the default preset per kind is VENDORED — plugin-served, no network needed'
         const p = new URL(f, wafonts);
         assert.ok(existsSync(p), `${f} is vendored`);
         assert.ok(statSync(p).size > 50_000, `${f} is a real render, not a stub`);
+    }
+});
+
+t('all three Hybrid audition tones are VENDORED — comparison works offline', () => {
+    const wafonts = new URL('../assets/wafonts/', import.meta.url);
+    assert.deepStrictEqual(HYBRID_PREVIEW_TONES.map(tone => _gmFilePure(tone.gm)), [
+        '0270_FluidR3_GM_sf2_file.js',
+        '0290_FluidR3_GM_sf2_file.js',
+        '0300_FluidR3_GM_sf2_file.js',
+    ]);
+    for (const tone of HYBRID_PREVIEW_TONES) {
+        const file = _gmFilePure(tone.gm);
+        const path = new URL(file, wafonts);
+        assert.ok(existsSync(path), `${tone.label}: ${file} is vendored`);
+        assert.ok(statSync(path).size > 50_000, `${tone.label}: ${file} is a real render`);
     }
 });
 
