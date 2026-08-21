@@ -51,3 +51,50 @@ export function compositePreviewRegionPure(context, beats) {
     const endTime = Math.max(startTime + 0.05, rawEnd);
     return { startTime, endTime, mode: 'bar' };
 }
+
+// The four player-facing audition choices. Keeping availability and wording
+// DOM-free makes the contract testable: only one real/generated source is ever
+// described as active, and an empty lane is explained instead of playing
+// confusing silence.
+export function compositePreviewModesPure(view, {
+    audioAvailable = false,
+    resultReady = false,
+} = {}) {
+    const lanes = new Map((view && Array.isArray(view.lanes) ? view.lanes : [])
+        .map(lane => [lane.id, Array.isArray(lane.entries) ? lane.entries : []]));
+    const names = view && view.names ? view.names : {};
+    const laneMode = (id, label, ready = true, pendingReason = '') => {
+        const hasNotes = (lanes.get(id) || []).length > 0;
+        const available = ready && hasNotes;
+        return {
+            id,
+            label,
+            available,
+            unavailableReason: !ready ? pendingReason
+                : hasNotes ? '' : `${label.replace(/ only$/, '')} has no notes in this section.`,
+        };
+    };
+    return [
+        {
+            id: 'song',
+            label: 'Original song',
+            available: !!audioAvailable,
+            unavailableReason: audioAvailable ? '' : 'No recording is loaded.',
+        },
+        laneMode('primary', `${names.primary || 'Base track'} only`),
+        laneMode('secondary', `${names.secondary || 'Fill track'} only`),
+        laneMode('result', 'Hybrid only', !!resultReady, 'Choose what to play first.'),
+    ];
+}
+
+// One mutually-exclusive audio contract for every Hybrid builder audition.
+// The controller supplies a different event lane, but this policy guarantees
+// the real recording and generated part never compete in the speaker output.
+export function compositePreviewAudioPolicyPure(mode) {
+    const guideOnly = mode === 'primary' || mode === 'secondary' || mode === 'result';
+    return {
+        referenceAudio: guideOnly ? 'muted' : 'audible',
+        metronome: false,
+        allowClapFallback: false,
+    };
+}

@@ -403,7 +403,10 @@ export function renderCompositeConflictTabSvg(view) {
             + strings.join('') + notes + noChoice + '</g>';
     }).join('');
     const aria = `Three aligned tablature lanes for review section ${view.conflictIndex + 1} of ${view.conflictCount}. ${view.explanation}`;
-    return `<svg viewBox="0 0 ${width} ${height}" width="100%" role="img" aria-label="${escapeMarkup(aria)}" style="min-width:46rem">`
+    // Keep notation at one stable pixel scale. The resizable dialog owns the
+    // viewport; a wider/taller window should reveal more workspace, not magnify
+    // all three lanes and their note glyphs through a 100%-wide SVG.
+    return `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="${escapeMarkup(aria)}" style="display:block;width:${width}px;height:${height}px;max-width:none">`
         + `<rect width="${width}" height="${height}" rx="12" fill="#0f172a"/>`
         + beatLines.join('') + measureLines + lanes
         + `<path d="M${conflictX.toFixed(1)} 28v8M${conflictEndX.toFixed(1)} 28v8M${conflictX.toFixed(1)} 32H${conflictEndX.toFixed(1)}" stroke="#f87171" stroke-width="2"/>`

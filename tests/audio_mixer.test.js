@@ -35,7 +35,8 @@ const busBlock = extract('audio-bus');
 const P = new Function(
     '"use strict";' + mixBlock
     + '\nreturn { MIX_DEFAULT_PCT, _mixPctFromStoredPure, _mixGainForPctPure,'
-    + ' _mixFirstPlayStartGainPure, _mixBlipAllowedPure, _mixDragChangedPitchPure };'
+    + ' _mixFirstPlayStartGainPure, _previewRefTargetPure, _previewMetronomeEnabledPure,'
+    + ' _mixBlipAllowedPure, _mixDragChangedPitchPure };'
 )();
 
 // ── Stateful env: real bus + blip code over stub ctx/localStorage ────
@@ -88,12 +89,13 @@ function makeEnv({ ctxState = 'running', storage = {} } = {}) {
     const S = { audioCtx: stubCtx(ctxState) };
     const voices = [];
     const env = new Function(
-        'S', 'localStorage', '_guideVoices', '_attachMeterTap',
+        'S', 'localStorage', '_guideVoices', '_attachMeterTap', '_editorGuidePreview',
         '"use strict";' + mixBlock + '\n' + busBlock
         + '\nreturn { _ensureMasterBus, _ensureRefGain, _mixLoadPct, _mixSetBusGain,'
         + ' _mixApplyFirstPlayFade, _mixResetFirstPlay, _editBlipAt, editorEditBlipEnabled,'
+        + ' setPreviewReference: (referenceAudio) => { _editorGuidePreview = referenceAudio ? { referenceAudio } : null; },'
         + ' voices: () => _guideVoices };'
-    )(S, ls, voices, () => {});   // meter taps are a no-op in the sliced env
+    )(S, ls, voices, () => {}, null);   // meter taps are a no-op in the sliced env
     return { ...env, S, ls, initialVoices: voices };
 }
 
@@ -144,6 +146,18 @@ t('first-play start gain: reduced but never inaudible, never above target', () =
     assert.strictEqual(P._mixFirstPlayStartGainPure(0.1), 0.05, 'floor at 0.05');
     assert.strictEqual(P._mixFirstPlayStartGainPure(0.04), 0.04, 'min(target, floor)');
     assert.strictEqual(P._mixFirstPlayStartGainPure(0), 0);
+});
+
+t('focused preview reference policy is explicit and leaves ordinary gain untouched', () => {
+    assert.strictEqual(P._previewRefTargetPure('muted', 0.8), 0);
+    assert.strictEqual(P._previewRefTargetPure('audible', 0.8), 0.8);
+    assert.strictEqual(P._previewRefTargetPure(null, 0.8), 0.8);
+});
+
+t('focused preview suppresses the metronome without changing its stored preference', () => {
+    assert.strictEqual(P._previewMetronomeEnabledPure(true, false, true), false);
+    assert.strictEqual(P._previewMetronomeEnabledPure(true, true, false), true);
+    assert.strictEqual(P._previewMetronomeEnabledPure(false, false, true), true);
 });
 
 t('blip rate limit: first always fires, gap enforced', () => {
@@ -249,6 +263,18 @@ t('first-play fade re-arms after a new recording loads (_mixResetFirstPlay)', ()
     env._mixApplyFirstPlayFade();
     const kinds = rg.gain.calls.slice(2).map(c => c[0]);
     assert.deepStrictEqual(kinds, ['set', 'lin'], 'fades again for the new recording');
+});
+
+t('muted focused preview does not consume the recording first-play safety fade', () => {
+    const env = makeEnv();
+    const rg = env._ensureRefGain();
+    env.setPreviewReference('muted');
+    env._mixApplyFirstPlayFade();
+    assert.strictEqual(rg.gain.calls.length, 0, 'muted reference schedules no audible fade');
+    env.setPreviewReference('audible');
+    env._mixApplyFirstPlayFade();
+    assert.deepStrictEqual(rg.gain.calls.map(c => c[0]), ['set', 'lin'],
+        'the first later audible recording still receives the safety fade');
 });
 
 // ── Stateful: edit blip ──────────────────────────────────────────────

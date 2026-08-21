@@ -97,6 +97,10 @@ test('custom source notes are keyboard-selectable and invalid drafts stay visibl
     assert.match(svg, /Your current choice/);
     assert.match(svg, />REVIEW</);
     assert.match(svg, /stroke="#f87171"/);
+    assert.match(svg, /width="1120"/);
+    assert.match(svg, /style="display:block;width:1120px;/);
+    assert.doesNotMatch(svg, /width="100%"/,
+        'resizing the review dialog must expand its viewport, not scale the notation');
 });
 
 test('note variants provide a compact escaped property comparison', () => {

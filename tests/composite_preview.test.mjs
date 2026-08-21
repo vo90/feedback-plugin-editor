@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+    compositePreviewAudioPolicyPure,
     compositePreviewEventsPure,
+    compositePreviewModesPure,
     compositePreviewRegionPure,
 } from '../src/composite/preview.js';
 
@@ -39,4 +41,51 @@ test('composite preview region follows the visible bar context', () => {
         endTime: 4,
         mode: 'bar',
     });
+});
+
+test('composite preview exposes four clearly isolated player-facing modes', () => {
+    const view = {
+        names: { primary: 'Lead', secondary: 'Rhythm' },
+        lanes: [
+            { id: 'primary', entries: [{}] },
+            { id: 'secondary', entries: [{}] },
+            { id: 'result', entries: [{}] },
+        ],
+    };
+    assert.deepEqual(compositePreviewModesPure(view, {
+        audioAvailable: true,
+        resultReady: true,
+    }).map(({ id, label, available }) => ({ id, label, available })), [
+        { id: 'song', label: 'Original song', available: true },
+        { id: 'primary', label: 'Lead only', available: true },
+        { id: 'secondary', label: 'Rhythm only', available: true },
+        { id: 'result', label: 'Hybrid only', available: true },
+    ]);
+});
+
+test('composite preview audio modes never mix the recording with a generated guide', () => {
+    assert.deepEqual(compositePreviewAudioPolicyPure('song'), {
+        referenceAudio: 'audible', metronome: false, allowClapFallback: false,
+    });
+    for (const mode of ['primary', 'secondary', 'result']) {
+        assert.deepEqual(compositePreviewAudioPolicyPure(mode), {
+            referenceAudio: 'muted', metronome: false, allowClapFallback: false,
+        });
+    }
+});
+
+test('composite preview explains unavailable recording, empty lanes, and unresolved hybrid', () => {
+    const modes = compositePreviewModesPure({
+        names: { primary: 'Lead', secondary: 'Rhythm' },
+        lanes: [
+            { id: 'primary', entries: [] },
+            { id: 'secondary', entries: [{}] },
+            { id: 'result', entries: [{}] },
+        ],
+    }, { audioAvailable: false, resultReady: false });
+    assert.equal(modes.find(mode => mode.id === 'song').unavailableReason, 'No recording is loaded.');
+    assert.equal(modes.find(mode => mode.id === 'primary').unavailableReason,
+        'Lead has no notes in this section.');
+    assert.equal(modes.find(mode => mode.id === 'result').unavailableReason,
+        'Choose what to play first.');
 });

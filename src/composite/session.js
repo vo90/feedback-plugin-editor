@@ -10,6 +10,8 @@ export function createHybridBuilderSession() {
         conflictIndex: 0,
         previewMode: '',
         previewPlaying: false,
+        previewLoading: false,
+        previewRequestId: 0,
         previewRestore: null,
         customDrafts: new Map(),
     };
@@ -18,5 +20,7 @@ export function createHybridBuilderSession() {
 export function resetHybridBuilderReview(session) {
     session.plan = null;
     session.conflictIndex = 0;
+    session.previewLoading = false;
+    session.previewRequestId++;
     session.customDrafts.clear();
 }

@@ -43,9 +43,13 @@ test('Hybrid builder session reset clears review state without losing preview re
     session.conflictIndex = 4;
     session.customDrafts.set('guided:1', ['primary:1']);
     session.previewRestore = { cursorTime: 12 };
+    session.previewLoading = true;
+    const requestId = session.previewRequestId;
     resetHybridBuilderReview(session);
     assert.equal(session.plan, null);
     assert.equal(session.conflictIndex, 0);
     assert.equal(session.customDrafts.size, 0);
+    assert.equal(session.previewLoading, false);
+    assert.equal(session.previewRequestId, requestId + 1);
     assert.deepEqual(session.previewRestore, { cursorTime: 12 });
 });

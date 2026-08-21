@@ -8,7 +8,9 @@
 import { arrKind, _isFrettedKind } from '../instrument.js';
 import {
     editorClearGuidePreview,
+    editorPrepareGuidePreview,
     editorSetGuidePreview,
+    editorWarmGuidePreview,
     startPlayback,
     stopPlayback,
 } from '../audio.js';
@@ -43,7 +45,12 @@ import {
     renderCompositeConflictTabSvg,
     renderCompositeDifferenceTable,
 } from './conflict-view.js';
-import { compositePreviewEventsPure, compositePreviewRegionPure } from './preview.js';
+import {
+    compositePreviewAudioPolicyPure,
+    compositePreviewEventsPure,
+    compositePreviewModesPure,
+    compositePreviewRegionPure,
+} from './preview.js';
 import { createHybridBuilderSession, resetHybridBuilderReview } from './session.js';
 import { renderHybridSetupView } from './setup-view.js';
 import {
@@ -148,21 +155,33 @@ function rememberCompositePreviewSession() {
 function updateCompositePreviewButtons() {
     for (const button of document.querySelectorAll('[data-composite-preview]')) {
         const active = button.dataset.compositePreview === hybridSession.previewMode;
+        const available = button.dataset.compositePreviewAvailable === 'true';
         button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        button.setAttribute('aria-busy', active && hybridSession.previewLoading ? 'true' : 'false');
+        button.disabled = hybridSession.previewLoading || !available;
         button.classList.toggle('ring-2', active);
         button.classList.toggle('ring-emerald-400', active);
     }
     const stop = byId('editor-composite-preview-stop');
-    if (stop) stop.disabled = !hybridSession.previewPlaying;
+    if (stop) stop.disabled = !hybridSession.previewPlaying && !hybridSession.previewLoading;
+}
+
+function setCompositePreviewHelp(message) {
+    const help = byId('editor-composite-preview-help');
+    if (help) help.textContent = message;
 }
 
 function endCompositePreviewPlayback() {
-    const hadPreview = hybridSession.previewPlaying || !!hybridSession.previewMode;
+    const hadPreview = hybridSession.previewPlaying || hybridSession.previewLoading
+        || !!hybridSession.previewMode;
+    hybridSession.previewRequestId++;
     if (hybridSession.previewPlaying && S.playing) stopPlayback();
     editorClearGuidePreview();
     hybridSession.previewPlaying = false;
+    hybridSession.previewLoading = false;
     hybridSession.previewMode = '';
     updateCompositePreviewButtons();
+    setCompositePreviewHelp('Only one source plays at a time. Track buttons use a clean guide instrument.');
     if (hadPreview) setStatus('Composite preview stopped.');
 }
 
@@ -360,15 +379,18 @@ function customMarkup(group) {
 function renderPreviewControls(view, wholeSong = false) {
     const resultReady = wholeSong || !!view.conflict.resolution;
     const buttonClass = 'px-2.5 py-1.5 rounded border border-gray-600 bg-dark-700 hover:border-gray-400 text-xs disabled:opacity-40 disabled:cursor-not-allowed';
+    const colors = { song: '', primary: ' text-sky-200', secondary: ' text-violet-200', result: ' text-emerald-200' };
+    const modes = compositePreviewModesPure(view, {
+        audioAvailable: !!S.audioBuffer,
+        resultReady,
+    });
+    const buttons = modes.map(mode => `<button type="button" data-composite-preview="${mode.id}" data-composite-preview-available="${mode.available ? 'true' : 'false'}" aria-pressed="false" class="${buttonClass}${colors[mode.id]}" ${mode.available ? '' : 'disabled'}${mode.unavailableReason ? ` title="${_editorEscHtml(mode.unavailableReason)}"` : ''}>▶ ${_editorEscHtml(mode.label)}</button>`).join('');
     return `<div class="mb-3 rounded-lg border border-gray-700 bg-dark-900/70 px-3 py-2">`
         + `<div class="flex flex-wrap items-center gap-2"><span class="text-xs text-gray-300 font-semibold mr-1">${wholeSong ? 'Preview the hybrid' : 'Listen to this section'}</span>`
-        + `<button type="button" data-composite-preview="song" aria-pressed="false" class="${buttonClass}" ${S.audioBuffer ? '' : 'disabled'}>▶ Song audio</button>`
-        + (wholeSong ? '' : `<button type="button" data-composite-preview="primary" aria-pressed="false" class="${buttonClass} text-sky-200">▶ ${_editorEscHtml(view.names.primary)}</button>`
-            + `<button type="button" data-composite-preview="secondary" aria-pressed="false" class="${buttonClass} text-violet-200">▶ ${_editorEscHtml(view.names.secondary)}</button>`)
-        + `<button type="button" data-composite-preview="result" aria-pressed="false" class="${buttonClass} text-emerald-200" ${resultReady ? '' : 'disabled'}>▶ Hybrid guide</button>`
+        + buttons
         + `<button type="button" id="editor-composite-preview-stop" class="${buttonClass}" disabled>■ Stop</button>`
         + (wholeSong ? '' : `<button type="button" id="editor-composite-keep-loop" class="ml-auto ${buttonClass}">Keep this section looped in the editor</button>`)
-        + `</div><p class="mt-1.5 text-xs text-gray-500">${wholeSong ? 'The guide plays the planned hybrid over your song. Nothing is created until you press Create Hybrid Track.' : 'The selected bars repeat while you compare the song and each playable part.'}</p></div>`;
+        + `</div><p id="editor-composite-preview-help" class="mt-1.5 text-xs text-gray-400" aria-live="polite">Only one source plays at a time. Track buttons use a clean guide instrument.${wholeSong ? ' Nothing is created until you press Create Hybrid Track.' : ' The selected bars repeat while you compare them.'}</p></div>`;
 }
 
 function currentConflictView() {
@@ -424,25 +446,74 @@ function setCompositeContextLoop(view) {
     return region;
 }
 
-function startCompositePreview(mode) {
+async function startCompositePreview(mode) {
     const view = currentPreviewView();
     if (!view) return;
+    const resultReady = !!view.conflict?.resolution;
+    const modeModel = compositePreviewModesPure(view, {
+        audioAvailable: !!S.audioBuffer,
+        resultReady,
+    }).find(candidate => candidate.id === mode);
+    if (!modeModel || !modeModel.available) {
+        const reason = modeModel?.unavailableReason || 'This preview is not available.';
+        setCompositePreviewHelp(reason);
+        setStatus(`Hybrid preview: ${reason}`);
+        return;
+    }
+    const lane = view.lanes.find(candidate => candidate.id === mode);
+    const arrangement = mode === 'secondary'
+        ? hybridSession.plan.secondary
+        : hybridSession.plan.primary;
+    // A new choice replaces the sound already playing immediately; do not let
+    // the previous Original/guide mode continue underneath a loading message.
+    if (hybridSession.previewPlaying && S.playing) stopPlayback();
+    if (hybridSession.previewPlaying || hybridSession.previewMode) editorClearGuidePreview();
+    const requestId = ++hybridSession.previewRequestId;
+    hybridSession.previewMode = mode;
+    hybridSession.previewPlaying = false;
+    hybridSession.previewLoading = mode !== 'song';
+    updateCompositePreviewButtons();
+    if (mode !== 'song') {
+        setCompositePreviewHelp(`Loading the clean sound for ${modeModel.label}…`);
+        setStatus(`Hybrid preview: loading the clean sound for ${modeModel.label}.`);
+        let ready = false;
+        try { ready = await editorPrepareGuidePreview(arrKind(arrangement)); }
+        catch (_) { ready = false; }
+        if (requestId !== hybridSession.previewRequestId || !hybridSession.plan) return;
+        hybridSession.previewLoading = false;
+        if (!ready) {
+            hybridSession.previewMode = '';
+            updateCompositePreviewButtons();
+            const message = 'The clean guide sound could not be loaded. The Original song preview is still available.';
+            setCompositePreviewHelp(message);
+            setStatus(`Hybrid preview: ${message}`);
+            return;
+        }
+    }
+    if (requestId !== hybridSession.previewRequestId) return;
     rememberCompositePreviewSession();
     if (S.playing) stopPlayback();
     editorClearGuidePreview();
-    const lane = view.lanes.find(candidate => candidate.id === mode);
     const events = mode === 'song' ? [] : compositePreviewEventsPure(
-        lane ? lane.entries : [], hybridSession.plan.primary, hybridSession.plan.beats,
+        lane ? lane.entries : [], arrangement, hybridSession.plan.beats,
         hybridSession.plan.compatibility.stringCount);
-    editorSetGuidePreview(events, arrKind(hybridSession.plan.primary));
+    editorSetGuidePreview(events, arrKind(arrangement), compositePreviewAudioPolicyPure(mode));
     setCompositeContextLoop(view);
-    hybridSession.previewMode = mode;
     startPlayback();
     hybridSession.previewPlaying = !!S.playing;
     updateCompositePreviewButtons();
-    const label = mode === 'song' ? 'song audio' : mode === 'result'
-        ? 'hybrid guide over song audio' : `${view.names[mode]} guide over song audio`;
-    setStatus(`Hybrid preview: playing ${label}.`);
+    if (!hybridSession.previewPlaying) {
+        restoreCompositePreviewSession();
+        const message = 'Playback could not start.';
+        setCompositePreviewHelp(message);
+        setStatus(`Hybrid preview: ${message}`);
+        return;
+    }
+    const help = mode === 'song'
+        ? 'Playing the original recording only. Generated parts and metronome are muted.'
+        : `Playing ${modeModel.label} with a clean guide sound. The original recording and metronome are muted.`;
+    setCompositePreviewHelp(help);
+    setStatus(`Hybrid preview: playing ${modeModel.label}.`);
 }
 
 function keepCompositeContextLoop() {
@@ -778,6 +849,7 @@ function analyzeFromDialog() {
     hybridSession.plan = plan;
     hybridSession.conflictIndex = 0;
     hybridSession.customDrafts.clear();
+    editorWarmGuidePreview(arrKind(plan.primary));
     setCompositeReviewMode(true);
     renderResult();
 }

@@ -52,7 +52,9 @@ let audioLoadGeneration = 0;
 let activeSourceGeneration = 0;
 // A resolver audition is an explicit, temporary guide source. `null` means
 // normal Editor playback; an object with an empty event list intentionally
-// means song audio without any arrangement guide.
+// means song audio without any arrangement guide. Focused tools may also
+// temporarily mute the reference/metronome without touching persisted mixer
+// preferences — the preview object owns that session-only policy.
 let _editorGuidePreview = null;
 
 // Lazily create the shared AudioContext. Compose mode never decodes a
@@ -1502,6 +1504,16 @@ function _mixFirstPlayStartGainPure(target) {
     if (!(target > 0)) return 0;
     return Math.min(target, Math.max(0.05, target * 0.3));
 }
+// A focused preview has first refusal over the reference bus. `null` keeps
+// ordinary playback/A-B behavior; only the explicit `muted` policy gates the
+// recording. Kept pure because first-play, fader moves, starts, seeks and A/B
+// must all agree on the same answer.
+function _previewRefTargetPure(previewReferenceAudio, fallbackGain) {
+    return previewReferenceAudio === 'muted' ? 0 : fallbackGain;
+}
+function _previewMetronomeEnabledPure(previewActive, previewMetronome, preference) {
+    return previewActive ? !!previewMetronome : !!preference;
+}
 // Rate-limit for the edit-preview blip: a group edit (set fret on N notes)
 // must read as ONE cue, not a machine-gun transient.
 function _mixBlipAllowedPure(nowMs, lastMs, gapMs) {
@@ -1683,8 +1695,20 @@ function _ensureRefGain() {
 let _mixFirstPlayDone = false;
 function _mixApplyFirstPlayFade() {
     if (_mixFirstPlayDone || !_refGain || !S.audioCtx) return;
+    const fader = _mixGainForPctPure(_mixLoadPct().ref);
+    const abTarget = typeof _abRefTargetPure === 'function'
+        ? _abRefTargetPure(
+            typeof _abActive === 'function' && _abActive(), !!S.playing,
+            typeof _abPhase === 'string' ? _abPhase : 'recording', fader)
+        : fader;
+    const previewReference = typeof _editorGuidePreview !== 'undefined' && _editorGuidePreview
+        ? _editorGuidePreview.referenceAudio : null;
+    const target = _previewRefTargetPure(previewReference, abTarget);
+    // A muted guide-only audition starts the reference source for clock/stem
+    // alignment, but it is not the recording's first audible play. Preserve
+    // the hearing-safety fade for the first later Original-song audition.
+    if (!(target > 0)) return;
     _mixFirstPlayDone = true;
-    const target = _mixGainForPctPure(_mixLoadPct().ref);
     const now = S.audioCtx.currentTime;
     _refGain.gain.setValueAtTime(_mixFirstPlayStartGainPure(target), now);
     _refGain.gain.linearRampToValueAtTime(target, now + 0.35);
@@ -2514,18 +2538,59 @@ function _guideResetSchedule() {
     if (typeof _bandFiredKeys !== 'undefined') _bandFiredKeys.clear();
 }
 
+// Warm a focused preview's pitched instrument as soon as its result exists.
+// This is deliberately fire-and-forget and never creates/resumes a context:
+// opening a modal must not start audio or violate browser gesture rules.
+export function editorWarmGuidePreview(kind = 'guitar') {
+    const gm = editorGmVoiceFor(_gmKindPure(kind));
+    if (gm === null || !S.audioCtx) return false;
+    if (!gmPresetReady(gm)) ensureGmPreset(gm, S.audioCtx);
+    return gmPresetReady(gm);
+}
+
+// User-gesture preparation for a focused pitched preview. The promise resolves
+// only after the requested clean instrument is available; callers can refuse
+// to start rather than misrepresenting a clap fallback as a guitar/bass part.
+export async function editorPrepareGuidePreview(kind = 'guitar') {
+    const gm = editorGmVoiceFor(_gmKindPure(kind));
+    const ctx = _ensureAudioCtx();
+    if (gm === null || !ctx) return false;
+    const loading = ensureGmPreset(gm, ctx);
+    if (ctx.state === 'suspended' && typeof ctx.resume === 'function') {
+        try { await ctx.resume(); } catch (_) { /* readiness check below owns the result */ }
+    }
+    // Script-tag loads have no browser-level timeout. Bound this focused UI
+    // wait so an offline/CDN stall returns a useful error instead of disabling
+    // every audition button forever; the underlying load may still populate
+    // the cache later, so a retry can succeed.
+    let timeoutId = null;
+    await Promise.race([
+        loading,
+        new Promise(resolve => { timeoutId = setTimeout(resolve, 10000); }),
+    ]);
+    if (timeoutId !== null) clearTimeout(timeoutId);
+    return gmPresetReady(gm);
+}
+
 // Temporary pitched source used by focused tools such as the composite
 // resolver. It never mutates S.arrangements, the active part, or persisted
 // guide preferences. An empty list is significant: suppress all chart guides
-// while retaining the imported song audio and optional metronome.
-export function editorSetGuidePreview(events = [], kind = 'guitar') {
+// while the policy decides whether the imported song audio is audible.
+export function editorSetGuidePreview(events = [], kind = 'guitar', options = {}) {
     const sanitized = _gmSanitizeEventsPure(events);
     _editorGuidePreview = {
         events: sanitized,
         gm: sanitized.length ? editorGmVoiceFor(_gmKindPure(kind)) : null,
+        referenceAudio: options.referenceAudio === 'muted' ? 'muted' : 'audible',
+        metronome: options.metronome !== false,
+        allowClapFallback: options.allowClapFallback !== false,
     };
     _guideResetSchedule();
-    _abApplyRefGain();
+    // Seat the gate before a newly-started BufferSource can emit its first
+    // sample. The usual 20 ms ramp is for live transitions; here playback is
+    // stopped and even a tiny fade from audible → zero would leak recording
+    // into a guide-only audition.
+    _abApplyRefGain(true);
     _guideTimerSync();
 }
 
@@ -2543,7 +2608,10 @@ function _guideTick() {
     // with the pref off; recording passes stay clean even with it on.
     const claps = previewActive
         || _abClapsEnabledPure(_abActive(), _abPhase, editorGuideClapEnabled());
-    const metro = editorMetronomeEnabled();
+    const metro = _previewMetronomeEnabledPure(
+        previewActive,
+        previewActive && _editorGuidePreview.metronome,
+        editorMetronomeEnabled());
     // Band tracks are real DAW channels, not a flavor of the old guide-clap
     // toggle. They stay live beside stems until their own strip is muted.
     // A/B's recording-only pass remains an intentional global audition mute.
@@ -2663,7 +2731,14 @@ function _guideTick() {
             }
         } else {
             if (gm !== null) ensureGmPreset(gm, S.audioCtx);   // clap while it loads
-            if (S.drumEditMode) {
+            // Focused pitched auditions can opt out of the historical clap
+            // fallback. Silence plus a clear loading/error state is more honest
+            // than claiming the user is hearing an isolated guitar part while
+            // only its rhythm is clicking.
+            if (previewActive && !_editorGuidePreview.allowClapFallback) {
+                // The resolver awaits the preset before playback; this branch
+                // only covers a preset disappearing between readiness and tick.
+            } else if (S.drumEditMode) {
                 // The drum grid's guide is the KIT, not a tick (each piece
                 // plays its one-shot; still gated by the drum strip above).
                 _drumKitVoicesInWindow(from, to, null, host.partClapState().vol);
@@ -2845,14 +2920,25 @@ export function _abDisarm() {
     _guideTimerSync();
 }
 
-export function _abApplyRefGain() {
+export function _abApplyRefGain(immediate = false) {
     const rg = _ensureRefGain();
     if (!rg || !S.audioCtx) return;
-    const target = _abRefTargetPure(
+    const abTarget = _abRefTargetPure(
         _abActive(), !!S.playing, _abPhase,
         _mixGainForPctPure(_mixLoadPct().ref));
-    // Same ~20 ms ramp as every mixer move — a phase flip is never a pop.
-    rg.gain.setTargetAtTime(target, S.audioCtx.currentTime, 0.02);
+    const previewReference = typeof _editorGuidePreview !== 'undefined' && _editorGuidePreview
+        ? _editorGuidePreview.referenceAudio : null;
+    const target = _previewRefTargetPure(
+        previewReference, abTarget);
+    if (immediate) {
+        if (typeof rg.gain.cancelScheduledValues === 'function') {
+            rg.gain.cancelScheduledValues(S.audioCtx.currentTime);
+        }
+        rg.gain.setValueAtTime(target, S.audioCtx.currentTime);
+    } else {
+        // Same ~20 ms ramp as every mixer move — a phase flip is never a pop.
+        rg.gain.setTargetAtTime(target, S.audioCtx.currentTime, 0.02);
+    }
 }
 
 function _abOnLoopWrap() {

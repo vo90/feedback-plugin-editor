@@ -169,16 +169,18 @@ function buildAB(opts) {
         editorClampScrollX: (x) => x, editorApplyScrollBounds: () => {},
     };
     const env = new Function(
-        'S', 'localStorage', 'document', 'window', '_guideVoices', 'host',
+        'S', 'localStorage', 'document', 'window', '_guideVoices', 'host', '_editorGuidePreview',
         '_selectedLoopRegion', '_setLoopRegionEnabled', '_updateLoopRegionControls',
         '_guideTimerSync', 'setStatus', '_editorSeekToTime', 'draw', '_attachMeterTap',
         '"use strict";' + mixBlock + '\n' + busBlock + '\n' + abPure + '\n' + abRuntime + loopArm
         + '\nreturn { _ensureRefGain, _mixSetBusGain, _mixLoadPct, _abApplyRefGain,'
         + ' _abActive, _editorToggleLoopAB, _setLoopRegionEnabled, refGainNode: () => _refGain,'
         + ' setPhase: (p) => { _abPhase = p; }, setOn: (v) => { _abOn = v; },'
+        + ' setPreviewReference: (mode) => { _editorGuidePreview = mode ? { referenceAudio: mode } : null; },'
         + ' getOn: () => _abOn, getPhase: () => _abPhase };'
     )(
         S, stubLocalStorage(), doc, win, [], host,
+        opts.previewReference ? { referenceAudio: opts.previewReference } : null,
         () => region,
         (enabled) => { spies.setLoopRegionEnabled.push(enabled); S.loopEnabled = !!enabled; },
         () => {},   // _updateLoopRegionControls (pre-fix arming path uses this)
@@ -214,6 +216,22 @@ t('ref fader on a recording pass ramps to the fresh fader level (mute is guide-p
     env._mixSetBusGain('ref', '80');
     const last = g.calls[g.calls.length - 1];
     assert.strictEqual(last[1], 0.8, 'recording pass follows the fader');
+});
+
+t('focused guide preview seats an immediate mute, survives fader moves, and restores cleanly', () => {
+    const { env } = buildAB({ playing: false, previewReference: 'muted' });
+    env._ensureRefGain();
+    const g = env.refGainNode().gain;
+    env._abApplyRefGain(true);
+    assert.deepStrictEqual(g.calls[g.calls.length - 1].slice(0, 2), ['set', 0],
+        'the recording gate is zero before the preview source starts');
+    env._mixSetBusGain('ref', '80');
+    assert.strictEqual(g.calls[g.calls.length - 1][1], 0,
+        'moving the recording fader cannot leak it into an isolated guide');
+    env.setPreviewReference(null);
+    env._abApplyRefGain();
+    assert.strictEqual(g.calls[g.calls.length - 1][1], 0.8,
+        'clearing the temporary preview restores the latest user fader level');
 });
 
 t('mid-play A/B arming delegates to the loop arm (seeks into region) — no raw S.loopEnabled write', () => {
