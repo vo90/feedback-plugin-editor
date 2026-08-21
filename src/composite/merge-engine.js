@@ -1,10 +1,8 @@
-/* Arrangement-composite merge engine.
+/* Shared Hybrid Track merge core.
  *
- * Pure, DOM-free planning for combining two fretted arrangements that share
- * the editor's song timeline. Source arrangements are never mutated. The
- * output of `analyzeCompositeMerge` is an explicit plan: safe material lives
- * in `fixedEntries`, while every cross-source physical collision is grouped
- * into a conflict hunk that must be resolved before materialization.
+ * Pure, DOM-free source preparation, duplicate handling, selection safety,
+ * and materialization shared by Automatic and Guided Hybrid Track planning.
+ * Source arrangements are never mutated.
  */
 
 import { beatOf, timeOf } from '../beats.js';
@@ -15,28 +13,6 @@ export const COMPOSITE_BEAT_EPS = 1e-4;
 export const COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS = 0.001;
 export const COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS = 0.005;
 export const COMPOSITE_TIMING_TOLERANCE_BEAT_FRACTION = 0.01;
-export const COMPOSITE_GAP_FILL_DEFAULTS = Object.freeze({
-    unit: 'beats',
-    minimumGap: 1,
-    transitionMargin: 0.25,
-});
-
-const COMPOSITE_GAP_FILL_UNIT_DEFAULTS = Object.freeze({
-    beats: Object.freeze({ minimumGap: 1, transitionMargin: 0.25 }),
-    // The first-time seconds values match the beat defaults at 120 BPM.
-    seconds: Object.freeze({ minimumGap: 0.5, transitionMargin: 0.125 }),
-});
-
-const COMPOSITE_GAP_FILL_UNIT_LIMITS = Object.freeze({
-    beats: Object.freeze({ minimumGap: 16, transitionMargin: 8 }),
-    seconds: Object.freeze({ minimumGap: 30, transitionMargin: 10 }),
-});
-
-export function compositeGapFillDefaultsForUnit(unit) {
-    const normalizedUnit = unit === 'seconds' ? 'seconds' : 'beats';
-    return { unit: normalizedUnit, ...COMPOSITE_GAP_FILL_UNIT_DEFAULTS[normalizedUnit] };
-}
-
 function clone(value) {
     if (value == null) return value;
     if (typeof structuredClone === 'function') return structuredClone(value);
@@ -310,38 +286,7 @@ export function compositeCompatibility(primary, secondary) {
     };
 }
 
-function mergeIntervals(entries, padding = 0, coordinate = beat => beat) {
-    const pad = Math.max(0, finite(padding));
-    const spans = entries.map(e => ({
-        start: coordinate(e.startBeat) - pad,
-        end: coordinate(e.effectiveEndBeat) + pad,
-    }))
-        .sort((a, b) => a.start - b.start || a.end - b.end);
-    const merged = [];
-    for (const span of spans) {
-        const tail = merged[merged.length - 1];
-        if (tail && span.start <= tail.end + COMPOSITE_BEAT_EPS) tail.end = Math.max(tail.end, span.end);
-        else merged.push({ ...span });
-    }
-    return merged;
-}
-
-export function normalizeCompositeGapFillOptions(options = {}) {
-    const unit = options.unit === 'seconds' ? 'seconds' : 'beats';
-    const defaults = COMPOSITE_GAP_FILL_UNIT_DEFAULTS[unit];
-    const limits = COMPOSITE_GAP_FILL_UNIT_LIMITS[unit];
-    // Accept the first PoC's beat-specific field names so an open dialog or
-    // downstream caller from that build degrades to the new shared-unit model.
-    const legacyMinimum = unit === 'beats' ? options.minimumGapBeats : options.minimumGapSeconds;
-    const legacyMargin = unit === 'beats' ? options.transitionMarginBeats : options.transitionMarginSeconds;
-    const minimumGap = Math.max(0, Math.min(limits.minimumGap,
-        finite(options.minimumGap, finite(legacyMinimum, defaults.minimumGap))));
-    const transitionMargin = Math.max(0, Math.min(limits.transitionMargin,
-        finite(options.transitionMargin, finite(legacyMargin, defaults.transitionMargin))));
-    return { unit, minimumGap, transitionMargin };
-}
-
-function groupPlayableEntries(entries) {
+export function compositePlayableGroups(entries) {
     const parent = entries.map((_, index) => index);
     const find = index => {
         while (parent[index] !== index) {
@@ -380,7 +325,7 @@ function groupPlayableEntries(entries) {
 }
 
 function annotatePlayableGroups(entries, source) {
-    const groups = groupPlayableEntries(entries);
+    const groups = compositePlayableGroups(entries);
     for (let index = 0; index < groups.length; index++) {
         const group = groups[index];
         const id = `${source}:gesture:${index}`;
@@ -474,186 +419,6 @@ export function prepareCompositeSources({ primary, secondary, beats = [] } = {})
     };
 }
 
-function eligibleGapFillWindows(primaryEntries, secondaryEntries, beats, options) {
-    const { unit, minimumGap, transitionMargin } = options;
-    // Beat mode follows the musical grid. Seconds mode projects every boundary
-    // through the real tempo map first, so its safety time remains constant
-    // through tempo changes and ramps.
-    const coordinate = unit === 'seconds' ? beat => timeOf(beats, beat) : beat => beat;
-    const allEntries = [...primaryEntries, ...secondaryEntries];
-    const contentStartBeat = Math.min(0, ...allEntries.map(entry => entry.startBeat));
-    const contentEndBeat = Math.max(
-        Array.isArray(beats) && beats.length ? beats.length - 1 : 0,
-        ...allEntries.map(entry => entry.effectiveEndBeat),
-    );
-    const contentStart = coordinate(contentStartBeat);
-    const contentEnd = coordinate(contentEndBeat);
-    const occupied = mergeIntervals(primaryEntries, transitionMargin, coordinate);
-    const windows = [];
-    let cursor = contentStart;
-    for (const span of occupied) {
-        if (span.end < contentStart + COMPOSITE_BEAT_EPS) continue;
-        if (span.start > contentEnd - COMPOSITE_BEAT_EPS) break;
-        const start = Math.max(contentStart, span.start);
-        const end = Math.min(contentEnd, span.end);
-        if (start - cursor + COMPOSITE_BEAT_EPS >= minimumGap) {
-            windows.push({ start: cursor, end: start });
-        }
-        cursor = Math.max(cursor, end);
-    }
-    if (contentEnd - cursor + COMPOSITE_BEAT_EPS >= minimumGap) {
-        windows.push({ start: cursor, end: contentEnd });
-    }
-    return { windows, coordinate };
-}
-
-function groupFitsWindow(group, windows, coordinate) {
-    const start = coordinate(group.startBeat);
-    const end = coordinate(group.endBeat);
-    return windows.some(window => start >= window.start - COMPOSITE_BEAT_EPS
-        && end <= window.end + COMPOSITE_BEAT_EPS);
-}
-
-function collisionPairs(primaryEntries, secondaryEntries, beats) {
-    const byString = new Map();
-    for (const entry of primaryEntries) {
-        if (!byString.has(entry.string)) byString.set(entry.string, []);
-        byString.get(entry.string).push(entry);
-    }
-    const pairs = [];
-    for (const secondary of secondaryEntries) {
-        const candidates = byString.get(secondary.string) || [];
-        for (const primary of candidates) {
-            if (primary.startBeat > secondary.effectiveEndBeat + COMPOSITE_BEAT_EPS) break;
-            if (primary.effectiveEndBeat < secondary.startBeat - COMPOSITE_BEAT_EPS) continue;
-            const reason = compositeCollisionReason(primary, secondary, beats);
-            if (reason) pairs.push({
-                primary,
-                secondary,
-                reason,
-                overlapSeconds: collisionOverlapSeconds(primary, secondary, beats),
-            });
-        }
-    }
-    return pairs.sort((a, b) => Math.min(a.primary.startBeat, a.secondary.startBeat)
-        - Math.min(b.primary.startBeat, b.secondary.startBeat));
-}
-
-function groupConflictPairs(pairs) {
-    const groups = [];
-    for (const pair of pairs) {
-        const startBeat = Math.min(pair.primary.startBeat, pair.secondary.startBeat);
-        const endBeat = Math.max(pair.primary.effectiveEndBeat, pair.secondary.effectiveEndBeat);
-        let group = groups[groups.length - 1];
-        if (!group || startBeat > group.endBeat + COMPOSITE_BEAT_EPS) {
-            group = {
-                id: `conflict:${groups.length + 1}`,
-                startBeat,
-                endBeat,
-                primaryEntries: [],
-                secondaryEntries: [],
-                reasons: [],
-                resolution: null,
-                selectedEntryIds: [],
-                validationError: '',
-                overlapSeconds: 0,
-            };
-            groups.push(group);
-        } else {
-            group.endBeat = Math.max(group.endBeat, endBeat);
-        }
-        if (!group.primaryEntries.some(e => e.id === pair.primary.id)) group.primaryEntries.push(pair.primary);
-        if (!group.secondaryEntries.some(e => e.id === pair.secondary.id)) group.secondaryEntries.push(pair.secondary);
-        if (!group.reasons.includes(pair.reason)) group.reasons.push(pair.reason);
-        group.overlapSeconds = Math.max(group.overlapSeconds, finite(pair.overlapSeconds));
-    }
-    for (const group of groups) {
-        group.primaryEntries.sort(compareEntries);
-        group.secondaryEntries.sort(compareEntries);
-    }
-    return groups;
-}
-
-export function analyzeCompositeMerge({
-    primary, secondary, beats = [], strategy = 'gap-fill', gapFill = {},
-} = {}) {
-    const prepared = prepareCompositeSources({ primary, secondary, beats });
-    const compatibility = prepared.compatibility;
-    if (!prepared.ok) {
-        return { ok: false, compatibility, strategy, fixedEntries: [], conflicts: [], stats: {} };
-    }
-    if (!['gap-fill', 'full-union'].includes(strategy)) {
-        return {
-            ok: false,
-            compatibility: { ...compatibility, ok: false, errors: ['Unknown merge strategy.'] },
-            strategy,
-            fixedEntries: [], conflicts: [], stats: {},
-        };
-    }
-
-    const primaryEntries = prepared.primaryEntries;
-    const allSecondary = prepared.secondaryEntries;
-    const secondaryEntries = prepared.uniqueSecondaryEntries;
-    const duplicates = prepared.duplicates;
-
-    const skippedEntries = [];
-    let candidates = secondaryEntries;
-    const gapFillOptions = normalizeCompositeGapFillOptions(gapFill);
-    if (strategy === 'gap-fill') {
-        const { windows, coordinate } = eligibleGapFillWindows(
-            primaryEntries, secondaryEntries, beats, gapFillOptions);
-        candidates = [];
-        // Coincident entries are one playable event (usually a chord). Never
-        // keep only the short child of a chord while dropping a sibling whose
-        // trail crosses into primary activity: the complete event fits or the
-        // complete event is skipped.
-        for (const group of groupPlayableEntries(secondaryEntries)) {
-            if (groupFitsWindow(group, windows, coordinate)) candidates.push(...group.entries);
-            else skippedEntries.push(...group.entries);
-        }
-    }
-
-    const pairs = collisionPairs(primaryEntries, candidates, beats);
-    const conflicts = groupConflictPairs(pairs);
-    const conflictingPrimary = new Set(pairs.map(p => p.primary.id));
-    const conflictingSecondary = new Set(pairs.map(p => p.secondary.id));
-    const fixedEntries = primaryEntries.filter(e => !conflictingPrimary.has(e.id));
-    for (const entry of candidates) if (!conflictingSecondary.has(entry.id)) fixedEntries.push(entry);
-    fixedEntries.sort(compareEntries);
-
-    return {
-        ok: true,
-        strategy,
-        gapFill: gapFillOptions,
-        compatibility,
-        primary,
-        secondary,
-        beats,
-        // Preserve both flattened sources for synchronized resolver context.
-        // These entries are immutable plan data; the visual layer must not
-        // reconstruct a source track from only accepted merge material.
-        sourceEntries: {
-            primary: primaryEntries,
-            secondary: allSecondary,
-        },
-        fixedEntries,
-        conflicts,
-        duplicates,
-        timingAdjustments: prepared.timingAdjustments,
-        skippedEntries,
-        stats: {
-            primaryNotes: primaryEntries.length,
-            secondaryNotes: allSecondary.length,
-            duplicatesRemoved: duplicates.length,
-            timingAdjustments: prepared.timingAdjustments.length,
-            secondaryAddedCleanly: fixedEntries.filter(e => e.source === 'secondary').length,
-            secondarySkippedByStrategy: skippedEntries.length,
-            conflictHunks: conflicts.length,
-            unresolvedConflicts: conflicts.length,
-        },
-    };
-}
-
 function conflictEntries(group) {
     const unique = new Map();
     for (const entry of [...(group.primaryEntries || []), ...(group.secondaryEntries || [])]) {
@@ -678,19 +443,10 @@ function expandSelectionUnits(group, selectedEntryIds) {
     return expanded;
 }
 
-function selectionFor(plan, group, resolution, selectedEntryIds) {
+function selectionFor(group, resolution, selectedEntryIds) {
     const available = conflictEntries(group);
     if (resolution === 'primary') return available.filter(entry => compositeEntryHasSource(entry, 'primary'));
     if (resolution === 'secondary') return available.filter(entry => compositeEntryHasSource(entry, 'secondary'));
-    if (resolution === 'compatible') {
-        const chosen = available.filter(entry => compositeEntryHasSource(entry, 'primary'));
-        for (const entry of available.filter(candidate => compositeEntryHasSource(candidate, 'secondary'))) {
-            if (chosen.some(other => other.id === entry.id)) continue;
-            if (!chosen.some(other => !entriesShareSource(other, entry)
-                && compositeCollisionReason(other, entry, plan.beats))) chosen.push(entry);
-        }
-        return chosen;
-    }
     if (resolution === 'custom') {
         const ids = expandSelectionUnits(group, selectedEntryIds);
         return available.filter(e => ids.has(e.id));
@@ -733,11 +489,11 @@ function entriesWithCandidateResolution(plan, currentGroup, selected) {
 
 export function resolveCompositeConflict(plan, conflictId, resolution, selectedEntryIds = []) {
     const group = plan && plan.conflicts && plan.conflicts.find(c => c.id === conflictId);
-    if (!group) return { ok: false, error: 'Conflict not found.' };
-    if (!['primary', 'secondary', 'compatible', 'custom'].includes(resolution)) {
-        return { ok: false, error: 'Unknown conflict resolution.' };
+    if (!group) return { ok: false, error: 'Review section not found.' };
+    if (!['primary', 'secondary', 'custom'].includes(resolution)) {
+        return { ok: false, error: 'Unknown review choice.' };
     }
-    const selected = selectionFor(plan, group, resolution, selectedEntryIds);
+    const selected = selectionFor(group, resolution, selectedEntryIds);
     const validation = validateCompositeSelection(
         entriesWithCandidateResolution(plan, group, selected),
         plan.beats,
@@ -817,7 +573,7 @@ function prepareCompositeEntries(entries, beats) {
 export function materializeCompositeArrangement(plan, name) {
     if (!plan || !plan.ok) throw new Error('A valid merge plan is required.');
     const unresolved = plan.conflicts.filter(c => !c.resolution);
-    if (unresolved.length) throw new Error(`${unresolved.length} merge conflict(s) remain unresolved.`);
+    if (unresolved.length) throw new Error(`${unresolved.length} review choice(s) remain unfinished.`);
     // Work on plan-entry clones so both imported tracks and the review plan
     // preserve their authored timing. The generated composite alone receives
     // any final cross-source sub-tolerance boundary clamps.
@@ -827,10 +583,10 @@ export function materializeCompositeArrangement(plan, name) {
         plan.beats,
         plan.compatibility && plan.compatibility.stringCount,
     );
-    if (!validation.ok) throw new Error(`The merged arrangement is not playable: ${validation.error}`);
+    if (!validation.ok) throw new Error(`The Hybrid Track is not playable: ${validation.error}`);
     const primary = plan.primary || {};
     const resultName = String(name || '').trim();
-    if (!resultName) throw new Error('The composite arrangement needs a name.');
+    if (!resultName) throw new Error('The Hybrid Track needs a name.');
     const arrangement = {
         name: resultName,
         type: plan.compatibility.kind === 'bass' ? 'bass' : 'guitar',

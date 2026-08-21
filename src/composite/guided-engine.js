@@ -306,12 +306,17 @@ function measureRangeLabel(cells) {
     return `Bars ${first.measure}–${last.measure}`;
 }
 
-function decisionBlock(cells, id) {
+function decisionBlock(cells, id, beats = []) {
     const primaryEntries = cells.flatMap(cell => cell.primaryEntries).sort(compareEntries);
     const secondaryEntries = cells.flatMap(cell => cell.secondaryEntries).sort(compareEntries);
     const rangeEndBeat = cells.at(-1).endBeat;
     const endBeat = Math.max(rangeEndBeat,
         ...primaryEntries.map(entryEffectiveEnd), ...secondaryEntries.map(entryEffectiveEnd));
+    const hasNoteVariant = primaryEntries.some(primary => secondaryEntries.some(secondary =>
+        compositeCollisionReason(primary, secondary, beats) === 'note-variant'));
+    const reasons = cells.some(cell => cell.transitionReview)
+        ? ['guided-choice', 'transition'] : ['guided-choice'];
+    if (hasNoteVariant) reasons.push('note-variant');
     return {
         id,
         kind: 'guided-decision',
@@ -324,8 +329,7 @@ function decisionBlock(cells, id) {
         primaryEntries,
         secondaryEntries,
         commonCount: cells.reduce((sum, cell) => sum + cell.commonEntries.length, 0),
-        reasons: cells.some(cell => cell.transitionReview)
-            ? ['guided-choice', 'transition'] : ['guided-choice'],
+        reasons,
         overlapSeconds: 0,
         resolution: null,
         selectedEntryIds: [],
@@ -655,12 +659,12 @@ function automaticRegions(cells) {
     return regions;
 }
 
-function buildDecisionBlocks(cells) {
+function buildDecisionBlocks(cells, beats = []) {
     const blocks = [];
     let run = [];
     const flush = () => {
         if (!run.length) return;
-        blocks.push(decisionBlock(run, `guided:${blocks.length + 1}`));
+        blocks.push(decisionBlock(run, `guided:${blocks.length + 1}`, beats));
         run = [];
     };
     for (const cell of cells) {
@@ -706,7 +710,7 @@ export function analyzeGuidedComposite({
     prepared.beats = beats;
     const { cells, range } = buildBaseCells({ prepared, beats, sections, primary, secondary });
     populateCells(cells, prepared);
-    const conflicts = buildDecisionBlocks(cells);
+    const conflicts = buildDecisionBlocks(cells, beats);
     const fixedEntries = fixedEntriesForCells(cells);
     const automatic = automaticRegions(cells);
     const plan = {

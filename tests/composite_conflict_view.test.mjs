@@ -8,10 +8,8 @@ import {
     renderCompositeConflictTabSvg,
     renderCompositeDifferenceTable,
 } from '../src/composite/conflict-view.js';
-import {
-    analyzeCompositeMerge,
-    resolveCompositeConflict,
-} from '../src/composite/merge-engine.js';
+import { resolveCompositeConflict } from '../src/composite/merge-engine.js';
+import { analyzeGuidedComposite } from '../src/composite/guided-engine.js';
 
 const beats = Array.from({ length: 25 }, (_, index) => ({
     time: index * 0.5,
@@ -37,11 +35,10 @@ const arrangement = (name, notes) => ({
 });
 
 function conflictPlan(primaryNotes = [], secondaryNotes = []) {
-    return analyzeCompositeMerge({
+    return analyzeGuidedComposite({
         primary: arrangement('Lead', primaryNotes),
         secondary: arrangement('Rhythm', secondaryNotes),
         beats,
-        strategy: 'full-union',
     });
 }
 
@@ -69,10 +66,10 @@ test('view model keeps synchronized source context and an honest unresolved resu
         secondaryName: 'Rhythm',
     });
     assert.equal(view.explanation,
-        'String 6 cannot play fret 7 from Lead and fret 5 from Rhythm together. They overlap by 500 ms, including their trails.');
+        'Both tracks play different parts here. Choose a track, or mix the notes yourself.');
     assert.deepEqual(view.lanes[0].entries.map(entry => entry.fret), [3, 7]);
     assert.deepEqual(view.lanes[1].entries.map(entry => entry.fret), [5, 5]);
-    assert.deepEqual(view.lanes[2].entries.map(entry => entry.fret), [3, 5]);
+    assert.deepEqual(view.lanes[2].entries.map(entry => entry.fret), []);
     assert.equal(view.lanes[2].entries.some(entry => entry.inConflict), false);
 
     resolveCompositeConflict(plan, plan.conflicts[0].id, 'primary');

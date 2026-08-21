@@ -17,22 +17,20 @@ import { S } from '../state.js';
 import { host } from '../host.js';
 import { _editorEscHtml, _installModalKeyboard, setStatus } from '../ui.js';
 import {
-    analyzeCompositeMerge,
-    clearCompositeConflictResolution,
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
-    compositeGapFillDefaultsForUnit,
     compositeResolvedEntries,
     compositeSelectionUnitIds,
     materializeCompositeArrangement,
-    normalizeCompositeGapFillOptions,
-    resolveCompositeConflict,
 } from './merge-engine.js';
+import {
+    analyzeGapFillComposite,
+    compositeGapFillDefaultsForUnit,
+    normalizeCompositeGapFillOptions,
+} from './gap-fill-engine.js';
 import {
     analyzeGuidedComposite,
     clearGuidedRepeatGroup,
     detachGuidedRepeatOccurrence,
-    GUIDED_REPEAT_MODE_EVERY,
-    GUIDED_REPEAT_MODE_MATCHING,
     guidedRepeatGroupForBlock,
     guidedReviewGroups,
     normalizeGuidedRepeatMode,
@@ -46,71 +44,24 @@ import {
     renderCompositeDifferenceTable,
 } from './conflict-view.js';
 import { compositePreviewEventsPure, compositePreviewRegionPure } from './preview.js';
+import { createHybridBuilderSession, resetHybridBuilderReview } from './session.js';
+import { renderHybridSetupView } from './setup-view.js';
+import {
+    HYBRID_GAP_FILL_CONTROL_CONFIG,
+    hybridGapFillPreferencesPure,
+    hybridGuidedPreferencesPure,
+    loadHybridGapFillPreferences,
+    loadHybridGuidedPreferences,
+    saveHybridGapFillPreferences,
+    saveHybridGuidedPreferences,
+} from './preferences.js';
 
-let activePlan = null;
-let activeConflictIndex = 0;
-let activePreviewMode = '';
-let compositePreviewPlaying = false;
-let compositePreviewRestore = null;
-const customDrafts = new Map();
-const COMPOSITE_GAP_FILL_PREFS_KEY = 'editorCompositeGapFill';
-const COMPOSITE_GUIDED_PREFS_KEY = 'editorCompositeGuided';
-const COMPOSITE_GAP_FILL_CONTROL_CONFIG = Object.freeze({
-    beats: Object.freeze({ minimumMax: 16, minimumStep: 0.25, marginMax: 8, marginStep: 0.125 }),
-    seconds: Object.freeze({ minimumMax: 30, minimumStep: 0.05, marginMax: 10, marginStep: 0.025 }),
-});
+export {
+    hybridGapFillPreferencesPure as _compositeGapFillPreferencesPure,
+    hybridGuidedPreferencesPure as _compositeGuidedPreferencesPure,
+};
 
-function preferenceValuesForUnit(unit, value) {
-    const normalized = normalizeCompositeGapFillOptions({ unit, ...(value || {}) });
-    return {
-        minimumGap: normalized.minimumGap,
-        transitionMargin: normalized.transitionMargin,
-    };
-}
-
-export function _compositeGapFillPreferencesPure(raw) {
-    let parsed = raw;
-    if (typeof raw === 'string') {
-        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-    }
-    if (!parsed || typeof parsed !== 'object') parsed = {};
-    const unit = parsed.unit === 'seconds' ? 'seconds' : 'beats';
-    return {
-        unit,
-        beats: preferenceValuesForUnit('beats', parsed.beats),
-        seconds: preferenceValuesForUnit('seconds', parsed.seconds),
-    };
-}
-
-function loadCompositeGapFillPreferences() {
-    let raw = null;
-    try { raw = localStorage.getItem(COMPOSITE_GAP_FILL_PREFS_KEY); } catch (_) { /* blocked storage */ }
-    return _compositeGapFillPreferencesPure(raw);
-}
-
-function saveCompositeGapFillPreferences(preferences) {
-    try { localStorage.setItem(COMPOSITE_GAP_FILL_PREFS_KEY, JSON.stringify(preferences)); } catch (_) { /* blocked storage */ }
-}
-
-export function _compositeGuidedPreferencesPure(raw) {
-    let parsed = raw;
-    if (typeof raw === 'string') {
-        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-    }
-    if (!parsed || typeof parsed !== 'object') parsed = {};
-    return { repeatMode: parsed.repeatMode === GUIDED_REPEAT_MODE_EVERY
-        ? GUIDED_REPEAT_MODE_EVERY : GUIDED_REPEAT_MODE_MATCHING };
-}
-
-function loadCompositeGuidedPreferences() {
-    let raw = null;
-    try { raw = localStorage.getItem(COMPOSITE_GUIDED_PREFS_KEY); } catch (_) { /* blocked storage */ }
-    return _compositeGuidedPreferencesPure(raw);
-}
-
-function saveCompositeGuidedPreferences(preferences) {
-    try { localStorage.setItem(COMPOSITE_GUIDED_PREFS_KEY, JSON.stringify(preferences)); } catch (_) { /* blocked storage */ }
-}
+const hybridSession = createHybridBuilderSession();
 
 function inputNumber(id) {
     const raw = byId(id)?.value;
@@ -132,7 +83,7 @@ function selectedCompositeStrategy() {
 
 function applyGapFillUnitToDialog(unit, values) {
     const normalized = normalizeCompositeGapFillOptions({ unit, ...(values || {}) });
-    const config = COMPOSITE_GAP_FILL_CONTROL_CONFIG[normalized.unit];
+    const config = HYBRID_GAP_FILL_CONTROL_CONFIG[normalized.unit];
     const minGap = byId('editor-composite-min-gap');
     const margin = byId('editor-composite-margin');
     const unitLabel = normalized.unit === 'seconds' ? 'seconds' : 'beats';
@@ -175,8 +126,8 @@ function cloneLoopRegion(region) {
 }
 
 function rememberCompositePreviewSession() {
-    if (compositePreviewRestore) return;
-    compositePreviewRestore = {
+    if (hybridSession.previewRestore) return;
+    hybridSession.previewRestore = {
         barSel: cloneLoopRegion(S.barSel),
         loopEnabled: !!S.loopEnabled,
         cursorTime: Number(S.cursorTime) || 0,
@@ -185,39 +136,37 @@ function rememberCompositePreviewSession() {
 
 function updateCompositePreviewButtons() {
     for (const button of document.querySelectorAll('[data-composite-preview]')) {
-        const active = button.dataset.compositePreview === activePreviewMode;
+        const active = button.dataset.compositePreview === hybridSession.previewMode;
         button.setAttribute('aria-pressed', active ? 'true' : 'false');
         button.classList.toggle('ring-2', active);
         button.classList.toggle('ring-emerald-400', active);
     }
     const stop = byId('editor-composite-preview-stop');
-    if (stop) stop.disabled = !compositePreviewPlaying;
+    if (stop) stop.disabled = !hybridSession.previewPlaying;
 }
 
 function endCompositePreviewPlayback() {
-    const hadPreview = compositePreviewPlaying || !!activePreviewMode;
-    if (compositePreviewPlaying && S.playing) stopPlayback();
+    const hadPreview = hybridSession.previewPlaying || !!hybridSession.previewMode;
+    if (hybridSession.previewPlaying && S.playing) stopPlayback();
     editorClearGuidePreview();
-    compositePreviewPlaying = false;
-    activePreviewMode = '';
+    hybridSession.previewPlaying = false;
+    hybridSession.previewMode = '';
     updateCompositePreviewButtons();
     if (hadPreview) setStatus('Composite preview stopped.');
 }
 
 function restoreCompositePreviewSession() {
     endCompositePreviewPlayback();
-    if (!compositePreviewRestore) return;
-    const restore = compositePreviewRestore;
-    compositePreviewRestore = null;
+    if (!hybridSession.previewRestore) return;
+    const restore = hybridSession.previewRestore;
+    hybridSession.previewRestore = null;
     _setBarSel(restore.barSel);
     _setLoopRegionEnabled(restore.loopEnabled);
     host.editorSeekToTime(restore.cursorTime);
 }
 
 function clearTransientState() {
-    activePlan = null;
-    activeConflictIndex = 0;
-    customDrafts.clear();
+    resetHybridBuilderReview(hybridSession);
 }
 
 function resetResult(message = 'Choose two tracks and how you want to build the hybrid.') {
@@ -241,10 +190,8 @@ function setCompositeReviewMode(reviewing) {
     if (workspace) workspace.style.gridTemplateColumns = 'minmax(0, 1fr)';
     const finish = byId('editor-composite-finish');
     if (finish && !reviewing) finish.hidden = true;
-}
-
-function optionMarkup(source) {
-    return `<option value="${source.index}">${_editorEscHtml(source.arrangement.name || `Track ${source.index + 1}`)}</option>`;
+    const analyze = byId('editor-composite-analyze');
+    if (analyze) analyze.hidden = reviewing;
 }
 
 function noteTechLabel(note) {
@@ -338,7 +285,7 @@ function activateGuidedReviewGroup(plan, group, preferUnresolved = true) {
     }
     if (index < 0) index = plan.conflicts.findIndex(block => group.memberIds.includes(block.id));
     if (index < 0) return false;
-    activeConflictIndex = index;
+    hybridSession.conflictIndex = index;
     return true;
 }
 
@@ -362,7 +309,7 @@ function renderOverview(plan) {
         const decisions = plan.conflicts.map((block, index) => {
             const left = ((block.startBeat - start) / (end - start)) * 100;
             const width = Math.max(0.7, (((block.rangeEndBeat || block.endBeat) - block.startBeat) / (end - start)) * 100);
-            const current = index === activeConflictIndex;
+            const current = index === hybridSession.conflictIndex;
             const stateClass = block.validationError ? 'bg-red-500'
                 : block.resolution ? 'bg-emerald-500' : 'bg-amber-500';
             const state = block.validationError ? 'Choice needs attention'
@@ -378,11 +325,11 @@ function renderOverview(plan) {
 }
 
 function customMarkup(group) {
-    const draft = customDrafts.get(group.id)
+    const draft = hybridSession.customDrafts.get(group.id)
         || (group.resolution === 'custom' ? group.selectedEntryIds : null);
     if (!draft) return '';
     const checked = new Set(draft);
-    const stringCount = activePlan?.compatibility?.stringCount || 6;
+    const stringCount = hybridSession.plan?.compatibility?.stringCount || 6;
     const render = (entry) => entryMarkup(entry, `custom-${group.id}`, stringCount).replace(
         `data-entry-id="${entry.id}"`, `data-entry-id="${entry.id}"${checked.has(entry.id) ? ' checked' : ''}`);
     const primarySelected = group.primaryEntries.filter(entry => checked.has(entry.id)).length;
@@ -414,13 +361,13 @@ function renderPreviewControls(view, wholeSong = false) {
 }
 
 function currentConflictView() {
-    if (!activePlan || !activePlan.conflicts.length) return null;
-    const group = activePlan.conflicts[activeConflictIndex];
+    if (!hybridSession.plan || !hybridSession.plan.conflicts.length) return null;
+    const group = hybridSession.plan.conflicts[hybridSession.conflictIndex];
     const names = selectedSourceNames();
-    const draft = customDrafts.get(group.id);
+    const draft = hybridSession.customDrafts.get(group.id);
     return buildCompositeConflictViewModel({
-        plan: activePlan,
-        conflictIndex: activeConflictIndex,
+        plan: hybridSession.plan,
+        conflictIndex: hybridSession.conflictIndex,
         primaryName: names.primary,
         secondaryName: names.secondary,
         customEntryIds: Array.isArray(draft) ? draft : null,
@@ -433,15 +380,15 @@ function entryLastBeat(entry) {
 }
 
 function wholePlanPreviewView() {
-    if (!activePlan) return null;
+    if (!hybridSession.plan) return null;
     const names = selectedSourceNames();
-    const primary = activePlan.sourceEntries?.primary || [];
-    const secondary = activePlan.sourceEntries?.secondary || [];
-    const result = compositeResolvedEntries(activePlan);
+    const primary = hybridSession.plan.sourceEntries?.primary || [];
+    const secondary = hybridSession.plan.sourceEntries?.secondary || [];
+    const result = compositeResolvedEntries(hybridSession.plan);
     const all = [...primary, ...secondary, ...result];
     const startBeat = all.length ? Math.max(0, Math.min(...all.map(entry => entry.startBeat))) : 0;
     const endBeat = all.length ? Math.max(startBeat + 1, ...all.map(entryLastBeat))
-        : Math.max(1, activePlan.beats.length - 1);
+        : Math.max(1, hybridSession.plan.beats.length - 1);
     return {
         names,
         context: { startBeat, endBeat },
@@ -459,7 +406,7 @@ function currentPreviewView() {
 }
 
 function setCompositeContextLoop(view) {
-    const region = compositePreviewRegionPure(view.context, activePlan.beats);
+    const region = compositePreviewRegionPure(view.context, hybridSession.plan.beats);
     _setBarSel(region);
     _setLoopRegionEnabled(true);
     host.editorSeekToTime(region.startTime);
@@ -474,13 +421,13 @@ function startCompositePreview(mode) {
     editorClearGuidePreview();
     const lane = view.lanes.find(candidate => candidate.id === mode);
     const events = mode === 'song' ? [] : compositePreviewEventsPure(
-        lane ? lane.entries : [], activePlan.primary, activePlan.beats,
-        activePlan.compatibility.stringCount);
-    editorSetGuidePreview(events, arrKind(activePlan.primary));
+        lane ? lane.entries : [], hybridSession.plan.primary, hybridSession.plan.beats,
+        hybridSession.plan.compatibility.stringCount);
+    editorSetGuidePreview(events, arrKind(hybridSession.plan.primary));
     setCompositeContextLoop(view);
-    activePreviewMode = mode;
+    hybridSession.previewMode = mode;
     startPlayback();
-    compositePreviewPlaying = !!S.playing;
+    hybridSession.previewPlaying = !!S.playing;
     updateCompositePreviewButtons();
     const label = mode === 'song' ? 'song audio' : mode === 'result'
         ? 'hybrid guide over song audio' : `${view.names[mode]} guide over song audio`;
@@ -495,59 +442,56 @@ function keepCompositeContextLoop() {
     setCompositeContextLoop(view);
     // This button is an explicit handoff: do not restore the user's previous
     // loop when the resolver closes.
-    compositePreviewRestore = null;
+    hybridSession.previewRestore = null;
     const button = byId('editor-composite-keep-loop');
     if (button) button.textContent = 'Editor loop set ✓';
     setStatus('This section will stay looped after you close the Hybrid Track builder.');
 }
 
 function renderConflict(plan) {
-    const guided = plan.strategy === 'guided';
     if (!plan.conflicts.length) {
         return `<div class="rounded border border-emerald-700/50 bg-emerald-950/20 p-4 text-sm text-emerald-100 flex flex-wrap items-center justify-between gap-3">`
             + `<div><b class="block text-base mb-1">No choices needed</b>The tracks match here, or only one track is playing at a time. The hybrid is ready to create.</div>`
             + `<button type="button" id="editor-composite-edit-settings" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm text-gray-200">Back and adjust</button></div>`;
     }
-    activeConflictIndex = Math.max(0, Math.min(activeConflictIndex, plan.conflicts.length - 1));
-    const group = plan.conflicts[activeConflictIndex];
-    const repeatContext = guided ? guidedRepeatContext(plan, group) : null;
+    hybridSession.conflictIndex = Math.max(0, Math.min(hybridSession.conflictIndex, plan.conflicts.length - 1));
+    const group = plan.conflicts[hybridSession.conflictIndex];
+    const repeatContext = guidedRepeatContext(plan, group);
     const repeatBadge = repeatContext?.grouped
         ? `<span class="inline-block mt-1 rounded-full bg-sky-950/70 px-2 py-0.5 text-xs text-sky-200">Applies to ${repeatContext.members.length} matching sections</span>` : '';
     const names = selectedSourceNames();
-    const draft = customDrafts.get(group.id);
+    const draft = hybridSession.customDrafts.get(group.id);
     const view = buildCompositeConflictViewModel({
         plan,
-        conflictIndex: activeConflictIndex,
+        conflictIndex: hybridSession.conflictIndex,
         primaryName: names.primary,
         secondaryName: names.secondary,
         customEntryIds: Array.isArray(draft) ? draft : null,
     });
     const resolvedClass = group.validationError ? 'border-red-700/60'
-        : group.resolution ? 'border-emerald-700/60' : guided ? 'border-amber-700/60' : 'border-red-700/60';
+        : group.resolution ? 'border-emerald-700/60' : 'border-amber-700/60';
     const unresolved = repeatContext
         ? repeatContext.unresolvedDecisions
         : plan.conflicts.filter(conflict => !conflict.resolution).length;
     const stateClass = group.validationError ? 'bg-red-900/70 text-red-200'
         : group.resolution ? 'bg-emerald-900/70 text-emerald-200'
-            : guided ? 'bg-amber-900/70 text-amber-100' : 'bg-red-900/70 text-red-200';
+            : 'bg-amber-900/70 text-amber-100';
     const stateLabel = group.validationError ? 'Choice needs attention'
         : group.resolution ? 'Choice made' : 'Needs review';
-    const rangeLabel = guided && group.label
-        ? `${group.label} · ${conflictReason(group)}`
-        : `Beats ${group.startBeat.toFixed(3)}–${group.endBeat.toFixed(3)} · ${conflictReason(group)}`;
+    const rangeLabel = `${group.label} · ${conflictReason(group)}`;
     const resolutionButtons = `<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">`
         + `<button type="button" data-resolution="primary" aria-pressed="${group.resolution === 'primary'}" class="text-left px-3 py-3 rounded-lg border text-sm ${group.resolution === 'primary' ? 'bg-sky-900/70 border-sky-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-sky-500'}"><b class="block text-sky-300">Play ${_editorEscHtml(names.primary)} here</b><span class="text-xs text-gray-400">Use this track for the complete section</span>${repeatBadge}</button>`
         + `<button type="button" data-resolution="secondary" aria-pressed="${group.resolution === 'secondary'}" class="text-left px-3 py-3 rounded-lg border text-sm ${group.resolution === 'secondary' ? 'bg-violet-900/70 border-violet-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-violet-500'}"><b class="block text-violet-300">Play ${_editorEscHtml(names.secondary)} here</b><span class="text-xs text-gray-400">Use this track for the complete section</span>${repeatBadge}</button>`
-        + `<button type="button" data-resolution="custom" aria-pressed="${customDrafts.has(group.id) || group.resolution === 'custom'}" class="text-left px-3 py-3 rounded-lg border text-sm ${customDrafts.has(group.id) || group.resolution === 'custom' ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Mix notes manually</b><span class="text-xs text-gray-400">Advanced: choose notes from either track</span>${repeatBadge}</button></div>`;
-    const splitMarkup = guided && group.splitPoints && group.splitPoints.length
+        + `<button type="button" data-resolution="custom" aria-pressed="${hybridSession.customDrafts.has(group.id) || group.resolution === 'custom'}" class="text-left px-3 py-3 rounded-lg border text-sm ${hybridSession.customDrafts.has(group.id) || group.resolution === 'custom' ? 'bg-amber-900/70 border-amber-400 text-white' : 'bg-dark-700 border-gray-600 hover:border-amber-500'}"><b class="block text-amber-300">Mix notes manually</b><span class="text-xs text-gray-400">Advanced: choose notes from either track</span>${repeatBadge}</button></div>`;
+    const splitMarkup = group.splitPoints && group.splitPoints.length
         ? `<div><b class="text-gray-300">Divide this review section at a bar</b><p class="mt-0.5">Use this if the musical part changes inside the highlighted area.</p><div class="flex flex-wrap gap-1 mt-2">${group.splitPoints.map(point => `<button type="button" data-guided-split-beat="${point.beat}" class="px-2 py-1 rounded border border-gray-600 bg-dark-700 hover:border-gray-400">${_editorEscHtml(point.label)}</button>`).join('')}</div></div>`
         : '';
-    const decisionNumber = repeatContext ? repeatContext.groupIndex + 1 : activeConflictIndex + 1;
+    const decisionNumber = repeatContext ? repeatContext.groupIndex + 1 : hybridSession.conflictIndex + 1;
     const decisionTotal = repeatContext ? repeatContext.groups.length : plan.conflicts.length;
     const canReset = repeatContext
         ? repeatContext.members.some(candidate => candidate.block.resolution
-            || customDrafts.has(candidate.block.id))
-        : group.resolution || customDrafts.has(group.id);
+            || hybridSession.customDrafts.has(candidate.block.id))
+        : group.resolution || hybridSession.customDrafts.has(group.id);
     return `<section class="rounded border ${resolvedClass} bg-dark-800/70 p-3">`
         + `<div class="flex flex-wrap items-start justify-between gap-3 mb-3">`
         + `<div><div class="flex flex-wrap items-center gap-2"><h4 class="text-base font-semibold">Section ${decisionNumber} of ${decisionTotal}</h4>`
@@ -573,25 +517,25 @@ function renderConflict(plan) {
 
 function bindResultEvents() {
     const result = byId('editor-composite-result');
-    if (!result || !activePlan) return;
+    if (!result || !hybridSession.plan) return;
     for (const marker of result.querySelectorAll('[data-conflict-index]')) {
         marker.addEventListener('click', () => {
-            activeConflictIndex = Number(marker.dataset.conflictIndex) || 0;
+            hybridSession.conflictIndex = Number(marker.dataset.conflictIndex) || 0;
             renderResult();
         });
     }
     for (const button of result.querySelectorAll('[data-guided-split-beat]')) {
         button.addEventListener('click', () => {
-            const block = activePlan.conflicts[activeConflictIndex];
-            const split = splitGuidedRepeatGroup(activePlan, block.id,
+            const block = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+            const split = splitGuidedRepeatGroup(hybridSession.plan, block.id,
                 Number(button.dataset.guidedSplitBeat));
             if (!split.ok) {
                 block.validationError = split.error;
                 renderResult();
                 return;
             }
-            for (const replacedId of split.replacedBlockIds || [block.id]) customDrafts.delete(replacedId);
-            activeConflictIndex = split.index;
+            for (const replacedId of split.replacedBlockIds || [block.id]) hybridSession.customDrafts.delete(replacedId);
+            hybridSession.conflictIndex = split.index;
             renderResult();
         });
     }
@@ -601,14 +545,10 @@ function bindResultEvents() {
         byId('editor-composite-primary')?.focus();
     });
     const moveDecision = offset => {
-        if (activePlan.strategy !== 'guided') {
-            activeConflictIndex += offset;
-        } else {
-            const block = activePlan.conflicts[activeConflictIndex];
-            const context = guidedRepeatContext(activePlan, block);
-            const target = context?.groups[context.groupIndex + offset];
-            if (target) activateGuidedReviewGroup(activePlan, target, false);
-        }
+        const block = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+        const context = guidedRepeatContext(hybridSession.plan, block);
+        const target = context?.groups[context.groupIndex + offset];
+        if (target) activateGuidedReviewGroup(hybridSession.plan, target, false);
         renderResult();
     };
     byId('editor-composite-prev')?.addEventListener('click', () => moveDecision(-1));
@@ -620,38 +560,29 @@ function bindResultEvents() {
     byId('editor-composite-keep-loop')?.addEventListener('click', keepCompositeContextLoop);
     for (const button of result.querySelectorAll('[data-resolution]')) {
         button.addEventListener('click', () => {
-            const conflict = activePlan.conflicts[activeConflictIndex];
+            const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
             const resolution = button.dataset.resolution;
             if (resolution === 'custom') {
-                if (!customDrafts.has(conflict.id)) {
-                    customDrafts.set(conflict.id, conflict.resolution === 'custom'
+                if (!hybridSession.customDrafts.has(conflict.id)) {
+                    hybridSession.customDrafts.set(conflict.id, conflict.resolution === 'custom'
                         ? [...conflict.selectedEntryIds]
                         : conflict.primaryEntries.map(e => e.id));
                 }
-                const draft = customDrafts.get(conflict.id);
-                if (activePlan.strategy === 'guided') {
-                    resolveGuidedRepeatGroup(activePlan, conflict.id, 'custom', draft);
-                } else {
-                    resolveCompositeConflict(activePlan, conflict.id, 'custom', draft);
-                }
+                const draft = hybridSession.customDrafts.get(conflict.id);
+                resolveGuidedRepeatGroup(hybridSession.plan, conflict.id, 'custom', draft);
             } else {
-                const repeatContext = activePlan.strategy === 'guided'
-                    ? guidedRepeatContext(activePlan, conflict) : null;
+                const repeatContext = guidedRepeatContext(hybridSession.plan, conflict);
                 for (const member of repeatContext?.members || [{ block: conflict }]) {
-                    customDrafts.delete(member.block.id);
+                    hybridSession.customDrafts.delete(member.block.id);
                 }
-                if (activePlan.strategy === 'guided') {
-                    resolveGuidedRepeatGroup(activePlan, conflict.id, resolution);
-                } else {
-                    resolveCompositeConflict(activePlan, conflict.id, resolution);
-                }
+                resolveGuidedRepeatGroup(hybridSession.plan, conflict.id, resolution);
             }
             renderResult();
         });
     }
     const toggleCustomEntry = entryId => {
-        const conflict = activePlan.conflicts[activeConflictIndex];
-        const draft = new Set(customDrafts.get(conflict.id)
+        const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+        const draft = new Set(hybridSession.customDrafts.get(conflict.id)
             || (conflict.resolution === 'custom' ? conflict.selectedEntryIds : []));
         const unitIds = compositeSelectionUnitIds(conflict, entryId);
         const selected = unitIds.length && unitIds.every(unitId => draft.has(unitId));
@@ -659,12 +590,8 @@ function bindResultEvents() {
             if (selected) draft.delete(unitId);
             else draft.add(unitId);
         }
-        customDrafts.set(conflict.id, [...draft]);
-        if (activePlan.strategy === 'guided') {
-            resolveGuidedRepeatGroup(activePlan, conflict.id, 'custom', [...draft]);
-        } else {
-            resolveCompositeConflict(activePlan, conflict.id, 'custom', [...draft]);
-        }
+        hybridSession.customDrafts.set(conflict.id, [...draft]);
+        resolveGuidedRepeatGroup(hybridSession.plan, conflict.id, 'custom', [...draft]);
         renderResult();
     };
     for (const checkbox of result.querySelectorAll('[data-entry-id]')) {
@@ -681,46 +608,30 @@ function bindResultEvents() {
         });
     }
     byId('editor-composite-reset-choice')?.addEventListener('click', () => {
-        const conflict = activePlan.conflicts[activeConflictIndex];
-        if (activePlan.strategy === 'guided') {
-            const context = guidedRepeatContext(activePlan, conflict);
-            for (const member of context?.members || [{ block: conflict }]) customDrafts.delete(member.block.id);
-            clearGuidedRepeatGroup(activePlan, conflict.id);
-        } else {
-            customDrafts.delete(conflict.id);
-            clearCompositeConflictResolution(activePlan, conflict.id);
-        }
+        const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+        const context = guidedRepeatContext(hybridSession.plan, conflict);
+        for (const member of context?.members || [{ block: conflict }]) hybridSession.customDrafts.delete(member.block.id);
+        clearGuidedRepeatGroup(hybridSession.plan, conflict.id);
         renderResult();
     });
     byId('editor-composite-detach-occurrence')?.addEventListener('click', () => {
-        const conflict = activePlan.conflicts[activeConflictIndex];
-        customDrafts.delete(conflict.id);
-        const detached = detachGuidedRepeatOccurrence(activePlan, conflict.id);
+        const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+        hybridSession.customDrafts.delete(conflict.id);
+        const detached = detachGuidedRepeatOccurrence(hybridSession.plan, conflict.id);
         if (!detached.ok) conflict.validationError = detached.error;
         renderResult();
     });
     byId('editor-composite-apply-next')?.addEventListener('click', () => {
-        if (activePlan.strategy === 'guided') {
-            const context = guidedRepeatContext(activePlan, activePlan.conflicts[activeConflictIndex]);
-            let target = null;
-            for (let offset = 1; offset < context.groups.length; offset++) {
-                const candidate = context.groups[(context.groupIndex + offset) % context.groups.length];
-                if (candidate.memberIds.some(id => {
-                    const block = activePlan.conflicts.find(item => item.id === id);
-                    return block && !block.resolution;
-                })) { target = candidate; break; }
-            }
-            if (target) activateGuidedReviewGroup(activePlan, target);
-        } else {
-            const total = activePlan.conflicts.length;
-            let next = -1;
-            for (let offset = 1; offset < total; offset++) {
-                const candidate = (activeConflictIndex + offset) % total;
-                if (!activePlan.conflicts[candidate].resolution) { next = candidate; break; }
-            }
-            if (next < 0 && activeConflictIndex < total - 1) next = activeConflictIndex + 1;
-            if (next >= 0) activeConflictIndex = next;
+        const context = guidedRepeatContext(hybridSession.plan, hybridSession.plan.conflicts[hybridSession.conflictIndex]);
+        let target = null;
+        for (let offset = 1; offset < context.groups.length; offset++) {
+            const candidate = context.groups[(context.groupIndex + offset) % context.groups.length];
+            if (candidate.memberIds.some(id => {
+                const block = hybridSession.plan.conflicts.find(item => item.id === id);
+                return block && !block.resolution;
+            })) { target = candidate; break; }
         }
+        if (target) activateGuidedReviewGroup(hybridSession.plan, target);
         renderResult();
     });
 }
@@ -769,19 +680,19 @@ function renderAutomaticResult(plan, names, normalizationDetails) {
 }
 
 function renderResult() {
-    if (activePreviewMode) endCompositePreviewPlayback();
+    if (hybridSession.previewMode) endCompositePreviewPlayback();
     const result = byId('editor-composite-result');
-    if (!result || !activePlan) return;
-    if (activePlan.strategy === 'guided') guidedReviewGroups(activePlan);
-    const stats = activePlan.stats;
-    const unresolvedBlocks = activePlan.conflicts.filter(c => !c.resolution).length;
-    const unresolved = activePlan.strategy === 'guided'
+    if (!result || !hybridSession.plan) return;
+    if (hybridSession.plan.strategy === 'guided') guidedReviewGroups(hybridSession.plan);
+    const stats = hybridSession.plan.stats;
+    const unresolvedBlocks = hybridSession.plan.conflicts.filter(c => !c.resolution).length;
+    const unresolved = hybridSession.plan.strategy === 'guided'
         ? stats.unresolvedReviewDecisions : unresolvedBlocks;
     const normalized = stats.timingAdjustments || 0;
     const normalizationNotice = normalized ? `<details class="mb-3 rounded border border-gray-700 bg-dark-900/50 px-3 py-2 text-xs text-gray-400">`
         + `<summary class="cursor-pointer hover:text-gray-200">Technical details: ${normalized} tiny import timing ${normalized === 1 ? 'seam was' : 'seams were'} cleaned up</summary>`
         + `<p class="mt-2">The cleanup stayed within the tempo-aware ${Math.round(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS * 1000)} ms safety limit. Only the new hybrid uses the adjusted trail; both original tracks remain unchanged.</p></details>` : '';
-    const repeatNotice = activePlan.repeatNotice;
+    const repeatNotice = hybridSession.plan.repeatNotice;
     let repeatNoticeMarkup = '';
     if (repeatNotice && (repeatNotice.requested > 1 || repeatNotice.kind !== 'applied')) {
         if (repeatNotice.kind === 'partial') {
@@ -794,8 +705,8 @@ function renderResult() {
         }
     }
     const names = selectedSourceNames();
-    if (activePlan.strategy !== 'guided') {
-        result.innerHTML = renderAutomaticResult(activePlan, names, normalizationNotice);
+    if (hybridSession.plan.strategy !== 'guided') {
+        result.innerHTML = renderAutomaticResult(hybridSession.plan, names, normalizationNotice);
     } else {
         const occurrences = Math.max(stats.reviewDecisions || 0, stats.decisionBlocks || 0);
         const groupedText = occurrences > (stats.reviewDecisions || 0)
@@ -804,7 +715,7 @@ function renderResult() {
             + `<div><b class="text-sm text-gray-100">${stats.reviewDecisions} ${stats.reviewDecisions === 1 ? 'choice' : 'choices'}${groupedText}</b>`
             + `<p class="text-xs text-gray-400">Choose which part you want to play in each different section.</p></div>`
             + `<b class="text-sm ${unresolved ? 'text-amber-300' : 'text-emerald-300'}">${unresolved ? `${unresolved} left` : 'All choices complete ✓'}</b></div>`
-            + normalizationNotice + repeatNoticeMarkup + renderOverview(activePlan) + renderConflict(activePlan);
+            + normalizationNotice + repeatNoticeMarkup + renderOverview(hybridSession.plan) + renderConflict(hybridSession.plan);
     }
     const finish = byId('editor-composite-finish');
     if (finish) {
@@ -822,15 +733,15 @@ function analyzeFromDialog() {
     const repeatMode = normalizeGuidedRepeatMode(byId('editor-composite-repeat-mode')?.value);
     const gapFill = gapFillOptionsFromDialog();
     if (strategy === 'gap-fill') {
-        const preferences = loadCompositeGapFillPreferences();
+        const preferences = loadHybridGapFillPreferences();
         preferences.unit = gapFill.unit;
         preferences[gapFill.unit] = {
             minimumGap: gapFill.minimumGap,
             transitionMargin: gapFill.transitionMargin,
         };
-        saveCompositeGapFillPreferences(preferences);
+        saveHybridGapFillPreferences(preferences);
     } else if (strategy === 'guided') {
-        saveCompositeGuidedPreferences({ repeatMode });
+        saveHybridGuidedPreferences({ repeatMode });
     }
     const error = byId('editor-composite-error');
     if (primaryIndex === secondaryIndex) {
@@ -845,16 +756,16 @@ function analyzeFromDialog() {
     };
     const plan = strategy === 'guided'
         ? analyzeGuidedComposite({ ...sources, sections: S.sections, repeatMode })
-        : analyzeCompositeMerge({ ...sources, strategy: 'gap-fill', gapFill });
+        : analyzeGapFillComposite({ ...sources, gapFill });
     if (!plan.ok) {
         if (error) error.textContent = plan.compatibility.errors.join(' ');
         resetResult('These tracks cannot be combined. Check that they use the same instrument, tuning, string count, and capo.');
         return;
     }
     if (error) error.textContent = '';
-    activePlan = plan;
-    activeConflictIndex = 0;
-    customDrafts.clear();
+    hybridSession.plan = plan;
+    hybridSession.conflictIndex = 0;
+    hybridSession.customDrafts.clear();
     setCompositeReviewMode(true);
     renderResult();
 }
@@ -906,8 +817,8 @@ export class CreateCompositeArrangementCmd {
 
 async function finishMerge() {
     const error = byId('editor-composite-error');
-    if (!activePlan) return;
-    const unresolved = activePlan.conflicts.filter(c => !c.resolution);
+    if (!hybridSession.plan) return;
+    const unresolved = hybridSession.plan.conflicts.filter(c => !c.resolution);
     if (unresolved.length) {
         if (error) error.textContent = `Finish the ${unresolved.length} remaining ${unresolved.length === 1 ? 'choice' : 'choices'} first.`;
         return;
@@ -924,7 +835,7 @@ async function finishMerge() {
     }
     let arrangement;
     try {
-        arrangement = materializeCompositeArrangement(activePlan, name);
+        arrangement = materializeCompositeArrangement(hybridSession.plan, name);
     } catch (cause) {
         if (error) error.textContent = cause.message;
         return;
@@ -970,11 +881,11 @@ export function editorShowCompositeArrangementModal() {
         ? S.currentArr : sources[0].index;
     const secondary = sources.find(source => source.index !== primary).index;
     const name = _compositeUniqueNamePure(S.arrangements.map(arr => arr && arr.name));
-    const gapFillPreferences = loadCompositeGapFillPreferences();
+    const gapFillPreferences = loadHybridGapFillPreferences();
     const gapFillUnit = gapFillPreferences.unit;
     const gapFillValues = gapFillPreferences[gapFillUnit]
         || compositeGapFillDefaultsForUnit(gapFillUnit);
-    const guidedPreferences = loadCompositeGuidedPreferences();
+    const guidedPreferences = loadHybridGuidedPreferences();
     const modal = document.createElement('div');
     modal.id = 'editor-composite-modal';
     modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4';
@@ -983,28 +894,14 @@ export function editorShowCompositeArrangementModal() {
         + `<p class="text-sm text-gray-400 mt-0.5">Combine two synchronized guitar or bass parts into one playable track. Your original tracks stay unchanged.</p></div>`
         + `<button type="button" id="editor-composite-close" class="text-gray-400 hover:text-white text-xl leading-none" aria-label="Close">×</button></header>`
         + `<div id="editor-composite-workspace" class="grid min-h-0 flex-1 overflow-hidden" style="grid-template-columns:minmax(0,1fr)">`
-        + `<section id="editor-composite-setup" class="p-5 overflow-y-auto"><div class="max-w-5xl mx-auto space-y-5">`
-        + `<section><h4 class="text-base font-semibold">1. Choose the two tracks</h4><p class="text-sm text-gray-400 mt-1">The base track is kept. The fill track supplies the extra or alternative parts.</p>`
-        + `<div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">`
-        + `<label class="block rounded-lg border border-sky-800/60 bg-sky-950/20 p-3 text-sm text-sky-100"><b>Base track — always kept</b><select id="editor-composite-primary" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm">${sources.map(optionMarkup).join('')}</select></label>`
-        + `<label class="block rounded-lg border border-violet-800/60 bg-violet-950/20 p-3 text-sm text-violet-100"><b>Fill track</b><select id="editor-composite-secondary" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm">${sources.map(optionMarkup).join('')}</select></label></div></section>`
-        + `<fieldset><legend class="text-base font-semibold">2. Choose how to build the hybrid</legend><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">`
-        + `<label data-composite-mode-card="gap-fill" class="cursor-pointer rounded-xl border border-accent bg-sky-950/25 p-4 hover:border-sky-400"><span class="flex items-start gap-3"><input type="radio" name="editor-composite-strategy" value="gap-fill" checked class="mt-1 accent-accent"><span><b class="block text-base text-white">Automatic</b><span class="block text-sm text-gray-300 mt-1">Keep the base track and add fill-track notes only where the complete notes and trails fit safely.</span><span class="block text-xs text-emerald-300 mt-2">Fastest · no section-by-section choices</span></span></span></label>`
-        + `<label data-composite-mode-card="guided" class="cursor-pointer rounded-xl border border-gray-600 bg-dark-700/50 p-4 hover:border-violet-400"><span class="flex items-start gap-3"><input type="radio" name="editor-composite-strategy" value="guided" class="mt-1 accent-accent"><span><b class="block text-base text-white">Review sections yourself</b><span class="block text-sm text-gray-300 mt-1">The song is divided into musical sections. Choose the base track, fill track, or a manual mix where they differ.</span><span class="block text-xs text-violet-300 mt-2">More control · repeated riffs can share one choice</span></span></span></label>`
-        + `</div></fieldset>`
-        + `<section id="editor-composite-guided-controls" hidden class="rounded-lg border border-gray-700 bg-dark-900/50 p-4"><h4 class="text-sm font-semibold">Repeated riffs</h4>`
-        + `<label class="block text-sm text-gray-300 mt-2">How should repeated sections be reviewed?<select id="editor-composite-repeat-mode" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"><option value="${GUIDED_REPEAT_MODE_MATCHING}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_MATCHING ? ' selected' : ''}>Review matching riffs once (recommended)</option><option value="${GUIDED_REPEAT_MODE_EVERY}"${guidedPreferences.repeatMode === GUIDED_REPEAT_MODE_EVERY ? ' selected' : ''}>Review every occurrence separately</option></select></label>`
-        + `<p class="text-xs text-gray-400 mt-2">When the same playable riff appears again, one choice can be reused. Every copy still gets its own playability check.</p></section>`
-        + `<details id="editor-composite-gap-controls" class="rounded-lg border border-gray-700 bg-dark-900/50 p-4"><summary class="cursor-pointer text-sm font-semibold hover:text-white">Advanced safety settings</summary>`
-        + `<div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3"><label class="block text-sm text-gray-300">Timing unit<select id="editor-composite-gap-unit" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"><option value="beats"${gapFillUnit === 'beats' ? ' selected' : ''}>Beats — follows song tempo</option><option value="seconds"${gapFillUnit === 'seconds' ? ' selected' : ''}>Seconds — fixed real time</option></select></label>`
-        + `<label class="block text-sm text-gray-300"><span id="editor-composite-min-gap-label">Smallest gap to fill (${gapFillUnit})</span><input id="editor-composite-min-gap" type="number" min="0" value="${gapFillValues.minimumGap}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"></label>`
-        + `<label class="block text-sm text-gray-300"><span id="editor-composite-margin-label">Extra space before and after (${gapFillUnit})</span><input id="editor-composite-margin" type="number" min="0" value="${gapFillValues.transitionMargin}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"></label></div>`
-        + `<p class="text-xs text-gray-400 mt-2">A fill-track note is added only when its entire chord, trail, and connected technique fit between base-track parts.</p></details>`
-        + `<section class="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end"><label class="block text-sm text-gray-300"><b>3. Name the new track</b><input id="editor-composite-name" maxlength="60" value="${_editorEscHtml(name)}" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"></label>`
-        + `<button type="button" id="editor-composite-analyze" class="px-5 py-2.5 rounded bg-accent hover:bg-accent-light text-sm font-medium">Preview automatic hybrid</button></section>`
-        + `</div></section><main id="editor-composite-result-workspace" hidden class="p-4 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-sm text-gray-400">Choose two tracks and how you want to build the hybrid.</p></div></main></div>`
+        + renderHybridSetupView({
+            sources, name, gapFillUnit, gapFillValues,
+            guidedRepeatMode: guidedPreferences.repeatMode,
+        })
+        + `<main id="editor-composite-result-workspace" hidden class="p-4 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-sm text-gray-400">Choose two tracks and how you want to build the hybrid.</p></div></main></div>`
         + `<footer class="border-t border-gray-700 px-5 py-3 flex items-center gap-3"><div id="editor-composite-error" class="text-sm text-red-300 flex-1" role="alert" aria-live="polite"></div>`
         + `<button type="button" id="editor-composite-cancel" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm">Cancel</button>`
+        + `<button type="button" id="editor-composite-analyze" class="px-4 py-2 rounded bg-accent hover:bg-accent-light text-sm font-medium">Preview automatic hybrid</button>`
         + `<button type="button" id="editor-composite-finish" hidden disabled class="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 rounded text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed">Create Hybrid Track</button></footer></div>`;
     (document.querySelector('.editor-root') || document.body).appendChild(modal);
     byId('editor-composite-primary').value = String(primary);
@@ -1042,7 +939,7 @@ export function editorShowCompositeArrangementModal() {
             minimumGap: options.minimumGap,
             transitionMargin: options.transitionMargin,
         };
-        saveCompositeGapFillPreferences(gapFillPreferences);
+        saveHybridGapFillPreferences(gapFillPreferences);
     };
     for (const control of [byId('editor-composite-primary'), byId('editor-composite-secondary')]) {
         control.addEventListener('change', () => {
@@ -1055,7 +952,7 @@ export function editorShowCompositeArrangementModal() {
     });
     repeatModeSelect.addEventListener('change', () => {
         guidedPreferences.repeatMode = normalizeGuidedRepeatMode(repeatModeSelect.value);
-        saveCompositeGuidedPreferences(guidedPreferences);
+        saveHybridGuidedPreferences(guidedPreferences);
         resetResult('The repeated-riff setting changed. Find the review sections again when you are ready.');
     });
     unitSelect.addEventListener('change', () => {
@@ -1063,7 +960,7 @@ export function editorShowCompositeArrangementModal() {
         currentGapFillUnit = unitSelect.value === 'seconds' ? 'seconds' : 'beats';
         gapFillPreferences.unit = currentGapFillUnit;
         applyGapFillUnitToDialog(currentGapFillUnit, gapFillPreferences[currentGapFillUnit]);
-        saveCompositeGapFillPreferences(gapFillPreferences);
+        saveHybridGapFillPreferences(gapFillPreferences);
         resetResult('The timing unit changed. Preview the automatic hybrid again when you are ready.');
     });
     for (const input of [byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {

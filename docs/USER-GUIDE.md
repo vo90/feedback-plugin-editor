@@ -261,47 +261,47 @@ empty** to chart from scratch — no source file needed — or **Import from a
 file** for Guitar Pro / MIDI / MusicXML). An empty track lands selected and
 ready: double-click the chart to add notes, and save to commit.
 
-### Composite guitar/bass arrangements
+### Hybrid guitar/bass tracks
 
-Use **Track ▸ Create Composite Arrangement…** to turn two synchronized guitar
-or bass parts into a new, ordinary playable track while keeping both sources
-unchanged. The source parts must have the same instrument family, string count,
-tuning, capo, and pitch-cent offset.
+Use **Track ▸ Create Hybrid Guitar Track…** to combine two synchronized guitar
+or bass parts into one playable track. For example, you can keep a lead part and
+add rhythm notes during its silent sections. Both original tracks stay exactly
+as they were.
 
-Choose one of two hybrid modes:
+#### Quick start
 
-- **Quick Hybrid** keeps the primary part and adds the secondary only during
-  protected primary rests. It is the fast way to fill long lead/rhythm gaps.
-- **Guided Hybrid** divides the song into adaptive musical blocks. Named song
-  sections are hard landmarks, blocks are at most four bars, and you can split
-  any block down to one bar before choosing either source or a custom result.
-  Its **Repeated material** setting can either review every occurrence
-  independently (the safe default) or group repetitions with the same
-  choice-dependent Lead and Rhythm material into one review decision. A grouped
-  choice is applied to every occurrence; use the occurrence chips to inspect or
-  audition their different song contexts.
+1. Choose the **Base track**. This is the part that is always kept.
+2. Choose the **Fill track**. This supplies extra or alternative notes.
+3. Name the new Hybrid Track.
+4. Choose **Automatic** or **Review sections yourself**.
+5. Preview the result, then select **Create Hybrid Track**. Save the song when
+   you want to keep it. Creating the track is undoable.
 
-Exact duplicates — same string, fret, onset, duration, and techniques — are
-included once. Guided Hybrid also accepts empty and single-source regions
-automatically, so only genuinely different material enters review. Complete
-chords, trails, slides, and linked gestures stay together. If choices in two
-neighboring blocks create an unplayable handoff, the resolver marks the
-transition instead of clipping it. **Finish Merge** stays unavailable until
-every decision is valid. Creating the result is undoable; save the song to
-commit the new arrangement to the feedpak.
+#### Which method should I choose?
 
-Repetition grouping compares the material the reviewer chooses between in both
-source alternatives, including relative timing, complete trails, techniques,
-chords, and connected gestures; a shared section name alone is never enough.
-Notes already shared by both arrangements are automatic, so they may differ
-between occurrences without creating a redundant review decision. Each
-occurrence keeps those shared notes. Custom selections and bar splits are
-mapped to the matching relative choice notes and bars. Every occurrence still
-receives its own transition check. If one copy is unsafe in its surrounding
-context, the safe copies keep the shared choice while the exception returns to
-individual review. You can also detach any occurrence manually with **Review
-this occurrence separately**. The repetition setting is remembered for the
-next Guided Hybrid analysis.
+- **Automatic** is the fast choice. It keeps the entire base track and adds
+  fill-track notes only where the whole chord, trail, slide, or connected
+  technique fits safely between base-track parts.
+- **Review sections yourself** gives you control. Where the two tracks play
+  different material, choose **Play [track] here** or **Mix notes manually**.
+  Empty, identical, and one-track-only sections are handled automatically.
+
+Choose **Review matching riffs once (recommended)** if repeated riffs should
+share one decision. Each copy still receives its own playability check. If one
+copy has different surrounding notes and cannot safely use the shared choice,
+only that copy returns for separate review. Choose **Review every occurrence
+separately** when you deliberately want different choices each time.
+
+The tracks must use the same instrument family, string count, tuning, capo, and
+pitch-cent offset. Notes that match in both tracks are included once. The builder
+never silently cuts a trail or connected gesture, and **Create Hybrid Track**
+remains unavailable until every reviewed section is playable.
+
+Advanced controls let you measure Automatic gaps in beats or seconds, adjust
+the safety space around base-track parts, split a review section at a bar, or
+choose notes directly from the aligned tablature. The technical note list and
+import-timing cleanup details are available when needed but do not change either
+original track.
 
 The **Tracks column** down the left side lists every track — the master mix,
 any studio stems, and each transcription part — beside a matching timeline lane.

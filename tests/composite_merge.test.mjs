@@ -2,19 +2,23 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-    analyzeCompositeMerge,
     clearCompositeConflictResolution,
-    COMPOSITE_GAP_FILL_DEFAULTS,
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS,
-    compositeGapFillDefaultsForUnit,
     compositeCompatibility,
     compositeTimingToleranceSeconds,
     materializeCompositeArrangement,
-    normalizeCompositeGapFillOptions,
+    prepareCompositeSources,
     resolveCompositeConflict,
     validateCompositeSelection,
 } from '../src/composite/merge-engine.js';
+import {
+    analyzeGapFillComposite,
+    COMPOSITE_GAP_FILL_DEFAULTS,
+    compositeGapFillDefaultsForUnit,
+    normalizeCompositeGapFillOptions,
+} from '../src/composite/gap-fill-engine.js';
+import { analyzeGuidedComposite } from '../src/composite/guided-engine.js';
 
 const beats = Array.from({ length: 17 }, (_, i) => ({ time: i * 0.5, measure: i % 4 === 0 ? i / 4 + 1 : -1 }));
 const note = (beat, string, fret, sustainBeats = 0, techniques = {}) => ({
@@ -44,6 +48,29 @@ const arr = (name, notes, extra = {}) => ({
     ...extra,
 });
 
+function sharedPlan(primary, secondary, timeline = beats) {
+    const prepared = prepareCompositeSources({ primary, secondary, beats: timeline });
+    return {
+        ok: prepared.ok,
+        strategy: 'test-shared-core',
+        compatibility: prepared.compatibility,
+        primary,
+        secondary,
+        beats: timeline,
+        sourceEntries: { primary: prepared.primaryEntries, secondary: prepared.secondaryEntries },
+        fixedEntries: [...prepared.primaryEntries, ...prepared.uniqueSecondaryEntries],
+        conflicts: [],
+        duplicates: prepared.duplicates,
+        timingAdjustments: prepared.timingAdjustments,
+        skippedEntries: [],
+        stats: {
+            duplicatesRemoved: prepared.duplicates.length,
+            timingAdjustments: prepared.timingAdjustments.length,
+            unresolvedConflicts: 0,
+        },
+    };
+}
+
 test('compatibility blocks mismatched tuning, capo, kind, and string count', () => {
     assert.equal(compositeCompatibility(arr('Lead', []), arr('Rhythm', [])).ok, true);
     assert.match(compositeCompatibility(arr('Lead', []), arr('Rhythm', [], { capo: 2 })).errors[0], /Capos/);
@@ -57,10 +84,10 @@ test('strict duplicates collapse only when timing, sustain, position, and techni
         note(2, 1, 5, 1, { palm_mute: true }),
         note(2, 1, 5, 0.5, { palm_mute: true }),
     ]);
-    const plan = analyzeCompositeMerge({ primary, secondary, beats, strategy: 'full-union' });
-    assert.equal(plan.stats.duplicatesRemoved, 1);
-    assert.equal(plan.conflicts.length, 1);
-    assert.deepEqual(plan.conflicts[0].reasons, ['note-variant']);
+    const prepared = prepareCompositeSources({ primary, secondary, beats });
+    assert.equal(prepared.duplicates.length, 1);
+    assert.equal(prepared.uniqueSecondaryEntries.length, 1);
+    assert.notEqual(prepared.primaryEntries[0].endBeat, prepared.uniqueSecondaryEntries[0].endBeat);
 });
 
 test('tempo-aware timing tolerance is one percent of a local beat with one-to-five millisecond limits', () => {
@@ -73,42 +100,38 @@ test('tempo-aware timing tolerance is one percent of a local beat with one-to-fi
 });
 
 test('identical notes within timing tolerance deduplicate but notes beyond it do not', () => {
-    const within = analyzeCompositeMerge({
+    const within = prepareCompositeSources({
         primary: arr('Lead', [timeNote(1, 1, 5, 0.25, { palm_mute: true })]),
         secondary: arr('Rhythm', [timeNote(1.003, 1, 5, 0.25, { palm_mute: true })]),
         beats,
-        strategy: 'full-union',
     });
-    assert.equal(within.stats.duplicatesRemoved, 1);
-    assert.equal(within.conflicts.length, 0);
-    assert.deepEqual(within.fixedEntries[0].sources, ['primary', 'secondary']);
+    assert.equal(within.duplicates.length, 1);
+    assert.deepEqual(within.primaryEntries[0].sources, ['primary', 'secondary']);
 
-    const outside = analyzeCompositeMerge({
+    const outside = prepareCompositeSources({
         primary: arr('Lead', [timeNote(1, 1, 5, 0.25, { palm_mute: true })]),
         secondary: arr('Rhythm', [timeNote(1.006, 1, 5, 0.25, { palm_mute: true })]),
         beats,
-        strategy: 'full-union',
     });
-    assert.equal(outside.stats.duplicatesRemoved, 0);
-    assert.equal(outside.conflicts.length, 1);
+    assert.equal(outside.duplicates.length, 0);
+    assert.equal(outside.uniqueSecondaryEntries.length, 1);
 });
 
 test('timing tolerance never hides semantic technique differences', () => {
-    const plan = analyzeCompositeMerge({
+    const prepared = prepareCompositeSources({
         primary: arr('Lead', [timeNote(1, 1, 5, 0.25, { palm_mute: true })]),
         secondary: arr('Rhythm', [timeNote(1.003, 1, 5, 0.25, { palm_mute: false })]),
         beats,
-        strategy: 'full-union',
     });
-    assert.equal(plan.stats.duplicatesRemoved, 0);
-    assert.deepEqual(plan.conflicts[0].reasons, ['note-variant']);
+    assert.equal(prepared.duplicates.length, 0);
+    assert.equal(prepared.uniqueSecondaryEntries.length, 1);
 });
 
 test('a tiny cross-source boundary overlap is clamped only in the materialized composite', () => {
     const primary = arr('Lead', [timeNote(1.001, 0, 2, 0.2)]);
     const secondary = arr('Rhythm', [timeNote(0.8, 0, 0, 0.202)]);
     const before = structuredClone({ primary, secondary });
-    const plan = analyzeCompositeMerge({ primary, secondary, beats, strategy: 'full-union' });
+    const plan = sharedPlan(primary, secondary);
     assert.equal(plan.conflicts.length, 0);
     const result = materializeCompositeArrangement(plan, 'Hybrid');
     assert.deepEqual(result.notes.map(entry => [entry.fret, entry.time, entry.sustain]), [
@@ -125,7 +148,7 @@ test('Majesty-style one millisecond source overlap normalizes before fuzzy dedup
         timeNote(20.414, 1, 2, 0.125),
     ]);
     const before = structuredClone({ primary, secondary });
-    const plan = analyzeCompositeMerge({ primary, secondary, beats, strategy: 'full-union' });
+    const plan = sharedPlan(primary, secondary);
     assert.equal(plan.stats.duplicatesRemoved, 1);
     assert.equal(plan.stats.timingAdjustments, 1);
     assert.equal(plan.conflicts.length, 0);
@@ -137,55 +160,39 @@ test('Majesty-style one millisecond source overlap normalizes before fuzzy dedup
     assert.deepEqual({ primary, secondary }, before);
 });
 
-test('deduplicated notes keep both-source provenance through conflict choices', () => {
+test('deduplicated notes keep both-source provenance in shared material', () => {
     const primary = arr('Lead', [timeNote(20.414, 1, 2, 0.125)]);
     const secondary = arr('Rhythm', [
         timeNote(20.099, 1, 0, 0.335),
         timeNote(20.414, 1, 2, 0.125),
     ]);
     const before = structuredClone({ primary, secondary });
-    const plan = analyzeCompositeMerge({ primary, secondary, beats, strategy: 'full-union' });
-    const conflict = plan.conflicts[0];
+    const plan = sharedPlan(primary, secondary);
     assert.equal(plan.stats.duplicatesRemoved, 1);
-    assert.deepEqual(conflict.primaryEntries[0].sources, ['primary', 'secondary']);
-    assert.equal(resolveCompositeConflict(plan, conflict.id, 'secondary').ok, true);
-    assert.deepEqual(materializeCompositeArrangement(plan, 'Rhythm Choice').notes.map(entry => entry.fret), [0, 2]);
-    assert.equal(clearCompositeConflictResolution(plan, conflict.id).ok, true);
-    const bothIds = [...conflict.primaryEntries, ...conflict.secondaryEntries].map(entry => entry.id);
-    assert.equal(resolveCompositeConflict(plan, conflict.id, 'custom', bothIds).ok, true);
-    assert.deepEqual(materializeCompositeArrangement(plan, 'Custom Choice').notes.map(entry => entry.fret), [0, 2]);
-    assert.equal(clearCompositeConflictResolution(plan, conflict.id).ok, true);
-    assert.equal(resolveCompositeConflict(plan, conflict.id, 'primary').ok, true);
-    assert.deepEqual(materializeCompositeArrangement(plan, 'Lead Choice').notes.map(entry => entry.fret), [2]);
+    assert.deepEqual(plan.fixedEntries.find(entry => entry.fret === 2).sources, ['primary', 'secondary']);
+    assert.deepEqual(materializeCompositeArrangement(plan, 'Hybrid').notes.map(entry => entry.fret), [0, 2]);
     assert.deepEqual({ primary, secondary }, before);
 });
 
 test('unknown imported technique fields prevent unsafe duplicate removal', () => {
-    const plan = analyzeCompositeMerge({
+    const prepared = prepareCompositeSources({
         primary: arr('Lead', [note(2, 1, 5, 1, { importer_expression: 'soft' })]),
         secondary: arr('Rhythm', [note(2, 1, 5, 1, { importer_expression: 'hard' })]),
         beats,
-        strategy: 'full-union',
     });
-    assert.equal(plan.stats.duplicatesRemoved, 0);
-    assert.equal(plan.conflicts.length, 1);
-    assert.deepEqual(plan.conflicts[0].reasons, ['note-variant']);
+    assert.equal(prepared.duplicates.length, 0);
+    assert.equal(prepared.uniqueSecondaryEntries.length, 1);
 });
 
 test('the same pitch on another string is not treated as a duplicate', () => {
-    const plan = analyzeCompositeMerge({
-        primary: arr('Lead', [note(1, 0, 5)]),
-        secondary: arr('Rhythm', [note(1, 1, 0)]),
-        beats,
-        strategy: 'full-union',
-    });
+    const plan = sharedPlan(arr('Lead', [note(1, 0, 5)]), arr('Rhythm', [note(1, 1, 0)]));
     assert.equal(plan.stats.duplicatesRemoved, 0);
     assert.equal(plan.conflicts.length, 0);
     assert.equal(plan.fixedEntries.length, 2);
 });
 
 test('gap fill adds secondary notes in rests and skips notes during primary activity', () => {
-    const plan = analyzeCompositeMerge({
+    const plan = analyzeGapFillComposite({
         primary: arr('Lead', [note(0, 0, 3, 2)]),
         secondary: arr('Rhythm', [note(1, 2, 7), note(3, 2, 8)]),
         beats,
@@ -197,7 +204,7 @@ test('gap fill adds secondary notes in rests and skips notes during primary acti
 });
 
 test('gap fill treats coincident zero-sustain attacks as primary activity', () => {
-    const plan = analyzeCompositeMerge({
+    const plan = analyzeGapFillComposite({
         primary: arr('Lead', [note(2, 0, 3)]),
         secondary: arr('Rhythm', [note(2, 2, 7)]),
         beats,
@@ -224,7 +231,7 @@ test('gap fill defaults are normalized and bounded', () => {
 });
 
 test('gap fill blocks every technique-labelled trail and any secondary trail that reaches the next lead passage', () => {
-    const plan = analyzeCompositeMerge({
+    const plan = analyzeGapFillComposite({
         primary: arr('Lead', [
             note(0, 0, 0, 4, { tremolo: true, importer_future_trail: true }),
             note(8, 1, 5),
@@ -253,7 +260,7 @@ test('gap fill rejects a whole coincident chord when any child trail crosses lea
             ],
         }],
     });
-    const plan = analyzeCompositeMerge({
+    const plan = analyzeGapFillComposite({
         primary: arr('Lead', [note(4, 0, 7)]),
         secondary: rhythm,
         beats,
@@ -265,7 +272,7 @@ test('gap fill rejects a whole coincident chord when any child trail crosses lea
 
 test('gap fill treats linked and connected-slide gestures as occupied until their destination', () => {
     for (const techniques of [{ link_next: true }, { slide_to: 7 }]) {
-        const plan = analyzeCompositeMerge({
+        const plan = analyzeGapFillComposite({
             primary: arr('Lead', [note(0, 0, 3, 0, techniques), note(4, 0, 7)]),
             secondary: arr('Rhythm', [note(2, 3, 9)]),
             beats,
@@ -278,7 +285,7 @@ test('gap fill treats linked and connected-slide gestures as occupied until thei
 });
 
 test('a cleared slide sentinel does not invent a connected trail', () => {
-    const plan = analyzeCompositeMerge({
+    const plan = analyzeGapFillComposite({
         primary: arr('Lead', [note(0, 0, 3, 0, { slide_to: null }), note(4, 0, 0)]),
         secondary: arr('Rhythm', [note(2, 3, 9)]),
         beats,
@@ -289,7 +296,7 @@ test('a cleared slide sentinel does not invent a connected trail', () => {
 });
 
 test('gap fill keeps a connected secondary gesture atomic when its destination trail crosses lead activity', () => {
-    const plan = analyzeCompositeMerge({
+    const plan = analyzeGapFillComposite({
         primary: arr('Lead', [note(4, 0, 9)]),
         secondary: arr('Rhythm', [
             note(2, 1, 3, 0, { link_next: true }),
@@ -309,10 +316,10 @@ test('gap fill requires the configured usable window after transition margins', 
         beats,
         strategy: 'gap-fill',
     };
-    const guarded = analyzeCompositeMerge({ ...input,
+    const guarded = analyzeGapFillComposite({ ...input,
         gapFill: { unit: 'beats', minimumGap: 1, transitionMargin: 0.25 } });
     assert.equal(guarded.stats.secondaryAddedCleanly, 0);
-    const tighter = analyzeCompositeMerge({ ...input,
+    const tighter = analyzeGapFillComposite({ ...input,
         gapFill: { unit: 'beats', minimumGap: 0.5, transitionMargin: 0.25 } });
     assert.equal(tighter.stats.secondaryAddedCleanly, 1);
 });
@@ -343,14 +350,14 @@ test('seconds gap fill measures real time across tempo changes', () => {
         beats: tempoBeats,
         strategy: 'gap-fill',
     };
-    const beatPlan = analyzeCompositeMerge({
+    const beatPlan = analyzeGapFillComposite({
         ...input,
         gapFill: { unit: 'beats', minimumGap: 1, transitionMargin: 0.25 },
     });
     assert.deepEqual(beatPlan.fixedEntries.filter(entry => entry.source === 'secondary')
         .map(entry => entry.fret), [9, 11]);
 
-    const secondsPlan = analyzeCompositeMerge({
+    const secondsPlan = analyzeGapFillComposite({
         ...input,
         gapFill: { unit: 'seconds', minimumGap: 0.5, transitionMargin: 0.05 },
     });
@@ -359,31 +366,19 @@ test('seconds gap fill measures real time across tempo changes', () => {
     assert.equal(secondsPlan.gapFill.unit, 'seconds');
 });
 
-test('full union groups overlapping same-string notes into unresolved hunks', () => {
-    const plan = analyzeCompositeMerge({
-        primary: arr('Lead', [note(2, 0, 3, 2), note(6, 1, 5)]),
-        secondary: arr('Rhythm', [note(3, 0, 7, 1), note(6, 1, 8)]),
-        beats,
-        strategy: 'full-union',
-    });
-    assert.equal(plan.conflicts.length, 2);
-    assert.equal(plan.stats.unresolvedConflicts, 2);
-    assert.throws(() => materializeCompositeArrangement(plan, 'Hybrid'), /unresolved/);
-});
-
-test('primary, secondary, and compatible conflict choices resolve deterministically', () => {
-    const plan = analyzeCompositeMerge({
+test('Guided source choices resolve deterministically and removed compatible-union is rejected', () => {
+    const plan = analyzeGuidedComposite({
         primary: arr('Lead', [note(2, 0, 3), note(2, 2, 7)]),
         secondary: arr('Rhythm', [note(2, 0, 5), note(2, 3, 9)]),
         beats,
-        strategy: 'full-union',
     });
     assert.equal(plan.conflicts.length, 1);
-    assert.equal(resolveCompositeConflict(plan, plan.conflicts[0].id, 'compatible').ok, true);
+    assert.equal(resolveCompositeConflict(plan, plan.conflicts[0].id, 'compatible').ok, false);
+    assert.equal(resolveCompositeConflict(plan, plan.conflicts[0].id, 'primary').ok, true);
     const result = materializeCompositeArrangement(plan, 'Hybrid Guitar');
     assert.equal(result.name, 'Hybrid Guitar');
     assert.equal(result.type, 'guitar');
-    assert.deepEqual(result.notes.map(n => [n.string, n.fret]), [[0, 3], [2, 7], [3, 9]]);
+    assert.deepEqual(result.notes.map(n => [n.string, n.fret]), [[0, 3], [2, 7]]);
     assert.equal(result.chords.length, 0);
     assert.equal(clearCompositeConflictResolution(plan, plan.conflicts[0].id).ok, true);
     assert.equal(plan.conflicts[0].resolution, null);
@@ -391,11 +386,10 @@ test('primary, secondary, and compatible conflict choices resolve deterministica
 });
 
 test('custom resolution refuses cross-source same-string collisions', () => {
-    const plan = analyzeCompositeMerge({
+    const plan = analyzeGuidedComposite({
         primary: arr('Lead', [note(2, 0, 3, 2)]),
         secondary: arr('Rhythm', [note(3, 0, 7, 1)]),
         beats,
-        strategy: 'full-union',
     });
     const conflict = plan.conflicts[0];
     const both = [...conflict.primaryEntries, ...conflict.secondaryEntries];
@@ -409,12 +403,7 @@ test('custom resolution refuses cross-source same-string collisions', () => {
 });
 
 test('materialization performs a final whole-arrangement playability check', () => {
-    const plan = analyzeCompositeMerge({
-        primary: arr('Lead', [note(2, 0, 3, 1)]),
-        secondary: arr('Rhythm', []),
-        beats,
-        strategy: 'full-union',
-    });
+    const plan = sharedPlan(arr('Lead', [note(2, 0, 3, 1)]), arr('Rhythm', []));
     plan.fixedEntries.push({
         ...structuredClone(plan.fixedEntries[0]),
         id: 'secondary:injected-overlap',
@@ -430,7 +419,7 @@ test('materialization preserves beat timing and leaves both sources untouched', 
     const primary = arr('Lead', [note(1.5, 0, 3, 0.5, { vibrato: true })], { tones: { base: 'clean' } });
     const secondary = arr('Rhythm', [note(4, 2, 7)]);
     const before = structuredClone({ primary, secondary });
-    const plan = analyzeCompositeMerge({ primary, secondary, beats, strategy: 'full-union' });
+    const plan = sharedPlan(primary, secondary);
     const result = materializeCompositeArrangement(plan, 'Hybrid');
     assert.equal(result.notes.length, 2);
     assert.equal(result.notes[0].time, 0.75);
