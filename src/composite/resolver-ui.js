@@ -11,6 +11,7 @@ import { host } from '../host.js';
 import { _editorEscHtml, _installModalKeyboard, setStatus } from '../ui.js';
 import {
     analyzeCompositeMerge,
+    COMPOSITE_GAP_FILL_DEFAULTS,
     materializeCompositeArrangement,
     resolveCompositeConflict,
 } from './merge-engine.js';
@@ -213,6 +214,10 @@ function analyzeFromDialog() {
     const primaryIndex = Number(byId('editor-composite-primary')?.value);
     const secondaryIndex = Number(byId('editor-composite-secondary')?.value);
     const strategy = byId('editor-composite-strategy')?.value || 'gap-fill';
+    const gapFill = {
+        minimumGapBeats: Number(byId('editor-composite-min-gap')?.value),
+        transitionMarginBeats: Number(byId('editor-composite-margin')?.value),
+    };
     const error = byId('editor-composite-error');
     if (primaryIndex === secondaryIndex) {
         if (error) error.textContent = 'Choose two different source tracks.';
@@ -224,6 +229,7 @@ function analyzeFromDialog() {
         secondary: S.arrangements[secondaryIndex],
         beats: S.beats,
         strategy,
+        gapFill,
     });
     if (!plan.ok) {
         if (error) error.textContent = plan.compatibility.errors.join(' ');
@@ -360,9 +366,13 @@ export function editorShowCompositeArrangementModal() {
         + `<label class="block text-xs text-gray-300">Primary track<select id="editor-composite-primary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
         + `<label class="block text-xs text-gray-300">Secondary track<select id="editor-composite-secondary" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs">${sources.map(optionMarkup).join('')}</select></label>`
         + `<label class="block text-xs text-gray-300">Merge strategy<select id="editor-composite-strategy" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"><option value="gap-fill">Gap Fill — secondary during rests</option><option value="full-union">Full Union — all compatible notes</option></select></label>`
+        + `<fieldset id="editor-composite-gap-controls" class="rounded border border-gray-700 p-2 space-y-2"><legend class="px-1 text-[11px] text-gray-400">Gap Fill safety</legend>`
+        + `<label class="block text-xs text-gray-300">Minimum usable gap (beats)<input id="editor-composite-min-gap" type="number" min="0" max="16" step="0.25" value="${COMPOSITE_GAP_FILL_DEFAULTS.minimumGapBeats}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
+        + `<label class="block text-xs text-gray-300">Transition margin each side (beats)<input id="editor-composite-margin" type="number" min="0" max="8" step="0.125" value="${COMPOSITE_GAP_FILL_DEFAULTS.transitionMarginBeats}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
+        + `<p class="text-[10px] text-gray-500">Every complete note, chord, trail, and connected gesture must fit inside the protected gap.</p></fieldset>`
         + `<label class="block text-xs text-gray-300">New track name<input id="editor-composite-name" maxlength="60" value="${_editorEscHtml(name)}" class="mt-1 w-full bg-dark-700 border border-gray-600 rounded px-2 py-1.5 text-xs"></label>`
         + `<button type="button" id="editor-composite-analyze" class="w-full px-3 py-2 rounded bg-accent hover:bg-accent-light text-xs font-medium">Analyze merge</button>`
-        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Gap Fill</b> prioritizes playable coverage. <b class="text-gray-300">Full Union</b> keeps all compatible material and exposes physical collisions.</div>`
+        + `<div class="rounded bg-dark-900/70 p-2 text-[11px] text-gray-400"><b class="text-gray-300">Gap Fill</b> adds only complete events whose full trails fit between protected lead passages. <b class="text-gray-300">Full Union</b> keeps all compatible material and exposes physical collisions.</div>`
         + `</aside><main class="p-4 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-xs text-gray-400">Choose two source tracks and analyze the merge.</p></div></main></div>`
         + `<footer class="border-t border-gray-700 px-5 py-3 flex items-center gap-3"><div id="editor-composite-error" class="text-xs text-red-300 flex-1"></div>`
         + `<button type="button" id="editor-composite-cancel" class="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 rounded text-xs">Cancel</button>`
@@ -374,9 +384,21 @@ export function editorShowCompositeArrangementModal() {
     byId('editor-composite-cancel').addEventListener('click', editorHideCompositeArrangementModal);
     byId('editor-composite-analyze').addEventListener('click', analyzeFromDialog);
     byId('editor-composite-finish').addEventListener('click', finishMerge);
-    for (const select of [byId('editor-composite-primary'), byId('editor-composite-secondary'), byId('editor-composite-strategy')]) {
-        select.addEventListener('change', () => resetResult('Sources or strategy changed. Analyze the merge again.'));
+    const strategySelect = byId('editor-composite-strategy');
+    const syncGapControls = () => {
+        const disabled = strategySelect?.value !== 'gap-fill';
+        for (const input of [byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
+            if (input) input.disabled = disabled;
+        }
+    };
+    for (const control of [byId('editor-composite-primary'), byId('editor-composite-secondary'),
+        strategySelect, byId('editor-composite-min-gap'), byId('editor-composite-margin')]) {
+        control.addEventListener('change', () => {
+            syncGapControls();
+            resetResult('Sources or merge settings changed. Analyze the merge again.');
+        });
     }
+    syncGapControls();
     _installModalKeyboard(modal, modal.firstElementChild, editorHideCompositeArrangementModal);
     byId('editor-composite-primary').focus();
     return true;

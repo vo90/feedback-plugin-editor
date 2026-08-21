@@ -3,8 +3,10 @@ import test from 'node:test';
 
 import {
     analyzeCompositeMerge,
+    COMPOSITE_GAP_FILL_DEFAULTS,
     compositeCompatibility,
     materializeCompositeArrangement,
+    normalizeCompositeGapFillOptions,
     resolveCompositeConflict,
     validateCompositeSelection,
 } from '../src/composite/merge-engine.js';
@@ -96,6 +98,108 @@ test('gap fill treats coincident zero-sustain attacks as primary activity', () =
     assert.equal(plan.stats.secondaryAddedCleanly, 0);
     assert.equal(plan.conflicts.length, 0);
     assert.equal(plan.fixedEntries.length, 1);
+});
+
+test('gap fill defaults are normalized and bounded', () => {
+    assert.deepEqual(normalizeCompositeGapFillOptions(), COMPOSITE_GAP_FILL_DEFAULTS);
+    assert.deepEqual(normalizeCompositeGapFillOptions({
+        minimumGapBeats: -2,
+        transitionMarginBeats: 99,
+    }), { minimumGapBeats: 0, transitionMarginBeats: 8 });
+});
+
+test('gap fill blocks every technique-labelled trail and any secondary trail that reaches the next lead passage', () => {
+    const plan = analyzeCompositeMerge({
+        primary: arr('Lead', [
+            note(0, 0, 0, 4, { tremolo: true, importer_future_trail: true }),
+            note(8, 1, 5),
+        ]),
+        secondary: arr('Rhythm', [
+            note(3, 2, 7),       // Inside the lead's open-string tremolo trail.
+            note(5, 2, 8, 2),    // Complete trail fits in the protected gap.
+            note(5.5, 3, 9, 2.5), // Trail reaches the next protected lead onset.
+        ]),
+        beats,
+        strategy: 'gap-fill',
+    });
+    assert.equal(plan.stats.secondaryAddedCleanly, 1);
+    assert.equal(plan.stats.secondarySkippedByStrategy, 2);
+    assert.deepEqual(plan.fixedEntries.filter(entry => entry.source === 'secondary')
+        .map(entry => entry.fret), [8]);
+});
+
+test('gap fill rejects a whole coincident chord when any child trail crosses lead activity', () => {
+    const rhythm = arr('Rhythm', [], {
+        chords: [{
+            time: 1,
+            notes: [
+                { string: 1, fret: 3, sustain: 0.25 },
+                { string: 2, fret: 5, sustain: 1.1 },
+            ],
+        }],
+    });
+    const plan = analyzeCompositeMerge({
+        primary: arr('Lead', [note(4, 0, 7)]),
+        secondary: rhythm,
+        beats,
+        strategy: 'gap-fill',
+    });
+    assert.equal(plan.stats.secondaryAddedCleanly, 0);
+    assert.equal(plan.stats.secondarySkippedByStrategy, 2);
+});
+
+test('gap fill treats linked and connected-slide gestures as occupied until their destination', () => {
+    for (const techniques of [{ link_next: true }, { slide_to: 7 }]) {
+        const plan = analyzeCompositeMerge({
+            primary: arr('Lead', [note(0, 0, 3, 0, techniques), note(4, 0, 7)]),
+            secondary: arr('Rhythm', [note(2, 3, 9)]),
+            beats,
+            strategy: 'gap-fill',
+            gapFill: { minimumGapBeats: 0, transitionMarginBeats: 0 },
+        });
+        assert.equal(plan.stats.secondaryAddedCleanly, 0);
+        assert.equal(plan.stats.secondarySkippedByStrategy, 1);
+    }
+});
+
+test('a cleared slide sentinel does not invent a connected trail', () => {
+    const plan = analyzeCompositeMerge({
+        primary: arr('Lead', [note(0, 0, 3, 0, { slide_to: null }), note(4, 0, 0)]),
+        secondary: arr('Rhythm', [note(2, 3, 9)]),
+        beats,
+        strategy: 'gap-fill',
+        gapFill: { minimumGapBeats: 0, transitionMarginBeats: 0 },
+    });
+    assert.equal(plan.stats.secondaryAddedCleanly, 1);
+});
+
+test('gap fill keeps a connected secondary gesture atomic when its destination trail crosses lead activity', () => {
+    const plan = analyzeCompositeMerge({
+        primary: arr('Lead', [note(4, 0, 9)]),
+        secondary: arr('Rhythm', [
+            note(2, 1, 3, 0, { link_next: true }),
+            note(3, 1, 5, 2),
+        ]),
+        beats,
+        strategy: 'gap-fill',
+    });
+    assert.equal(plan.stats.secondaryAddedCleanly, 0);
+    assert.equal(plan.stats.secondarySkippedByStrategy, 2);
+});
+
+test('gap fill requires the configured usable window after transition margins', () => {
+    const input = {
+        primary: arr('Lead', [note(0, 0, 3, 1), note(2.4, 1, 5)]),
+        secondary: arr('Rhythm', [note(1.5, 3, 9)]),
+        beats,
+        strategy: 'gap-fill',
+    };
+    const guarded = analyzeCompositeMerge({ ...input,
+        gapFill: { minimumGapBeats: 1, transitionMarginBeats: 0.25 } });
+    assert.equal(guarded.stats.secondaryAddedCleanly, 0);
+    const tighter = analyzeCompositeMerge({ ...input,
+        gapFill: { minimumGapBeats: 0.5, transitionMarginBeats: 0.25 } });
+    assert.equal(tighter.stats.secondaryAddedCleanly, 1);
 });
 
 test('full union groups overlapping same-string notes into unresolved hunks', () => {

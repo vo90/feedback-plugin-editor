@@ -12,6 +12,10 @@ import { arrKind } from '../instrument.js';
 import { _stringCountFor } from '../lanes.js';
 
 export const COMPOSITE_BEAT_EPS = 1e-4;
+export const COMPOSITE_GAP_FILL_DEFAULTS = Object.freeze({
+    minimumGapBeats: 1,
+    transitionMarginBeats: 0.25,
+});
 
 function clone(value) {
     if (value == null) return value;
@@ -51,10 +55,34 @@ function noteBeat(note, beats) {
 }
 
 function noteEndBeat(note, beats, startBeat) {
-    if (Number.isFinite(Number(note && note.beatEnd))) return Math.max(startBeat, Number(note.beatEnd));
+    const ends = [startBeat];
+    if (Number.isFinite(Number(note && note.beatEnd))) ends.push(Number(note.beatEnd));
     const startTime = finite(note && note.time);
-    const sustain = Math.max(0, finite(note && note.sustain));
-    return Math.max(startBeat, beatOf(beats, startTime + sustain));
+    const sustain = Math.max(0, finite(note && (note.sustain ?? note.sus)));
+    ends.push(beatOf(beats, startTime + sustain));
+    return Math.max(...ends);
+}
+
+function connectedToNext(entry, next) {
+    if (!entry || !next || entry.string !== next.string) return false;
+    const techniques = entry.note && entry.note.techniques || {};
+    if (techniques.link_next) return true;
+    const slideTarget = techniques.slide_to;
+    return Number.isFinite(slideTarget) && slideTarget >= 0 && next.fret === slideTarget;
+}
+
+function extendConnectedPlayableSpans(entries) {
+    const nextByString = new Map();
+    for (let i = entries.length - 1; i >= 0; i--) {
+        const entry = entries[i];
+        const next = nextByString.get(entry.string);
+        if (connectedToNext(entry, next)) {
+            entry.effectiveEndBeat = Math.max(entry.effectiveEndBeat, next.startBeat);
+            entry.connectedToId = next.id;
+        }
+        nextByString.set(entry.string, entry);
+    }
+    return entries;
 }
 
 function flattenArrangement(arrangement, source, beats) {
@@ -65,13 +93,17 @@ function flattenArrangement(arrangement, source, beats) {
             raw.push({
                 ...chordNote,
                 time: chordNote.time ?? chord.time,
-                sustain: chordNote.sustain || 0,
+                // Some importers author one duration on the chord, others put
+                // it on every child. Preserve either representation so the
+                // whole visible trail participates in merge occupancy.
+                sustain: chordNote.sustain ?? chordNote.sus
+                    ?? chord.sustain ?? chord.sus ?? 0,
                 techniques: clone(chordNote.techniques || {}),
                 _fn: clone(chord.fn || null),
             });
         }
     }
-    return raw.map((note, index) => {
+    const entries = raw.map((note, index) => {
         const startBeat = noteBeat(note, beats);
         const endBeat = noteEndBeat(note, beats, startBeat);
         return {
@@ -88,6 +120,7 @@ function flattenArrangement(arrangement, source, beats) {
         };
     }).filter(e => Number.isFinite(e.startBeat) && e.string >= 0 && e.fret >= 0)
         .sort(compareEntries);
+    return extendConnectedPlayableSpans(entries);
 }
 
 function compareEntries(a, b) {
@@ -181,8 +214,9 @@ function duplicateOf(entry, lookup) {
     return null;
 }
 
-function mergeIntervals(entries) {
-    const spans = entries.map(e => ({ start: e.startBeat, end: e.effectiveEndBeat }))
+function mergeIntervals(entries, padding = 0) {
+    const pad = Math.max(0, finite(padding));
+    const spans = entries.map(e => ({ start: e.startBeat - pad, end: e.effectiveEndBeat + pad }))
         .sort((a, b) => a.start - b.start || a.end - b.end);
     const merged = [];
     for (const span of spans) {
@@ -193,22 +227,82 @@ function mergeIntervals(entries) {
     return merged;
 }
 
-function overlapsIntervals(entry, intervals) {
-    let lo = 0;
-    let hi = intervals.length;
-    while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (intervals[mid].end < entry.startBeat - COMPOSITE_BEAT_EPS) lo = mid + 1;
-        else hi = mid;
-    }
-    const span = intervals[lo];
-    if (!span) return false;
+export function normalizeCompositeGapFillOptions(options = {}) {
+    const minimumGapBeats = Math.max(0, Math.min(16,
+        finite(options.minimumGapBeats, COMPOSITE_GAP_FILL_DEFAULTS.minimumGapBeats)));
+    const transitionMarginBeats = Math.max(0, Math.min(8,
+        finite(options.transitionMarginBeats, COMPOSITE_GAP_FILL_DEFAULTS.transitionMarginBeats)));
+    return { minimumGapBeats, transitionMarginBeats };
+}
 
-    // Zero-sustain notes still occupy their onset. Treat coincident attacks as
-    // activity so gap-fill does not layer a second part on the same beat.
-    if (Math.abs(span.start - entry.startBeat) <= COMPOSITE_BEAT_EPS) return true;
-    return span.start < entry.effectiveEndBeat - COMPOSITE_BEAT_EPS
-        && entry.startBeat < span.end - COMPOSITE_BEAT_EPS;
+function groupPlayableEntries(entries) {
+    const parent = entries.map((_, index) => index);
+    const find = index => {
+        while (parent[index] !== index) {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        return index;
+    };
+    const join = (left, right) => {
+        const a = find(left);
+        const b = find(right);
+        if (a !== b) parent[b] = a;
+    };
+    const indexById = new Map(entries.map((entry, index) => [entry.id, index]));
+    for (let i = 1; i < entries.length; i++) {
+        if (near(entries[i - 1].startBeat, entries[i].startBeat)) join(i - 1, i);
+    }
+    for (let i = 0; i < entries.length; i++) {
+        const target = indexById.get(entries[i].connectedToId);
+        if (target !== undefined) join(i, target);
+    }
+    const groups = new Map();
+    for (let i = 0; i < entries.length; i++) {
+        const root = find(i);
+        const group = groups.get(root) || {
+            startBeat: entries[i].startBeat,
+            endBeat: entries[i].effectiveEndBeat,
+            entries: [],
+        };
+        group.startBeat = Math.min(group.startBeat, entries[i].startBeat);
+        group.endBeat = Math.max(group.endBeat, entries[i].effectiveEndBeat);
+        group.entries.push(entries[i]);
+        groups.set(root, group);
+    }
+    return [...groups.values()].sort((a, b) => a.startBeat - b.startBeat);
+}
+
+function eligibleGapFillWindows(primaryEntries, secondaryEntries, beats, options) {
+    const { minimumGapBeats, transitionMarginBeats } = options;
+    const allEntries = [...primaryEntries, ...secondaryEntries];
+    const contentStart = Math.min(0, ...allEntries.map(entry => entry.startBeat));
+    const contentEnd = Math.max(
+        Array.isArray(beats) && beats.length ? beats.length - 1 : 0,
+        ...allEntries.map(entry => entry.effectiveEndBeat),
+    );
+    const occupied = mergeIntervals(primaryEntries, transitionMarginBeats);
+    const windows = [];
+    let cursor = contentStart;
+    for (const span of occupied) {
+        if (span.end < contentStart + COMPOSITE_BEAT_EPS) continue;
+        if (span.start > contentEnd - COMPOSITE_BEAT_EPS) break;
+        const start = Math.max(contentStart, span.start);
+        const end = Math.min(contentEnd, span.end);
+        if (start - cursor + COMPOSITE_BEAT_EPS >= minimumGapBeats) {
+            windows.push({ start: cursor, end: start });
+        }
+        cursor = Math.max(cursor, end);
+    }
+    if (contentEnd - cursor + COMPOSITE_BEAT_EPS >= minimumGapBeats) {
+        windows.push({ start: cursor, end: contentEnd });
+    }
+    return windows;
+}
+
+function groupFitsWindow(group, windows) {
+    return windows.some(window => group.startBeat >= window.start - COMPOSITE_BEAT_EPS
+        && group.endBeat <= window.end + COMPOSITE_BEAT_EPS);
 }
 
 function collisionPairs(primaryEntries, secondaryEntries) {
@@ -264,7 +358,9 @@ function groupConflictPairs(pairs) {
     return groups;
 }
 
-export function analyzeCompositeMerge({ primary, secondary, beats = [], strategy = 'gap-fill' } = {}) {
+export function analyzeCompositeMerge({
+    primary, secondary, beats = [], strategy = 'gap-fill', gapFill = {},
+} = {}) {
     const compatibility = compositeCompatibility(primary || {}, secondary || {});
     if (!compatibility.ok) {
         return { ok: false, compatibility, strategy, fixedEntries: [], conflicts: [], stats: {} };
@@ -291,12 +387,17 @@ export function analyzeCompositeMerge({ primary, secondary, beats = [], strategy
 
     const skippedEntries = [];
     let candidates = secondaryEntries;
+    const gapFillOptions = normalizeCompositeGapFillOptions(gapFill);
     if (strategy === 'gap-fill') {
-        const activity = mergeIntervals(primaryEntries);
+        const windows = eligibleGapFillWindows(primaryEntries, secondaryEntries, beats, gapFillOptions);
         candidates = [];
-        for (const entry of secondaryEntries) {
-            if (overlapsIntervals(entry, activity)) skippedEntries.push(entry);
-            else candidates.push(entry);
+        // Coincident entries are one playable event (usually a chord). Never
+        // keep only the short child of a chord while dropping a sibling whose
+        // trail crosses into primary activity: the complete event fits or the
+        // complete event is skipped.
+        for (const group of groupPlayableEntries(secondaryEntries)) {
+            if (groupFitsWindow(group, windows)) candidates.push(...group.entries);
+            else skippedEntries.push(...group.entries);
         }
     }
 
@@ -311,6 +412,7 @@ export function analyzeCompositeMerge({ primary, secondary, beats = [], strategy
     return {
         ok: true,
         strategy,
+        gapFill: gapFillOptions,
         compatibility,
         primary,
         secondary,
