@@ -9,6 +9,7 @@ import {
     _compositeGuidedPreferencesPure,
     _compositeUniqueNamePure,
     CreateCompositeArrangementCmd,
+    HYBRID_DIALOG_STYLE,
 } from '../src/composite/resolver-ui.js';
 import { host } from '../src/host.js';
 import { S } from '../src/state.js';
@@ -27,6 +28,14 @@ test('composite names are unique without changing their instrument-readable pref
     assert.equal(_compositeUniqueNamePure(['Lead', 'Rhythm']), 'Hybrid Guitar');
     assert.equal(_compositeUniqueNamePure(['Hybrid Guitar']), 'Hybrid Guitar 2');
     assert.equal(_compositeUniqueNamePure(['hybrid guitar', 'HYBRID GUITAR 2']), 'Hybrid Guitar 3');
+});
+
+test('Hybrid review workspace grows with the app and remains manually resizable', () => {
+    assert.match(HYBRID_DIALOG_STYLE, /width:calc\(100vw - 2rem\)/);
+    assert.match(HYBRID_DIALOG_STYLE, /height:calc\(100vh - 2rem\)/);
+    assert.match(HYBRID_DIALOG_STYLE, /resize:both/);
+    assert.match(HYBRID_DIALOG_STYLE, /max-width:calc\(100vw - 1rem\)/);
+    assert.doesNotMatch(HYBRID_DIALOG_STYLE, /90rem|54rem/);
 });
 
 test('composite Gap Fill preferences remember separate beat and second values', () => {

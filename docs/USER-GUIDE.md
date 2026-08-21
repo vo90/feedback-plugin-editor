@@ -277,6 +277,9 @@ as they were.
 5. Preview the result, then select **Create Hybrid Track**. Save the song when
    you want to keep it. Creating the track is undoable.
 
+The builder expands with the Song Editor window, including on large displays.
+You can also drag its lower-right corner to make the workspace smaller or larger.
+
 #### Which method should I choose?
 
 - **Automatic** is the fast choice. It keeps the entire base track and adds

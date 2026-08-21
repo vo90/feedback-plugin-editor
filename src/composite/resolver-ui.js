@@ -61,6 +61,17 @@ export {
     hybridGuidedPreferencesPure as _compositeGuidedPreferencesPure,
 };
 
+export const HYBRID_DIALOG_STYLE = [
+    'width:calc(100vw - 2rem)',
+    'height:calc(100vh - 2rem)',
+    'min-width:min(42rem, calc(100vw - 2rem))',
+    'min-height:min(32rem, calc(100vh - 2rem))',
+    'max-width:calc(100vw - 1rem)',
+    'max-height:calc(100vh - 1rem)',
+    'resize:both',
+    'overflow:hidden',
+].join(';');
+
 const hybridSession = createHybridBuilderSession();
 
 function inputNumber(id) {
@@ -890,9 +901,9 @@ export function editorShowCompositeArrangementModal() {
     const modal = document.createElement('div');
     modal.id = 'editor-composite-modal';
     modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4';
-    modal.innerHTML = `<div class="max-w-full flex flex-col rounded-xl border border-gray-600 bg-dark-800 shadow-2xl" style="width:min(90rem, calc(100vw - 2rem));height:min(54rem, calc(100vh - 2rem))" role="dialog" aria-modal="true" aria-labelledby="editor-composite-title">`
+    modal.innerHTML = `<div id="editor-composite-dialog" class="max-w-full flex flex-col rounded-xl border border-gray-600 bg-dark-800 shadow-2xl" style="${HYBRID_DIALOG_STYLE}" role="dialog" aria-modal="true" aria-labelledby="editor-composite-title" aria-describedby="editor-composite-description">`
         + `<header class="flex items-start justify-between gap-4 border-b border-gray-700 px-5 py-3"><div><h3 id="editor-composite-title" class="text-lg font-semibold">Create a Hybrid Guitar Track</h3>`
-        + `<p class="text-sm text-gray-400 mt-0.5">Combine two synchronized guitar or bass parts into one playable track. Your original tracks stay unchanged.</p></div>`
+        + `<p id="editor-composite-description" class="text-sm text-gray-400 mt-0.5">Combine two synchronized guitar or bass parts into one playable track. Your original tracks stay unchanged. The workspace follows the app window and can also be resized from its lower-right corner.</p></div>`
         + `<button type="button" id="editor-composite-close" class="text-gray-400 hover:text-white text-xl leading-none" aria-label="Close">×</button></header>`
         + `<div id="editor-composite-workspace" class="grid min-h-0 flex-1 overflow-hidden" style="grid-template-columns:minmax(0,1fr)">`
         + renderHybridSetupView({
