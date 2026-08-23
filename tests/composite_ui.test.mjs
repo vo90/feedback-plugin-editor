@@ -277,7 +277,9 @@ test('Hybrid analysis and creation use cancellable background tasks with stale g
     assert.match(analyzeBody, /signal:\s*request\.controller\.signal/);
     assert.match(analyzeBody, /hybridAnalysisIsCurrent/);
     assert.match(analyzeBody, /completeHybridAnalysis/);
-    assert.match(analyzeBody, /installHybridPlan\(hybridSession, plan\)/);
+    assert.match(analyzeBody,
+        /installHybridPlan\(hybridSession, plan, request\.sessionId\)/,
+        'the completed plan retains the song session that produced it');
     assert.doesNotMatch(analyzeBody,
         /analyzeGapFillComposite|analyzeGuidedComposite|analyzeExperimentalAutoComposite/,
         'the modal must not run a planner directly on the renderer thread');
@@ -285,6 +287,15 @@ test('Hybrid analysis and creation use cancellable background tasks with stale g
     const finishStart = resolver.indexOf('async function finishMerge');
     const finishEnd = resolver.indexOf('function setCompositeCreationUi', finishStart);
     const finishBody = resolver.slice(finishStart, finishEnd);
+    assert.ok(finishBody.indexOf('endCompositePreviewPlayback()')
+        < finishBody.indexOf('beginHybridCreation(hybridSession'),
+    'creation stops private preview transport before making the workspace inert');
+    assert.match(finishBody,
+        /beginHybridCreation\(hybridSession, \{[\s\S]*sessionId:\s*hybridSession\.planSessionId/,
+        'creation uses plan ownership, not whichever Editor session is current later');
+    assert.match(finishBody,
+        /creationRequestIsCurrent[\s\S]*editor\.format === 'sloppak'[\s\S]*editor\.sessionId === hybridSession\.planSessionId/,
+        'every delayed creation checkpoint validates both project format and plan owner');
     assert.ok(finishBody.indexOf('setCompositeCreationUi(true)')
         < finishBody.indexOf('await waitForCompositeUiPaint()'),
     'Creating state is installed before yielding a paint');
@@ -292,11 +303,17 @@ test('Hybrid analysis and creation use cancellable background tasks with stale g
         < finishBody.indexOf('runHybridMaterializationTask'),
     'materialization starts only after the Creating state can paint');
     assert.match(finishBody, /signal:\s*request\.controller\.signal/);
+    assert.match(finishBody,
+        /if \(!creationRequestIsCurrent\(\)[\s\S]*commitCompositeArrangement\(arrangement\)/,
+        'song and plan ownership are checked again immediately before commit');
     assert.doesNotMatch(finishBody, /materializeCompositeArrangement/,
         'the Create button must not materialize synchronously in the renderer');
     assert.match(resolver,
-        /function closeCompositeModalImmediately[\s\S]*cancelHybridAnalysis\(hybridSession\)/,
-        'closing or tearing down the modal aborts any background analysis');
+        /function closeCompositeModalImmediately[\s\S]*clearTransientState\(\)/,
+        'closing or tearing down the modal enters the single transient-state cleanup path');
+    assert.match(resolver,
+        /function clearTransientState[\s\S]*resetHybridBuilderReview\(hybridSession\)/,
+        'the shared cleanup path resets and aborts background analysis/creation');
 });
 
 test('Hybrid playhead is visible and exact before, during, and after playback', () => {
@@ -315,6 +332,15 @@ test('Hybrid playhead is visible and exact before, during, and after playback', 
     assert.match(resolver,
         /follow:\s*\(activelyPlaying \|\| playbackSettled\)[\s\S]*hybridPreviewPreferences\.followPlayhead/,
         'natural completion also returns the followed camera and overview box to that position');
+    const playheadStart = resolver.indexOf('function updateCompositeTimelinePlayhead');
+    const playheadEnd = resolver.indexOf('function startCompositeTimelinePlayhead', playheadStart);
+    const playheadBody = resolver.slice(playheadStart, playheadEnd);
+    assert.match(playheadBody,
+        /playbackSettled[\s\S]*previewPlaying = false[\s\S]*previewLoading = false[\s\S]*previewMode = ''/,
+        'natural completion settles every transport flag instead of leaving a pressed mode');
+    assert.match(playheadBody,
+        /finished · press Space to replay[\s\S]*Hybrid preview:/,
+        'natural completion replaces the stale playing help and status text');
     const stopStart = resolver.indexOf('function endCompositePreviewPlayback');
     const stopEnd = resolver.indexOf('function disposeCompositePreviewSession', stopStart);
     assert.match(resolver.slice(stopStart, stopEnd), /refreshCompositeTimelinePlayheadNow\(\)/,
@@ -347,6 +373,9 @@ test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () 
         /editable:\s*compositeModalControlEditingTarget\(target\)[\s\S]*spaceEditable:\s*textEditing/,
         'range/select navigation stays native while only actual text editing suppresses Space');
     assert.match(resolver,
+        /transportAvailable:\s*compositePreviewTransportAvailable\(\)/,
+        'modal shortcuts are gated by the visible, non-inert review workspace');
+    assert.match(resolver,
         /COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES[\s\S]*'range'[\s\S]*return !COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES\.has/,
         'range inputs remain transport controls while text-like inputs keep Space');
     assert.doesNotMatch(resolver, /function compositeModalNativeActivationTarget/);
@@ -357,6 +386,9 @@ test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () 
         /action\.kind === 'preview'[\s\S]*toggleCompositePreview\(action\.mode\)/,
         'number shortcuts invoke transport directly instead of synthesizing a click');
     assert.match(shortcutBody,
+        /const result = byId\('editor-composite-result-workspace'\)[\s\S]*result\?\.querySelector/,
+        'shortcuts can target only controls in the active result workspace');
+    assert.match(shortcutBody,
         /action\.kind === 'play-toggle'[\s\S]*toggleCompositePreview\(button\.dataset\.compositePreview\)/,
         'Space invokes the selected transport action directly');
     assert.match(resolver,
@@ -366,6 +398,72 @@ test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () 
     assert.match(main,
         /window\.__editorScreenTeardown = \(\) => \{[\s\S]*_teardownHybridFeature\(\)/,
         'Editor reinjection removes the Hybrid document listener and body-mounted modal');
+});
+
+test('Hybrid preview lifecycle blocks loading races and stale review work', () => {
+    const resolver = fs.readFileSync(
+        new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    assert.match(resolver,
+        /function requireCurrentCompositePlan[\s\S]*hybridPlanSessionIsCurrent[\s\S]*closeCompositeModalImmediately/,
+        'review and preview fail closed when their analyzed song is no longer open');
+    const buttonsStart = resolver.indexOf('function updateCompositePreviewButtons');
+    const buttonsEnd = resolver.indexOf('function setCompositePreviewHelp', buttonsStart);
+    const buttonsBody = resolver.slice(buttonsStart, buttonsEnd);
+    assert.match(buttonsBody,
+        /editor-composite-preview-tone[\s\S]*editor-composite-whole-loop[\s\S]*previewLoading/,
+        'tone and whole-song loop controls stay disabled through initial loading');
+    const seekStart = resolver.indexOf('function seekCompositeTimelineAtTime');
+    const seekEnd = resolver.indexOf('function commitCompositeTimelineZoom', seekStart);
+    const seekBody = resolver.slice(seekStart, seekEnd);
+    assert.ok(seekBody.indexOf('if (hybridSession.previewLoading)')
+        < seekBody.indexOf('hybridSession.previewController.seek(time)'),
+    'a loading preview cannot be replaced by an unowned ruler seek');
+    const previewStart = resolver.indexOf('async function startCompositePreview');
+    const previewEnd = resolver.indexOf('function keepCompositeContextLoop', previewStart);
+    const previewBody = resolver.slice(previewStart, previewEnd);
+    assert.match(previewBody,
+        /previewRequestIsCurrent[\s\S]*hybridPlanSessionIsCurrent[\s\S]*await controller\.setMode[\s\S]*previewRequestIsCurrent[\s\S]*await controller\.setTone[\s\S]*previewRequestIsCurrent/,
+        'each asynchronous preview preparation step retains request and song ownership');
+    const focusStart = resolver.indexOf('function prepareCurrentReviewFocus');
+    const focusEnd = resolver.indexOf('function centerCurrentReviewInTimeline', focusStart);
+    const focusBody = resolver.slice(focusStart, focusEnd);
+    assert.ok(focusBody.indexOf('endCompositePreviewPlayback()')
+        < focusBody.indexOf('seekCompositeTimelineAtTime(time)'),
+    'review navigation stops the old preview before moving the cursor, avoiding a redundant restart');
+});
+
+test('Hybrid preview surfaces private transport failures and partial recording availability', () => {
+    const resolver = fs.readFileSync(
+        new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const controllerStart = resolver.indexOf('function ensureCompositePreviewController');
+    const controllerEnd = resolver.indexOf('function updateCompositePreviewButtons', controllerStart);
+    const controllerBody = resolver.slice(controllerStart, controllerEnd);
+    assert.match(controllerBody,
+        /state\.error[\s\S]*setCompositePreviewHelp\(message\)[\s\S]*setCompositeEditorStatus/,
+        'device and decode failures replace both local help and the Editor status');
+    const previewStart = resolver.indexOf('async function startCompositePreview');
+    const previewEnd = resolver.indexOf('function keepCompositeContextLoop', previewStart);
+    const previewBody = resolver.slice(previewStart, previewEnd);
+    assert.match(previewBody,
+        /controller\.state\(\)\.warnings[\s\S]*recording source[\s\S]*playing the available audio/,
+        'partial stem failures remain audible but are explained to the user');
+});
+
+test('Hybrid feature teardown settles its shared choice prompt through the public key path', () => {
+    const resolver = fs.readFileSync(
+        new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    assert.match(resolver,
+        /async function compositePromptChoice[\s\S]*compositeChoicePromptToken = token[\s\S]*await _editorPromptChoice[\s\S]*compositeChoicePromptToken === token/,
+        'the feature tracks only prompts it opened itself');
+    assert.match(resolver,
+        /function cancelCompositeChoicePrompt[\s\S]*editor-choice-prompt[\s\S]*KeyboardEvent\('keydown'[\s\S]*key: 'Escape'/,
+        'forced cleanup settles the shared prompt through its normal Escape handler');
+    assert.match(resolver,
+        /function clearTransientState[\s\S]*cancelCompositeChoicePrompt\(\)[\s\S]*closeDecisionResolve/,
+        'reinjection cannot leave a prompt Promise or creation close-decision behind');
+    assert.match(resolver,
+        /function editorSuspendCompositeArrangementUi[\s\S]*cancelCompositeChoicePrompt\(\)/,
+        'screen navigation cannot leave a body-mounted prompt over another screen');
 });
 
 test('Hybrid follow uses bounded double-buffered cameras and compositor-only overview movers', () => {
@@ -570,11 +668,11 @@ test('continuous Hybrid preview preferences update live and persist off the inpu
     assert.doesNotMatch(resolver.slice(centerStart, centerEnd),
         /refreshCompositeTimelineViewport/,
         'initial review centering is camera-only; its bind frame performs the sole exact render');
-    const closeStart = resolver.indexOf('function closeCompositeModalImmediately');
-    const closeEnd = resolver.indexOf('export async function editorHideCompositeArrangementModal', closeStart);
-    assert.match(resolver.slice(closeStart, closeEnd),
-        /flushHybridPreviewPreferences\(\)[\s\S]*cancelHybridAnalysis/,
-        'close and teardown persist the latest continuous value before cleanup');
+    const clearStart = resolver.indexOf('function clearTransientState');
+    const clearEnd = resolver.indexOf('function setCompositeReviewMode', clearStart);
+    assert.match(resolver.slice(clearStart, clearEnd),
+        /flushHybridPreviewPreferences\(\)[\s\S]*resetHybridBuilderReview/,
+        'close and teardown persist the latest continuous value before resetting state');
 });
 
 test('Hybrid preview owns and destroys its private transport at the feature boundary', () => {
@@ -584,7 +682,7 @@ test('Hybrid preview owns and destroys its private transport at the feature boun
         /function disposeCompositePreviewSession[\s\S]*controller\.destroy\(\)/,
         'close, teardown, and song switches destroy the feature-owned controller');
     assert.match(resolver,
-        /function closeCompositeModalImmediately[\s\S]*disposeCompositePreviewSession\(\)/,
+        /function clearTransientState[\s\S]*disposeCompositePreviewSession\(\)/,
         'modal teardown cannot leak its private AudioContext into the next Editor session');
     assert.doesNotMatch(imports,
         /from '\.\.\/audio\.js'|from '\.\.\/loop\.js'|from '\.\.\/state\.js'/,
@@ -668,6 +766,7 @@ test('Hybrid setup remembers explicit review-every-occurrence preference', () =>
 test('Hybrid builder session reset clears review and private-preview ownership', () => {
     const session = createHybridBuilderSession();
     session.plan = { ok: true };
+    session.planSessionId = 'song-a';
     session.stage = 'final-preview';
     session.conflictIndex = 4;
     session.customDrafts.set('guided:1', ['primary:1']);
@@ -690,6 +789,7 @@ test('Hybrid builder session reset clears review and private-preview ownership',
     const requestId = session.previewRequestId;
     resetHybridBuilderReview(session);
     assert.equal(session.plan, null);
+    assert.equal(session.planSessionId, null);
     assert.equal(session.stage, 'setup');
     assert.equal(session.conflictIndex, 0);
     assert.equal(session.customDrafts.size, 0);
@@ -795,8 +895,9 @@ test('Hybrid analysis requests are cancellable and stale results cannot replace 
 test('Hybrid revisions distinguish plan, resolution, and view-only changes', () => {
     const session = createHybridBuilderSession();
     const plan = { strategy: 'guided' };
-    assert.equal(installHybridPlan(session, plan), 1);
+    assert.equal(installHybridPlan(session, plan, 'song-a'), 1);
     assert.equal(session.plan, plan);
+    assert.equal(session.planSessionId, 'song-a');
     assert.equal(session.resolutionRevision, 0);
     assert.equal(markHybridResolutionChanged(session), 1);
     assert.equal(markHybridViewChanged(session), 3);

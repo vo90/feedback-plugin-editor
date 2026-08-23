@@ -31,6 +31,7 @@ export class FakeAudioNode {
     }
 
     connect(target) {
+        this.disconnected = false;
         this.connections.push(target);
         return target;
     }
@@ -77,7 +78,7 @@ export class FakeDynamicsCompressorNode extends FakeAudioNode {
 }
 
 export class FakeAudioContext {
-    constructor({ state = 'running', decode = null } = {}) {
+    constructor({ state = 'running', decode = null, outputTimestamp = null } = {}) {
         this.currentTime = 0;
         this.state = state;
         this.destination = new FakeAudioNode();
@@ -86,6 +87,8 @@ export class FakeAudioContext {
         this.compressors = [];
         this.decode = decode;
         this.closed = false;
+        this.outputTimestamp = outputTimestamp;
+        this.listeners = new Map();
     }
 
     createGain() {
@@ -111,6 +114,25 @@ export class FakeAudioContext {
         const buffer = { duration: 4, bytes };
         queueMicrotask(() => success?.(buffer));
         return Promise.resolve(buffer);
+    }
+
+    getOutputTimestamp() {
+        if (!this.outputTimestamp) return undefined;
+        return typeof this.outputTimestamp === 'function'
+            ? this.outputTimestamp() : { ...this.outputTimestamp };
+    }
+
+    addEventListener(type, listener) {
+        if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+        this.listeners.get(type).add(listener);
+    }
+
+    removeEventListener(type, listener) {
+        this.listeners.get(type)?.delete(listener);
+    }
+
+    emit(type) {
+        for (const listener of this.listeners.get(type) || []) listener({ type });
     }
 
     async resume() {

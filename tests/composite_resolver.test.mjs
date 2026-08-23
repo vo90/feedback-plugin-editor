@@ -272,6 +272,18 @@ test('the shared timeline and modal shortcuts cover review and final preview coh
     assert.deepEqual(_compositeModalShortcutPure({ key: 'ArrowRight', stage: 'review' }), {
         kind: 'next',
     });
+    assert.equal(_compositeModalShortcutPure({ key: ' ', stage: 'setup' }), null,
+        'Setup never exposes Hybrid transport shortcuts');
+    assert.equal(_compositeModalShortcutPure({ key: '1', stage: 'setup' }), null);
+    assert.equal(_compositeModalShortcutPure({
+        key: ' ', stage: 'review', transportAvailable: false,
+    }), null, 'a hidden, inert, or busy review cannot start playback');
+    assert.equal(_compositeModalShortcutPure({
+        key: '1', stage: 'final-preview', transportAvailable: false,
+    }), null, 'sound shortcuts cannot target unavailable preview controls');
+    assert.equal(_compositeModalShortcutPure({
+        key: 'ArrowRight', stage: 'review', transportAvailable: false,
+    }), null, 'busy review navigation cannot click an inert decision control');
     assert.equal(_compositeModalShortcutPure({
         key: 'ArrowRight', stage: 'final-preview',
     }), null);
@@ -287,6 +299,10 @@ test('Escape stops one active Hybrid preview before a separate press may close',
         key: 'Escape', previewActive: true, editable: true,
     }), { kind: 'stop-preview' },
     'Escape still stops auditioning while focus is on a preview control');
+    assert.deepEqual(_compositeModalShortcutPure({
+        key: 'Escape', previewActive: true, transportAvailable: false,
+    }), { kind: 'stop-preview' },
+    'an active preview can still be stopped while other transport is gated');
     assert.deepEqual(_compositeModalShortcutPure({
         key: 'Escape', repeat: true,
     }), { kind: 'consume' },

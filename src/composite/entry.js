@@ -6,11 +6,15 @@
  */
 
 import {
-    editorHideCompositeArrangementModal,
+    editorResumeCompositeArrangementUi,
     editorShowCompositeArrangementModal as showCompositeArrangementModal,
+    editorSuspendCompositeArrangementUi,
     editorTeardownCompositeArrangementUi as teardownCompositeArrangementUi,
 } from './resolver-ui.js';
-import { installHybridPerformanceTools } from './performance.js';
+import {
+    installHybridPerformanceTools,
+    uninstallHybridPerformanceTools,
+} from './performance.js';
 
 const STYLE_OWNER = 'hybrid-track-builder';
 const STYLE_URL = new URL('../../assets/composite/hybrid.css', import.meta.url).href;
@@ -18,6 +22,66 @@ const STYLE_URL = new URL('../../assets/composite/hybrid.css', import.meta.url).
 let stylePromise = null;
 let styleElement = null;
 let rejectStyleLoad = null;
+let editorScreenVisibilityObserver = null;
+
+// The Hybrid modal is mounted under <body> so it can fill the desktop window,
+// while the Editor itself is one of the host application's persistent screens.
+// Keep that host-specific visibility bridge here in the lazy feature entry:
+// normal Editor startup and its shared UI modules remain unaware of it.
+export function createHybridEditorScreenVisibilityObserver({
+    documentObject = globalThis.document,
+    MutationObserverClass = globalThis.MutationObserver,
+    onActive = editorResumeCompositeArrangementUi,
+    onInactive = editorSuspendCompositeArrangementUi,
+} = {}) {
+    let target = null;
+    let observer = null;
+    let running = false;
+    let lastActive = null;
+
+    const sync = () => {
+        if (!running) return false;
+        const nextTarget = documentObject?.getElementById?.('plugin-editor') || null;
+        if (nextTarget !== target) {
+            observer?.disconnect();
+            target = nextTarget;
+            observer = target && typeof MutationObserverClass === 'function'
+                ? new MutationObserverClass(sync) : null;
+            observer?.observe(target, { attributes: true, attributeFilter: ['class'] });
+        }
+        const active = !!target?.classList?.contains('active');
+        if (active === lastActive) return active;
+        lastActive = active;
+        if (active) onActive?.();
+        else onInactive?.();
+        return active;
+    };
+
+    return {
+        start() {
+            running = true;
+            return sync();
+        },
+        stop() {
+            running = false;
+            observer?.disconnect();
+            observer = null;
+            target = null;
+            lastActive = null;
+        },
+        sync,
+    };
+}
+
+function installHybridEditorScreenVisibilityObserver() {
+    editorScreenVisibilityObserver ||= createHybridEditorScreenVisibilityObserver();
+    return editorScreenVisibilityObserver.start();
+}
+
+function uninstallHybridEditorScreenVisibilityObserver() {
+    editorScreenVisibilityObserver?.stop();
+    editorScreenVisibilityObserver = null;
+}
 
 function matchingStyleElement() {
     if (typeof document === 'undefined') return null;
@@ -77,17 +141,22 @@ export function ensureHybridTrackStyles() {
 export async function editorShowCompositeArrangementModal() {
     await ensureHybridTrackStyles();
     installHybridPerformanceTools();
-    return showCompositeArrangementModal();
+    const shown = await showCompositeArrangementModal();
+    if (shown) installHybridEditorScreenVisibilityObserver();
+    return shown;
 }
 
-export { editorHideCompositeArrangementModal };
-
 export function editorTeardownCompositeArrangementUi() {
-    teardownCompositeArrangementUi();
-    const rejectPending = rejectStyleLoad;
-    rejectStyleLoad = null;
-    rejectPending?.(new Error('Hybrid Track stylesheet load was cancelled'));
-    stylePromise = null;
-    if (styleElement?.isConnected) styleElement.remove();
-    styleElement = null;
+    uninstallHybridEditorScreenVisibilityObserver();
+    try {
+        teardownCompositeArrangementUi();
+    } finally {
+        uninstallHybridPerformanceTools();
+        const rejectPending = rejectStyleLoad;
+        rejectStyleLoad = null;
+        rejectPending?.(new Error('Hybrid Track stylesheet load was cancelled'));
+        stylePromise = null;
+        if (styleElement?.isConnected) styleElement.remove();
+        styleElement = null;
+    }
 }

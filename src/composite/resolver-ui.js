@@ -12,7 +12,6 @@ import {
     commitCompositeArrangement,
     compositeEditorArrangementNameTaken,
     compositeEditorContainsArrangement,
-    compositeEditorSessionIsCurrent,
     keepCompositeEditorLoop,
     readCompositeAnalysisSnapshot,
     readCompositeEditorSnapshot,
@@ -87,8 +86,6 @@ import {
 import {
     beginHybridAnalysis,
     beginHybridCreation,
-    cancelHybridAnalysis,
-    cancelHybridCreation,
     completeHybridAnalysis,
     completeHybridCreation,
     createHybridBuilderSession,
@@ -96,6 +93,7 @@ import {
     hybridCloseAction,
     hybridCloseGuardKind,
     hybridCreationIsCurrent,
+    hybridPlanSessionIsCurrent,
     installHybridPlan,
     markHybridResolutionChanged,
     markHybridReviewWork,
@@ -165,6 +163,13 @@ export {
     hybridPreviewPreferencesPure as _compositePreviewPreferencesPure,
 };
 
+export function _compositeModalSessionIsCurrentPure(
+    modalSessionId, { sessionId, format } = {}, planSessionId = null,
+) {
+    return !!(modalSessionId && sessionId === modalSessionId && format === 'sloppak'
+        && (!planSessionId || planSessionId === modalSessionId));
+}
+
 export const HYBRID_DIALOG_STYLE = [
     // Position against the modal itself. A percentage-height flex item is
     // treated as auto-height in Electron here, which can place the footer
@@ -215,6 +220,8 @@ let dialogResizeSaveTimer = 0;
 let timelineViewCache = null;
 let timelineViewportDom = null;
 let compositeModalDocumentKeydown = null;
+let compositeModalSessionId = null;
+let compositeChoicePromptToken = null;
 const convertCompositePreviewEvents = createCompositePreviewEventCache();
 const compositePreviewEventPlanCache = new WeakMap();
 const compositeResolvedEntryPlanCache = new WeakMap();
@@ -504,6 +511,7 @@ export function _compositeTimelineStageActivePure(stage) {
 export function _compositeModalShortcutPure({
     key = '', editable = false, modified = false, stage = 'review',
     previewActive = false, repeat = false, spaceEditable = editable,
+    transportAvailable = true,
 } = {}) {
     // The Hybrid modal's generic keyboard trap closes on Escape. Consume the
     // first Escape here while auditioning so it behaves as Stop instead. A held
@@ -512,13 +520,17 @@ export function _compositeModalShortcutPure({
     if (key === 'Escape' && repeat && !modified) return { kind: 'consume' };
     if (key === 'Escape' && previewActive && !modified) return { kind: 'stop-preview' };
     if (modified) return null;
+    const transportEnabled = transportAvailable
+        && _compositeTimelineStageActivePure(stage);
     if (key === ' ') {
         if (spaceEditable) return null;
+        if (!transportEnabled) return null;
         return repeat ? { kind: 'consume' } : { kind: 'play-toggle' };
     }
     // Preserve arrows and character input for select/range/text controls. Only
     // Space is deliberately uniform across non-text modal controls.
     if (editable) return null;
+    if (!transportEnabled) return null;
     const modes = { '1': 'song', '2': 'primary', '3': 'secondary', '4': 'result' };
     if (repeat && modes[key]) return { kind: 'consume' };
     if (modes[key]) return { kind: 'preview', mode: modes[key] };
@@ -530,6 +542,51 @@ export function _compositeModalShortcutPure({
 
 function byId(id) {
     return document.getElementById(id);
+}
+
+async function compositePromptChoice(options) {
+    const token = {};
+    compositeChoicePromptToken = token;
+    try {
+        return await _editorPromptChoice(options);
+    } finally {
+        if (compositeChoicePromptToken === token) compositeChoicePromptToken = null;
+    }
+}
+
+function cancelCompositeChoicePrompt() {
+    if (!compositeChoicePromptToken) return false;
+    const prompt = byId('editor-choice-prompt');
+    if (!prompt || typeof globalThis.KeyboardEvent !== 'function') return false;
+    prompt.dispatchEvent(new globalThis.KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: false,
+        cancelable: true,
+    }));
+    return true;
+}
+
+function compositePreviewTransportAvailable() {
+    const modal = byId('editor-composite-modal');
+    const workspace = byId('editor-composite-workspace');
+    const result = byId('editor-composite-result-workspace');
+    return !!(modal && !modal.hidden && result && !result.hidden
+        && _compositeTimelineStageActivePure(hybridSession.stage)
+        && !hybridSession.analyzing && !hybridSession.creating
+        && !hybridSession.closePromptPending
+        && !timelineViewportDom?.reviewRefreshPending
+        && !modal.inert && !workspace?.inert && !result.inert);
+}
+
+function requireCurrentCompositePlan() {
+    if (!hybridSession.plan) return false;
+    const editor = readCompositeEditorSnapshot();
+    if (hybridPlanSessionIsCurrent(hybridSession, editor)) return true;
+    const modal = byId('editor-composite-modal');
+    closeCompositeModalImmediately(modal);
+    setCompositeEditorStatus(
+        'The open song changed, so Hybrid Track was closed. Open it again to build a preview for this song.');
+    return false;
 }
 
 function compositeModalTextEditingTarget(target) {
@@ -704,7 +761,9 @@ function ensureCompositePreviewController() {
             if (state.error) {
                 hybridSession.previewPlaying = false;
                 hybridSession.previewMode = '';
-                setCompositePreviewHelp(state.error.message || 'Playback could not start.');
+                const message = state.error.message || 'Playback could not start.';
+                setCompositePreviewHelp(message);
+                setCompositeEditorStatus(`Hybrid preview: ${message}`);
             }
             updateCompositePreviewButtons();
         },
@@ -716,18 +775,29 @@ function ensureCompositePreviewController() {
 
 function updateCompositePreviewButtons() {
     const reviewRefreshPending = !!timelineViewportDom?.reviewRefreshPending;
+    const interactionBlocked = hybridSession.analyzing || hybridSession.creating
+        || hybridSession.closePromptPending;
     for (const button of document.querySelectorAll('[data-composite-preview]')) {
         const active = button.dataset.compositePreview === hybridSession.previewMode;
         const available = button.dataset.compositePreviewAvailable === 'true';
         button.setAttribute('aria-pressed', active ? 'true' : 'false');
         button.setAttribute('aria-busy', active && hybridSession.previewLoading
             || reviewRefreshPending ? 'true' : 'false');
-        button.disabled = hybridSession.previewLoading || reviewRefreshPending || !available;
+        button.disabled = interactionBlocked || hybridSession.previewLoading
+            || reviewRefreshPending || !available;
         button.classList.toggle('ring-2', active);
         button.classList.toggle('ring-emerald-400', active);
     }
     const stop = byId('editor-composite-preview-stop');
-    if (stop) stop.disabled = !hybridSession.previewPlaying && !hybridSession.previewLoading;
+    if (stop) stop.disabled = interactionBlocked
+        || !hybridSession.previewPlaying && !hybridSession.previewLoading;
+    for (const control of [
+        byId('editor-composite-preview-tone'),
+        byId('editor-composite-whole-loop'),
+    ]) {
+        if (control) control.disabled = interactionBlocked
+            || hybridSession.previewLoading || reviewRefreshPending;
+    }
 }
 
 function setCompositePreviewHelp(message) {
@@ -765,6 +835,7 @@ function endCompositePreviewPlayback() {
 }
 
 function toggleCompositePreview(mode) {
+    if (!requireCurrentCompositePlan() || !compositePreviewTransportAvailable()) return;
     if (hybridSession.previewMode === mode
             && (hybridSession.previewPlaying || hybridSession.previewLoading)) {
         endCompositePreviewPlayback();
@@ -783,7 +854,9 @@ function disposeCompositePreviewSession() {
 
 function clearTransientState() {
     flushHybridPreviewPreferences();
+    cancelCompositeChoicePrompt();
     hybridSession.closeDecisionResolve?.('discard');
+    compositeModalSessionId = null;
     stopCompositeModalDocumentKeyboard();
     stopHybridDialogSizePersistence();
     stopCompositeTimelineUi();
@@ -1139,7 +1212,9 @@ function scheduleCompositePreviewEventPrewarm(plan = hybridSession.plan) {
     ];
     let index = 0;
     const queue = () => scheduleCompositeTimelineIdle(deadline => {
-        if (hybridSession.plan !== plan) return;
+        if (hybridSession.plan !== plan
+                || !hybridPlanSessionIsCurrent(
+                    hybridSession, readCompositeEditorSnapshot())) return;
         if (compositeTimelineInputPending()
                 || Math.max(0, Number(deadline?.timeRemaining?.()) || 0) < 8) {
             queue();
@@ -1170,6 +1245,7 @@ function setCompositeContextLoop(controller, view, requestedStartTime = null) {
 }
 
 async function startCompositePreview(mode) {
+    if (!requireCurrentCompositePlan() || !compositePreviewTransportAvailable()) return;
     if (timelineViewportDom?.reviewRefreshPending) {
         const message = 'Updating the tracks for your choice…';
         setCompositePreviewHelp(message);
@@ -1177,6 +1253,7 @@ async function startCompositePreview(mode) {
         return;
     }
     const previewRequestStartedAt = hybridPerfStart();
+    const plan = hybridSession.plan;
     const view = currentPreviewView();
     if (!view) return;
     const audio = readCompositePreviewAudioSnapshot();
@@ -1202,6 +1279,17 @@ async function startCompositePreview(mode) {
     controller.stop();
     stopCompositeEditorPlayback();
     const requestId = ++hybridSession.previewRequestId;
+    const previewRequestIsCurrent = () => requestId === hybridSession.previewRequestId
+        && hybridSession.plan === plan
+        && hybridSession.previewController === controller
+        && hybridPlanSessionIsCurrent(hybridSession, readCompositeEditorSnapshot());
+    const settleStalePreviewRequest = () => {
+        if (hybridSession.plan === plan
+                && !hybridPlanSessionIsCurrent(
+                    hybridSession, readCompositeEditorSnapshot())) {
+            requireCurrentCompositePlan();
+        }
+    };
     hybridSession.previewMode = mode;
     hybridSession.previewLastMode = mode;
     hybridSession.previewPlaying = false;
@@ -1234,17 +1322,29 @@ async function startCompositePreview(mode) {
         });
     }
     await controller.setMode(mode);
+    if (!previewRequestIsCurrent()) {
+        settleStalePreviewRequest();
+        return;
+    }
     await controller.setTone(tone);
+    if (!previewRequestIsCurrent()) {
+        settleStalePreviewRequest();
+        return;
+    }
     hybridSession.previewRecordingGain = mode === 'song'
         ? recordingPreviewGainFor(view, audio) : 1;
     controller.setMix(hybridPreviewMixFor(mode));
     const context = setCompositeContextLoop(controller, view, requestedStartTime);
     await controller.seek(context.startTime);
-    if (requestId !== hybridSession.previewRequestId || !hybridSession.plan
-            || hybridSession.previewController !== controller) return;
+    if (!previewRequestIsCurrent()) {
+        settleStalePreviewRequest();
+        return;
+    }
     const started = await controller.start(mode);
-    if (requestId !== hybridSession.previewRequestId
-            || hybridSession.previewController !== controller) return;
+    if (!previewRequestIsCurrent()) {
+        settleStalePreviewRequest();
+        return;
+    }
     hybridSession.previewLoading = false;
     hybridSession.previewPlaying = !!started && controller.isPlaying();
     updateCompositePreviewButtons();
@@ -1262,14 +1362,20 @@ async function startCompositePreview(mode) {
     hybridPerfEnd('ui.preview.requestMs', previewRequestStartedAt);
     hybridPerfResetFrame('timeline.playhead');
     startCompositeTimelinePlayhead();
-    const help = mode === 'song'
+    const baseHelp = mode === 'song'
         ? 'Original song · level-matched.'
         : `${modeModel.label} · ${tone.label} · level-matched.`;
+    const sourceWarnings = controller.state().warnings || [];
+    const warning = sourceWarnings.length
+        ? ` ${sourceWarnings.length === 1 ? 'One recording source was unavailable' : `${sourceWarnings.length} recording sources were unavailable`}; playing the available audio.`
+        : '';
+    const help = `${baseHelp}${warning}`;
     setCompositePreviewHelp(help);
-    setCompositeEditorStatus(`Hybrid preview: playing ${modeModel.label}.`);
+    setCompositeEditorStatus(`Hybrid preview: playing ${modeModel.label}.${warning}`);
 }
 
 function keepCompositeContextLoop() {
+    if (!requireCurrentCompositePlan() || !compositePreviewTransportAvailable()) return;
     const view = currentPreviewView();
     if (!view) return;
     endCompositePreviewPlayback();
@@ -1283,6 +1389,7 @@ function keepCompositeContextLoop() {
 }
 
 function restartCompositePreview() {
+    if (!requireCurrentCompositePlan() || !compositePreviewTransportAvailable()) return;
     const view = currentPreviewView();
     if (!view || !hybridSession.plan) return;
     const region = compositePreviewRegionPure(
@@ -1416,7 +1523,7 @@ function renderConflict(plan) {
 }
 
 function enterCompositeFinalPreview() {
-    if (!hybridSession.plan) return false;
+    if (!requireCurrentCompositePlan()) return false;
     if (hybridSession.plan.conflicts.some(block => !block.resolution)) return false;
     endCompositePreviewPlayback();
     hybridSession.stage = 'final-preview';
@@ -1430,6 +1537,7 @@ function enterCompositeFinalPreview() {
 }
 
 function toggleCompositeCustomEntry(entryId) {
+    if (!requireCurrentCompositePlan()) return;
     const conflict = hybridSession.plan?.conflicts?.[hybridSession.conflictIndex];
     if (!conflict) return;
     const interactionStartedAt = hybridPerfStart();
@@ -1450,6 +1558,7 @@ function toggleCompositeCustomEntry(entryId) {
 }
 
 function inspectExperimentalPassage(passageId) {
+    if (!requireCurrentCompositePlan()) return false;
     const passage = hybridSession.plan?.passages?.find(candidate => candidate.id === passageId);
     if (!passage) return false;
     endCompositePreviewPlayback();
@@ -1497,6 +1606,8 @@ function bindCompositeReviewDetails(details) {
 
 function bindCompositeReviewToolbarEvents(toolbar) {
     if (!toolbar) return;
+    const reviewActionAvailable = () => hybridSession.stage === 'review'
+        && requireCurrentCompositePlan() && compositePreviewTransportAvailable();
     const refreshReviewDecision = () => {
         if (!refreshCurrentCompositeReview()) renderResult();
     };
@@ -1505,6 +1616,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
     }
     for (const marker of toolbar.querySelectorAll('[data-conflict-index]')) {
         marker.addEventListener('click', () => {
+            if (!reviewActionAvailable()) return;
             hybridSession.conflictIndex = Number(marker.dataset.conflictIndex) || 0;
             prepareCurrentReviewFocus(true);
             refreshReviewDecision();
@@ -1512,6 +1624,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
     }
     for (const button of toolbar.querySelectorAll('[data-guided-split-beat]')) {
         button.addEventListener('click', () => {
+            if (!reviewActionAvailable()) return;
             const block = hybridSession.plan.conflicts[hybridSession.conflictIndex];
             const split = splitGuidedRepeatGroup(hybridSession.plan, block.id,
                 Number(button.dataset.guidedSplitBeat));
@@ -1532,11 +1645,13 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         });
     }
     toolbar.querySelector('#editor-composite-edit-settings')?.addEventListener('click', () => {
+        if (!reviewActionAvailable()) return;
         endCompositePreviewPlayback();
         setCompositeReviewMode(false);
         byId('editor-composite-primary')?.focus();
     });
     toolbar.querySelector('#editor-composite-skip-experimental-review')?.addEventListener('click', () => {
+        if (!reviewActionAvailable()) return;
         for (const conflict of hybridSession.plan.conflicts) {
             if (!conflict.resolution) resolveCompositeConflict(
                 hybridSession.plan, conflict.id, 'primary');
@@ -1546,6 +1661,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         enterCompositeFinalPreview();
     });
     const moveDecision = offset => {
+        if (!reviewActionAvailable()) return;
         const interactionStartedAt = hybridPerfStart();
         const block = hybridSession.plan.conflicts[hybridSession.conflictIndex];
         const context = guidedRepeatContext(hybridSession.plan, block);
@@ -1569,6 +1685,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         'click', () => moveDecision(1));
     for (const button of toolbar.querySelectorAll('[data-resolution]')) {
         button.addEventListener('click', () => {
+            if (!reviewActionAvailable()) return;
             const interactionStartedAt = hybridPerfStart();
             const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
             const resolution = button.dataset.resolution;
@@ -1602,6 +1719,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         });
     }
     toolbar.querySelector('#editor-composite-reset-choice')?.addEventListener('click', () => {
+        if (!reviewActionAvailable()) return;
         const interactionStartedAt = hybridPerfStart();
         const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
         const context = guidedRepeatContext(hybridSession.plan, conflict);
@@ -1615,6 +1733,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         finishCompositeInteraction('review.reset', interactionStartedAt);
     });
     toolbar.querySelector('#editor-composite-detach-occurrence')?.addEventListener('click', () => {
+        if (!reviewActionAvailable()) return;
         const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
         hybridSession.customDrafts.delete(conflict.id);
         const detached = detachGuidedRepeatOccurrence(hybridSession.plan, conflict.id);
@@ -1626,6 +1745,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         renderResult();
     });
     toolbar.querySelector('#editor-composite-apply-next')?.addEventListener('click', () => {
+        if (!reviewActionAvailable()) return;
         const interactionStartedAt = hybridPerfStart();
         const context = guidedRepeatContext(hybridSession.plan,
             hybridSession.plan.conflicts[hybridSession.conflictIndex]);
@@ -1656,16 +1776,28 @@ function bindCompositeReviewToolbarEvents(toolbar) {
 function bindResultEvents() {
     const result = byId('editor-composite-result');
     if (!result || !hybridSession.plan) return;
+    const transportActionAvailable = () => requireCurrentCompositePlan()
+        && compositePreviewTransportAvailable();
+    const guardResultInteraction = event => {
+        if (transportActionAvailable()) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+    };
+    for (const type of ['click', 'change', 'input', 'pointerdown', 'keydown', 'wheel']) {
+        result.addEventListener(type, guardResultInteraction, true);
+    }
     const reviewToolbar = result.querySelector('.editor-composite-review-toolbar');
     bindCompositeReviewToolbarEvents(reviewToolbar);
     if (!reviewToolbar) {
         byId('editor-composite-edit-settings')?.addEventListener('click', () => {
+            if (!transportActionAvailable()) return;
             endCompositePreviewPlayback();
             setCompositeReviewMode(false);
             byId('editor-composite-primary')?.focus();
         });
     }
     byId('editor-composite-copy-report')?.addEventListener('click', async () => {
+        if (!transportActionAvailable()) return;
         let report = hybridSession.plan?.comparisonReport
             || experimentalComparisonReport(hybridSession.plan);
         if (hybridSession.plan?.strategy === 'experimental') {
@@ -1699,6 +1831,7 @@ function bindResultEvents() {
     byId('editor-composite-passage-prev')?.addEventListener('click', () => moveInspectedPassage(-1));
     byId('editor-composite-passage-next')?.addEventListener('click', () => moveInspectedPassage(1));
     byId('editor-composite-passage-clear')?.addEventListener('click', () => {
+        if (!transportActionAvailable()) return;
         endCompositePreviewPlayback();
         hybridSession.inspectedPassageId = '';
         hybridSession.timelineFocusPassage = false;
@@ -1706,6 +1839,7 @@ function bindResultEvents() {
         renderResult();
     });
     byId('editor-composite-back-review')?.addEventListener('click', () => {
+        if (!transportActionAvailable()) return;
         endCompositePreviewPlayback();
         hybridSession.stage = 'review';
         prepareCurrentReviewFocus(true);
@@ -1715,10 +1849,13 @@ function bindResultEvents() {
         button.addEventListener('click', () => toggleCompositePreview(
             button.dataset.compositePreview));
     }
-    byId('editor-composite-preview-stop')?.addEventListener('click', endCompositePreviewPlayback);
+    byId('editor-composite-preview-stop')?.addEventListener('click', () => {
+        if (transportActionAvailable()) endCompositePreviewPlayback();
+    });
     byId('editor-composite-preview-restart')?.addEventListener('click', restartCompositePreview);
     byId('editor-composite-keep-loop')?.addEventListener('click', keepCompositeContextLoop);
     byId('editor-composite-whole-loop')?.addEventListener('click', () => {
+        if (!transportActionAvailable() || hybridSession.previewLoading) return;
         hybridSession.wholeSongLoop = !hybridSession.wholeSongLoop;
         const button = byId('editor-composite-whole-loop');
         if (button) {
@@ -1744,6 +1881,10 @@ function bindResultEvents() {
             : 'Whole-song loop is off. Playback stops at the end of the song.');
     });
     byId('editor-composite-preview-tone')?.addEventListener('change', event => {
+        if (!transportActionAvailable() || hybridSession.previewLoading) {
+            event.target.value = hybridPreviewPreferences.tone;
+            return;
+        }
         setHybridPreviewPreferences({
             ...hybridPreviewPreferences,
             tone: event.target.value,
@@ -1758,6 +1899,7 @@ function bindResultEvents() {
         }
     });
     byId('editor-composite-preview-volume')?.addEventListener('input', event => {
+        if (!transportActionAvailable()) return;
         setHybridPreviewPreferences({
             ...hybridPreviewPreferences,
             volume: event.target.value,
@@ -3009,6 +3151,11 @@ function syncCompositeTimelineNativeCamera(dom = timelineViewportDom) {
 function seekCompositeTimelineAtTime(rawTime, {
     center = false,
 } = {}) {
+    if (hybridSession.plan && !requireCurrentCompositePlan()) return 0;
+    if (hybridSession.previewLoading) {
+        setCompositePreviewHelp('Wait for the current preview to finish loading before seeking.');
+        return hybridSession.timelineSeekTime;
+    }
     const time = Math.max(0, Number(rawTime) || 0);
     // Ordinary seeks only move the retained camera/playhead. Building a fresh
     // full-song model is necessary solely when the caller asks us to derive a
@@ -3318,12 +3465,24 @@ function updateCompositeTimelinePlayhead(frameTime = 0) {
         updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime);
         timelinePlayheadFrame = requestAnimationFrame(updateCompositeTimelinePlayhead);
     } else if (playbackSettled) {
+        const finishedMode = hybridSession.previewMode;
+        const finishedLabel = {
+            song: 'Original song',
+            primary: 'Base preview',
+            secondary: 'Fill preview',
+            result: 'Hybrid preview',
+        }[finishedMode] || 'Preview';
         applyCompositeTimelineCamera(dom, visualScroll, frame.contentX);
         updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime, true);
         syncCompositeTimelineNativeCamera(dom);
         hybridSession.previewPlaying = false;
+        hybridSession.previewLoading = false;
+        hybridSession.previewMode = '';
+        hybridSession.previewRecordingGain = 1;
         hybridPerfResetFrame('timeline.playhead');
         updateCompositePreviewButtons();
+        setCompositePreviewHelp(`${finishedLabel} finished · press Space to replay.`);
+        setCompositeEditorStatus(`Hybrid preview: ${finishedLabel.toLowerCase()} finished.`);
     } else {
         applyCompositeTimelineCamera(dom, visualScroll, frame.contentX);
         updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime, true);
@@ -3342,11 +3501,14 @@ function refreshCompositeTimelinePlayheadNow() {
 }
 
 function prepareCurrentReviewFocus(seek = false) {
+    if (!requireCurrentCompositePlan()) return;
     if (hybridSession.stage !== 'review') return;
     const view = currentConflictView();
     if (!view) return;
     hybridSession.timelineFocusReview = true;
     if (seek) {
+        if (hybridSession.previewMode || hybridSession.previewLoading
+                || hybridSession.previewPlaying) endCompositePreviewPlayback();
         const time = Math.max(0, timeOf(hybridSession.plan.beats, view.context.startBeat));
         seekCompositeTimelineAtTime(time);
     }
@@ -4104,6 +4266,7 @@ function scheduleCompositeReviewTimelineRefresh(conflictId) {
         }
         timelineReviewRefreshFrame = requestAnimationFrame(() => {
             timelineReviewRefreshFrame = 0;
+            if (!requireCurrentCompositePlan()) return;
             const plan = hybridSession.plan;
             const dom = timelineViewportDom;
             const conflict = plan?.conflicts?.[hybridSession.conflictIndex];
@@ -4160,6 +4323,7 @@ function scheduleCompositeReviewTimelineRefresh(conflictId) {
 // workspace, controls, and listeners. Replace only the decision toolbar, then
 // build the new focused model and lane SVGs after paint in the hidden camera.
 function refreshCurrentCompositeReview() {
+    if (!requireCurrentCompositePlan()) return false;
     const plan = hybridSession.plan;
     const previousToolbar = byId('editor-composite-result')
         ?.querySelector('.editor-composite-review-toolbar');
@@ -4206,6 +4370,7 @@ function refreshCurrentCompositeReview() {
 }
 
 function renderResult() {
+    if (!requireCurrentCompositePlan()) return;
     invalidateCompositeTimelineView();
     stopCompositeTimelineUi();
     if (hybridSession.previewMode) endCompositePreviewPlayback();
@@ -4292,7 +4457,7 @@ function setCompositeAnalysisUi(analyzing, phase = '') {
 
 async function confirmCompositeRebuild() {
     if (!hybridSession.plan || !hybridSession.hasReviewWork) return true;
-    const choice = await _editorPromptChoice({
+    const choice = await compositePromptChoice({
         title: 'Rebuild and discard review choices?',
         message: 'The current review choices belong to the existing preview. Rebuilding will replace them with a new analysis.',
         choices: [
@@ -4357,6 +4522,10 @@ async function analyzeFromDialog() {
     const configToken = _compositeAnalysisConfigTokenPure(config);
     const request = beginHybridAnalysis(hybridSession, { sessionId, configToken });
     if (!request) return;
+    const editorStillOwnsAnalysis = () => {
+        const current = readCompositeEditorSnapshot();
+        return current.format === 'sloppak' && current.sessionId === request.sessionId;
+    };
     const requestIsCurrent = () => {
         if (byId('editor-composite-modal') !== modal) return false;
         let currentConfigToken = '';
@@ -4365,15 +4534,17 @@ async function analyzeFromDialog() {
                 compositeAnalysisConfigFromDialog(),
             );
         } catch (_) { /* a replaced setup is stale by definition */ }
-        return hybridAnalysisIsCurrent(hybridSession, request, {
-            sessionId: readCompositeEditorSnapshot().sessionId,
-            configToken: currentConfigToken,
-        });
+        const current = readCompositeEditorSnapshot();
+        return current.format === 'sloppak'
+            && hybridAnalysisIsCurrent(hybridSession, request, {
+                sessionId: current.sessionId,
+                configToken: currentConfigToken,
+            });
     };
     const settleStaleRequest = () => {
         const ownedLifecycle = completeHybridAnalysis(hybridSession, request);
         if (!ownedLifecycle || byId('editor-composite-modal') !== modal) return;
-        if (!compositeEditorSessionIsCurrent(request.sessionId)) {
+        if (!editorStillOwnsAnalysis()) {
             closeCompositeModalImmediately(modal);
         } else {
             setCompositeAnalysisUi(false);
@@ -4407,7 +4578,7 @@ async function analyzeFromDialog() {
         const ownedLifecycle = completeHybridAnalysis(hybridSession, request);
         if (!current || !ownedLifecycle || byId('editor-composite-modal') !== modal) {
             if (ownedLifecycle && byId('editor-composite-modal') === modal
-                    && !compositeEditorSessionIsCurrent(request.sessionId)) {
+                    && !editorStillOwnsAnalysis()) {
                 closeCompositeModalImmediately(modal);
             }
             return;
@@ -4436,7 +4607,7 @@ async function analyzeFromDialog() {
         return;
     }
     if (error) error.textContent = '';
-    installHybridPlan(hybridSession, plan);
+    installHybridPlan(hybridSession, plan, request.sessionId);
     hybridSession.analysisConfig = structuredClone(config);
     hybridSession.setupDirty = false;
     hybridSession.setupDirtyMessage = '';
@@ -4459,9 +4630,9 @@ async function analyzeFromDialog() {
 
 async function finishMerge() {
     const error = byId('editor-composite-error');
-    const plan = hybridSession.plan;
     const modal = byId('editor-composite-modal');
-    if (!plan || !modal) return;
+    if (!modal || !requireCurrentCompositePlan()) return;
+    const plan = hybridSession.plan;
     const unresolved = hybridSession.plan.conflicts.filter(c => !c.resolution);
     if (unresolved.length) {
         if (error) error.textContent = `Finish the ${unresolved.length} remaining ${unresolved.length === 1 ? 'choice' : 'choices'} first.`;
@@ -4477,19 +4648,33 @@ async function finishMerge() {
         if (error) error.textContent = 'Another track already uses that name.';
         return;
     }
+    endCompositePreviewPlayback();
     const request = beginHybridCreation(hybridSession, {
-        sessionId: readCompositeEditorSnapshot().sessionId,
+        sessionId: hybridSession.planSessionId,
         plan,
     });
     if (!request) return;
     request.modal = modal;
     setCompositeCreationUi(true);
     if (error) error.textContent = 'Creating the new Hybrid Track…';
+    const creationRequestIsCurrent = () => {
+        const editor = readCompositeEditorSnapshot();
+        return editor.format === 'sloppak'
+            && editor.sessionId === hybridSession.planSessionId
+            && hybridCreationIsCurrent(hybridSession, request, {
+                sessionId: editor.sessionId,
+                plan: hybridSession.plan,
+            });
+    };
+    const editorStillOwnsCreation = () => {
+        const editor = readCompositeEditorSnapshot();
+        return editor.format === 'sloppak' && editor.sessionId === request.sessionId;
+    };
     const settleStaleCreation = () => {
         const ownedLifecycle = hybridSession.createRequestId === request.id;
         completeHybridCreation(hybridSession, request);
         if (!ownedLifecycle || byId('editor-composite-modal') !== modal) return;
-        if (!compositeEditorSessionIsCurrent(request.sessionId)) {
+        if (!editorStillOwnsCreation()) {
             closeCompositeModalImmediately(modal);
         } else {
             setCompositeCreationUi(false);
@@ -4504,27 +4689,21 @@ async function finishMerge() {
         // the Worker request or the functional local fallback can do heavy
         // materialization work.
         await waitForCompositeUiPaint();
-        if (!hybridCreationIsCurrent(hybridSession, request, {
-            sessionId: readCompositeEditorSnapshot().sessionId,
-            plan: hybridSession.plan,
-        }) || byId('editor-composite-modal') !== modal) {
+        if (!creationRequestIsCurrent()
+                || byId('editor-composite-modal') !== modal) {
             settleStaleCreation();
             return;
         }
         arrangement = await runHybridMaterializationTask(plan, name, {
             signal: request.controller.signal,
             onProgress: phase => {
-                if (!hybridCreationIsCurrent(hybridSession, request, {
-                    sessionId: readCompositeEditorSnapshot().sessionId,
-                    plan: hybridSession.plan,
-                }) || byId('editor-composite-modal') !== modal) return;
+                if (!creationRequestIsCurrent()
+                        || byId('editor-composite-modal') !== modal) return;
                 if (error) error.textContent = _compositeTaskPhaseLabelPure(phase);
             },
         });
-        if (!hybridCreationIsCurrent(hybridSession, request, {
-            sessionId: readCompositeEditorSnapshot().sessionId,
-            plan: hybridSession.plan,
-        }) || byId('editor-composite-modal') !== modal) {
+        if (!creationRequestIsCurrent()
+                || byId('editor-composite-modal') !== modal) {
             settleStaleCreation();
             return;
         }
@@ -4535,15 +4714,12 @@ async function finishMerge() {
         if (closeDecision) await closeDecision;
 
         const currentModal = byId('editor-composite-modal');
-        const requestIsCurrent = hybridCreationIsCurrent(hybridSession, request, {
-            sessionId: readCompositeEditorSnapshot().sessionId,
-            plan: hybridSession.plan,
-        });
+        const requestIsCurrent = creationRequestIsCurrent();
         if (!requestIsCurrent || currentModal !== modal) {
             const ownedLifecycle = hybridSession.createRequestId === request.id;
             completeHybridCreation(hybridSession, request);
             if (ownedLifecycle && currentModal === modal
-                    && !compositeEditorSessionIsCurrent(request.sessionId)) {
+                    && !editorStillOwnsCreation()) {
                 closeCompositeModalImmediately(modal);
             } else if (ownedLifecycle && currentModal === modal) {
                 setCompositeCreationUi(false);
@@ -4563,20 +4739,22 @@ async function finishMerge() {
             if (error) error.textContent = 'Another track started using that name while the Hybrid was being prepared. Choose a different name and try again.';
             return;
         }
+        if (!creationRequestIsCurrent()
+                || byId('editor-composite-modal') !== modal) {
+            settleStaleCreation();
+            return;
+        }
         commitCompositeArrangement(arrangement);
         completeHybridCreation(hybridSession, request);
         closeCompositeModalImmediately(modal);
         setCompositeEditorStatus(`Created Hybrid Track “${name}” with ${arrangement.notes.length} notes. Save the song when you are ready.`);
     } catch (cause) {
-        const requestIsCurrent = hybridCreationIsCurrent(hybridSession, request, {
-            sessionId: readCompositeEditorSnapshot().sessionId,
-            plan: hybridSession.plan,
-        });
+        const requestIsCurrent = creationRequestIsCurrent();
         if (!requestIsCurrent || byId('editor-composite-modal') !== modal) {
             const ownedLifecycle = hybridSession.createRequestId === request.id;
             completeHybridCreation(hybridSession, request);
             if (ownedLifecycle && byId('editor-composite-modal') === modal
-                    && !compositeEditorSessionIsCurrent(request.sessionId)) {
+                    && !editorStillOwnsCreation()) {
                 closeCompositeModalImmediately(modal);
             }
             return;
@@ -4603,17 +4781,61 @@ function setCompositeCreationUi(creating) {
     }
     const cancel = byId('editor-composite-cancel');
     if (cancel) cancel.textContent = creating ? 'Cancel creation' : 'Cancel';
+    updateCompositePreviewButtons();
 }
 
 function closeCompositeModalImmediately(modal = byId('editor-composite-modal')) {
-    // Commit the last slider/zoom/resize value before DOM teardown cancels its
-    // event stream. This also clears every pending persistence timer.
-    flushHybridPreviewPreferences();
-    cancelHybridAnalysis(hybridSession);
-    cancelHybridCreation(hybridSession);
-    disposeCompositePreviewSession();
-    modal?.remove();
+    // Clear state before removing the DOM so the last slider/zoom/resize value
+    // is committed while its controls still exist. clearTransientState owns
+    // cancellation and preview disposal; keeping one path makes teardown
+    // idempotent for close, screen reinjection, and stale-session failures.
     clearTransientState();
+    modal?.remove();
+}
+
+// The feature modal lives under <body>, outside the persistent Editor screen.
+// Suspending it when that screen becomes inactive preserves the in-progress
+// review while ensuring private audio and document-level shortcuts cannot leak
+// into another host screen.
+export function editorSuspendCompositeArrangementUi() {
+    endCompositePreviewPlayback();
+    cancelCompositeChoicePrompt();
+    stopCompositeModalDocumentKeyboard();
+    const modal = byId('editor-composite-modal');
+    if (!modal) return false;
+    const active = document.activeElement;
+    if (active && modal.contains(active)) active.blur?.();
+    modal.hidden = true;
+    modal.setAttribute('aria-hidden', 'true');
+    modal.dataset.editorScreenSuspended = 'true';
+    return true;
+}
+
+export function editorResumeCompositeArrangementUi() {
+    const modal = byId('editor-composite-modal');
+    if (!modal) {
+        stopCompositeModalDocumentKeyboard();
+        compositeModalSessionId = null;
+        return false;
+    }
+    const editor = readCompositeEditorSnapshot();
+    const planSessionId = hybridSession.plan ? hybridSession.planSessionId : null;
+    const sessionIsCurrent = _compositeModalSessionIsCurrentPure(
+        compositeModalSessionId, editor, planSessionId,
+    ) && (!hybridSession.plan || hybridPlanSessionIsCurrent(hybridSession, editor));
+    if (!sessionIsCurrent) {
+        closeCompositeModalImmediately(modal);
+        setCompositeEditorStatus(
+            'The open song changed, so Hybrid Track was closed. Open it again to continue.');
+        return false;
+    }
+    modal.hidden = false;
+    modal.removeAttribute('aria-hidden');
+    delete modal.dataset.editorScreenSuspended;
+    installCompositeModalDocumentKeyboard(modal);
+    recoverCompositeModalFocus(modal);
+    if (timelineViewportDom) scheduleCompositeTimelineViewport();
+    return true;
 }
 
 export async function editorHideCompositeArrangementModal() {
@@ -4634,7 +4856,7 @@ export async function editorHideCompositeArrangementModal() {
     hybridSession.closeDecisionPromise = closeDecision;
     hybridSession.closeDecisionResolve = settleCloseDecision;
     const creating = guardKind === 'creating';
-    const choice = await _editorPromptChoice({
+    const choice = await compositePromptChoice({
         title: creating ? 'Cancel Hybrid Track creation?' : 'Discard your Hybrid review?',
         message: creating
             ? 'The new track is still being prepared. Cancelling guarantees that this request cannot add a track later.'
@@ -4677,6 +4899,7 @@ function handleCompositeModalShortcut(event) {
         stage: hybridSession.stage,
         previewActive: hybridSession.previewPlaying || hybridSession.previewLoading,
         repeat: event.repeat,
+        transportAvailable: compositePreviewTransportAvailable(),
     });
     if (!action) return;
     if (action.kind === 'consume') {
@@ -4693,7 +4916,8 @@ function handleCompositeModalShortcut(event) {
         return;
     }
     if (action.kind === 'preview') {
-        const button = document.querySelector(
+        const result = byId('editor-composite-result-workspace');
+        const button = result?.querySelector(
             `[data-composite-preview="${action.mode}"]:not([disabled])`);
         if (!button) return;
         event.preventDefault();
@@ -4707,9 +4931,10 @@ function handleCompositeModalShortcut(event) {
         if (hybridSession.previewPlaying || hybridSession.previewLoading) {
             endCompositePreviewPlayback();
         } else {
-            const button = document.querySelector(
+            const result = byId('editor-composite-result-workspace');
+            const button = result?.querySelector(
                 `[data-composite-preview="${hybridSession.previewLastMode}"]:not([disabled])`)
-                || document.querySelector('[data-composite-preview]:not([disabled])');
+                || result?.querySelector('[data-composite-preview]:not([disabled])');
             if (button) toggleCompositePreview(button.dataset.compositePreview);
         }
         return;
@@ -4787,6 +5012,7 @@ export async function editorShowCompositeArrangementModal() {
     // is translated below the host chrome, so mounting there makes `inset:0`
     // extend past the bottom of the real window.
     document.body.appendChild(modal);
+    compositeModalSessionId = editor.sessionId;
     const dialog = byId('editor-composite-dialog');
     restoreHybridDialogSize(dialog);
     beginHybridDialogSizePersistence(dialog);

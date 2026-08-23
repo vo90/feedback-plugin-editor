@@ -1,8 +1,25 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 const read = relative => fs.readFileSync(new URL(`../${relative}`, import.meta.url), 'utf8');
+const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+
+function repositoryFiles(relativeDirectory) {
+    const root = path.join(repositoryRoot, relativeDirectory);
+    const files = [];
+    const walk = directory => {
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+            const absolute = path.join(directory, entry.name);
+            if (entry.isDirectory()) walk(absolute);
+            else files.push(path.relative(repositoryRoot, absolute).replaceAll('\\', '/'));
+        }
+    };
+    walk(root);
+    return files.sort();
+}
 
 test('Hybrid Track is lazy and leaves normal Editor startup feature-free', () => {
     const main = read('src/main.js');
@@ -21,6 +38,9 @@ test('Hybrid styling is a feature-owned, fully namespaced asset', () => {
     assert.doesNotMatch(theme, /editor-composite/,
         'the shared Editor theme must not contain Hybrid rules');
     assert.match(entry, /assets\/composite\/hybrid\.css/);
+    assert.match(entry,
+        /function editorTeardownCompositeArrangementUi[\s\S]*uninstallHybridPerformanceTools\(\)/,
+        'screen teardown must detach feature-owned diagnostics');
     assert.match(hybrid, /#editor-composite-modal/);
     const selectorsOnly = hybrid.replace(/\/\*[\s\S]*?\*\//g, '');
     for (const line of selectorsOnly.split(/\r?\n/)) {
@@ -36,10 +56,25 @@ test('Hybrid styling is a feature-owned, fully namespaced asset', () => {
 test('Hybrid creation uses normal Editor history without a private backend write', () => {
     const resolver = read('src/composite/resolver-ui.js');
     const adapter = read('src/composite/editor-adapter.js');
-    assert.doesNotMatch(resolver, /\/api\/plugins\/editor\/add-arrangement/);
     assert.match(resolver, /commitCompositeArrangement\(arrangement\)/);
     assert.match(adapter, /history\.exec\(command\)/,
         'the feature boundary must commit one undoable Editor command');
+
+    for (const file of repositoryFiles('src/composite').filter(name => name.endsWith('.js'))) {
+        const source = read(file);
+        assert.doesNotMatch(source,
+            /\bmethod\s*:\s*['"](?:POST|PUT|PATCH|DELETE)['"]/i,
+            `${file} must not write through the Editor backend`);
+        assert.doesNotMatch(source, /\bsendBeacon\s*\(/,
+            `${file} must not persist through a beacon`);
+        const endpoints = source.match(
+            /\/api\/plugins\/editor\/[A-Za-z0-9_./{}-]*/g,
+        ) || [];
+        for (const endpoint of endpoints) {
+            assert.ok(endpoint.startsWith('/api/plugins/editor/wafont/'),
+                `${file} reaches unexpected Editor endpoint ${endpoint}`);
+        }
+    }
 });
 
 test('Hybrid audition reaches Editor audio and loop state only through its adapter', () => {
@@ -54,10 +89,27 @@ test('Hybrid audition reaches Editor audio and loop state only through its adapt
         'the one explicit Editor-loop handoff stays visible at the boundary');
 });
 
-test('shared Editor modules never import the Hybrid feature', () => {
-    for (const file of ['src/audio.js', 'src/gm-guide.js', 'src/playability-lint.js']) {
+test('only the two deliberate normal-Editor hooks mention the Hybrid feature', () => {
+    const normalSources = repositoryFiles('src').filter(file =>
+        file.endsWith('.js') && !file.startsWith('src/composite/'));
+    const featureMarker = /\bHybrid\b|editorComposite|CompositeArrangement|editor-composite|['"]\.\/composite\//i;
+    const legacyCorePreviewHook = /editor(?:ClearGuidePreview|PlaybackVisualTime|PrepareGuidePreview|SetGuidePreview|UpdateGuidePreviewMix|WarmGuidePreview)/;
+    const mentioned = [];
+    for (const file of normalSources) {
         const source = read(file);
-        assert.doesNotMatch(source, /(?:from|import\()\s*['"]\.\/composite\//,
-            `${file} must not depend on the optional feature`);
+        if (featureMarker.test(source)) mentioned.push(file);
+        assert.doesNotMatch(source, legacyCorePreviewHook,
+            `${file} must not regain feature-specific preview policy`);
     }
+    assert.deepEqual(mentioned, ['src/main.js', 'src/menu-bar.js'],
+        'normal Editor integration is limited to the lazy command and its menu item');
+
+    const main = read('src/main.js');
+    assert.equal((main.match(/import\(['"]\.\/composite\/entry\.js['"]\)/g) || []).length, 1);
+    assert.doesNotMatch(main, /from ['"]\.\/composite\//,
+        'the normal startup graph must remain feature-free');
+    const menu = read('src/menu-bar.js');
+    assert.match(menu, /Create Hybrid Track…[^\n]+editorShowCompositeArrangementModal/);
+    assert.doesNotMatch(menu, /(?:from|import\()\s*['"]\.\/composite\//,
+        'the menu hook must not load implementation code');
 });

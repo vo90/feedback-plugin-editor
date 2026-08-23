@@ -6,6 +6,7 @@ import {
     compositeChordVoiceGainPure,
     compositeGuideEventsPure,
     compositeGuideGroupsInWindowPure,
+    compositeGuideLoopGroupsInWindowPure,
     compositeGuideScheduleWindowPure,
 } from '../src/composite/audition-guide-scheduler.js';
 import { FakeAudioContext } from './composite_audition_fakes.mjs';
@@ -46,6 +47,71 @@ test('guide event windows include the exact cursor and scale a chord at constant
     assert.deepEqual(groups[0].voices.map(voice => voice.midi), [64, 60],
         'one-millisecond chord buckets dedupe identical pitches');
     assert.equal(compositeChordVoiceGainPure(4, 0.5), 0.25);
+});
+
+test('guide loop projection schedules both sides of a boundary on exact sample anchors', () => {
+    const events = compositeGuideEventsPure([
+        { t: 1, midi: 60, sus: 0.1 },
+        { t: 1.15, midi: 62, sus: 0.1 },
+    ]);
+    const groups = compositeGuideLoopGroupsInWindowPure(events, 0, 0.3, {
+        cursorTime: 1.1,
+        loopStart: 1,
+        loopEnd: 1.2,
+    });
+    assert.deepEqual(groups.map(group => [group.elapsed, group.voices[0].midi]), [
+        [0.05, 62],
+        [0.1, 60],
+        [0.25, 62],
+    ]);
+
+    const context = new FakeAudioContext();
+    const scheduled = [];
+    const scheduler = new CompositeGuideScheduler({
+        context,
+        setIntervalFn: () => 8,
+        clearIntervalFn: () => {},
+        voice: options => {
+            scheduled.push(options);
+            return { until: options.when + 0.1, cancel() {} };
+        },
+    });
+    scheduler.configure({ events });
+    scheduler.start(1.1, {
+        endTime: 1.2,
+        startContextTime: 10,
+        loop: { enabled: true, startTime: 1, endTime: 1.2 },
+    });
+    assert.deepEqual(scheduled.map(item => item.when), [10.05, 10.1, 10.25]);
+    scheduler.destroy();
+});
+
+test('cleaned guide pass targets are reused so WebAudioFont envelopes stay bounded', () => {
+    const context = new FakeAudioContext();
+    const timeouts = timeoutHarness();
+    const targets = [];
+    const scheduler = new CompositeGuideScheduler({
+        context,
+        nowChart: () => 0,
+        chartToContext: value => value,
+        setIntervalFn: () => 10,
+        clearIntervalFn: () => {},
+        setTimeoutFn: (callback, delay) => timeouts.set(callback, delay),
+        clearTimeoutFn: id => timeouts.clear(id),
+        voice: options => {
+            targets.push(options.target);
+            return { until: 1, cancel() {} };
+        },
+    });
+    scheduler.configure({ events: [{ t: 0, midi: 60, sus: 1 }] });
+    scheduler.start(0, { endTime: 1 });
+    scheduler.stop();
+    timeouts.fire(timeouts.jobs[0]);
+    scheduler.start(0, { endTime: 1 });
+    assert.strictEqual(targets[1], targets[0]);
+    assert.equal(context.gains.length, 1,
+        'repeated transport passes do not create an unbounded target list');
+    scheduler.destroy();
 });
 
 test('guide scheduling retains the exact seek onset and cancels its voice generation', () => {

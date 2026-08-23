@@ -7,11 +7,12 @@
 
 import {
     _audioRegionPlacementsPure,
-    _declickEnvelopePure,
     _regionStartPure,
 } from '../audio.js';
 
 export const COMPOSITE_REFERENCE_DECLICK_SECONDS = 0.005;
+export const COMPOSITE_REFERENCE_STOP_FADE_SECONDS = 0.004;
+export const COMPOSITE_REFERENCE_CLEANUP_DELAY_MS = 8;
 
 function finite(value, fallback = 0) {
     const number = Number(value);
@@ -136,6 +137,7 @@ export function compositeReferencePlacementsPure(snapshot, cursorTime, {
                 ? regionRemaining : Math.max(0, ending - cursor - placement.delay);
             const duration = Math.min(regionRemaining, previewRemaining);
             if (!(duration > 0)) continue;
+            const mediaEnd = placement.offset + duration;
             out.push({
                 sourceId: source.id,
                 buffer: source.buffer,
@@ -145,6 +147,12 @@ export function compositeReferencePlacementsPure(snapshot, cursorTime, {
                 delay: placement.delay,
                 duration,
                 trimmed: region.srcIn > 0 || region.srcOut < bufferDuration,
+                // A seek into the middle of media and any stop before the
+                // natural buffer tail are artificial waveform cuts even when
+                // the authored region itself is the implicit full-file span.
+                // They need the same short edge treatment as authored trims.
+                fadeIn: placement.offset > 1e-6,
+                fadeOut: mediaEnd < bufferDuration - 1e-6,
                 chartStartTime: regionStart,
             });
         }
@@ -181,16 +189,51 @@ function stopNode(node) {
     try { node?.disconnect?.(); } catch (_) { /* already disconnected */ }
 }
 
+function boundaryEnvelope(startTime, duration, {
+    fadeIn = false,
+    fadeOut = false,
+    fadeSeconds = COMPOSITE_REFERENCE_DECLICK_SECONDS,
+} = {}) {
+    const start = Math.max(0, finite(startTime));
+    const length = Math.max(0, finite(duration));
+    const fade = Math.min(Math.max(0, finite(fadeSeconds)), length / 2);
+    const points = [{ t: start, gain: fadeIn ? 0 : 1 }];
+    if (fadeIn && fade > 0) points.push({ t: start + fade, gain: 1 });
+    if (fadeOut && fade > 0) {
+        const outStart = start + length - fade;
+        if (outStart > points[points.length - 1].t) {
+            points.push({ t: outStart, gain: 1 });
+        }
+        points.push({ t: start + length, gain: 0 });
+    }
+    return points;
+}
+
 export class CompositeReferenceMixer {
-    constructor({ context, target, fetchFn = globalThis.fetch?.bind(globalThis) } = {}) {
+    constructor({
+        context,
+        target,
+        fetchFn = globalThis.fetch?.bind(globalThis),
+        setTimeoutFn = globalThis.setTimeout?.bind(globalThis),
+        clearTimeoutFn = globalThis.clearTimeout?.bind(globalThis),
+        stopFadeSeconds = COMPOSITE_REFERENCE_STOP_FADE_SECONDS,
+        cleanupDelayMs = COMPOSITE_REFERENCE_CLEANUP_DELAY_MS,
+    } = {}) {
         if (!context) throw new Error('Hybrid reference mixer requires an AudioContext');
         this.context = context;
         this.target = target || context.destination;
         this.fetchFn = fetchFn;
+        this.setTimeoutFn = setTimeoutFn;
+        this.clearTimeoutFn = clearTimeoutFn;
+        this.stopFadeSeconds = Math.max(0, Math.min(0.02,
+            finite(stopFadeSeconds, COMPOSITE_REFERENCE_STOP_FADE_SECONDS)));
+        this.cleanupDelayMs = Math.max(0, Math.trunc(finite(
+            cleanupDelayMs, COMPOSITE_REFERENCE_CLEANUP_DELAY_MS)));
         this.decodedByUrl = new Map();
         this.fetchControllers = new Set();
         this.snapshot = compositeReferenceSnapshotPure();
         this.live = [];
+        this.retired = new Set();
         this.generation = 0;
         this.destroyed = false;
         this.failures = [];
@@ -231,7 +274,9 @@ export class CompositeReferenceMixer {
         const snapshot = compositeReferenceSnapshotPure(input);
         const failures = [];
         await Promise.all(snapshot.sources.map(async source => {
-            if (source.buffer || !source.url) return;
+            // A muted/soloed-away source cannot contribute to this immutable
+            // pass, so do not make Play wait for or report its unavailable URL.
+            if (!(source.gain > 0) || source.buffer || !source.url) return;
             try {
                 source.buffer = await this._decodeUrl(source.url);
             } catch (error) {
@@ -243,35 +288,115 @@ export class CompositeReferenceMixer {
         }
         this.failures = failures;
         this.snapshot = snapshot;
-        return { snapshot, failures: failures.slice() };
+        const requested = snapshot.sources.filter(source => source.gain > 0
+            && (source.buffer || source.url));
+        const playable = requested.filter(source => source.buffer);
+        if (requested.length && !playable.length && failures.length) {
+            const error = new Error('Hybrid preview could not load any audible reference audio');
+            error.failures = failures.slice();
+            throw error;
+        }
+        return {
+            snapshot,
+            failures: failures.slice(),
+            playableSourceCount: playable.length,
+        };
+    }
+
+    _cleanupBatch(batch) {
+        if (!batch) return;
+        for (const item of batch.items || []) {
+            stopNode(item.node);
+            try { item.regionGain?.disconnect?.(); } catch (_) { /* already disconnected */ }
+            try { item.sourceGain?.disconnect?.(); } catch (_) { /* already disconnected */ }
+        }
+        try { batch.outputGain?.disconnect?.(); } catch (_) { /* already disconnected */ }
+        batch.items = [];
+    }
+
+    _retireBatch(batch, immediate = false) {
+        if (!batch) return;
+        const now = Math.max(0, finite(this.context?.currentTime));
+        const fade = immediate ? 0 : this.stopFadeSeconds;
+        const parameter = batch.outputGain?.gain;
+        try {
+            parameter?.cancelScheduledValues?.(now);
+            parameter?.setValueAtTime?.(Math.max(0, finite(parameter.value, 1)), now);
+            if (fade > 0 && typeof parameter?.linearRampToValueAtTime === 'function') {
+                parameter.linearRampToValueAtTime(0, now + fade);
+            } else {
+                parameter?.setValueAtTime?.(0, now);
+            }
+        } catch (_) { /* node stop below remains the hard fallback */ }
+        for (const item of batch.items || []) {
+            try { item.node?.stop?.(now + fade); } catch (_) { /* already ended */ }
+        }
+        if (immediate || typeof this.setTimeoutFn !== 'function') {
+            this._cleanupBatch(batch);
+            return;
+        }
+        const job = { id: null, run: null };
+        job.run = () => {
+            if (!this.retired.delete(job)) return;
+            this._cleanupBatch(batch);
+        };
+        this.retired.add(job);
+        try {
+            job.id = this.setTimeoutFn(
+                job.run, Math.ceil(fade * 1000) + this.cleanupDelayMs);
+        } catch (_) {
+            this.retired.delete(job);
+            this._cleanupBatch(batch);
+        }
+    }
+
+    _pruneEnded() {
+        const now = Math.max(0, finite(this.context?.currentTime));
+        const keep = [];
+        for (const batch of this.live) {
+            if (Number.isFinite(Number(batch?.endsAt)) && Number(batch.endsAt) <= now) {
+                this._cleanupBatch(batch);
+            } else {
+                keep.push(batch);
+            }
+        }
+        this.live = keep;
     }
 
     schedule(cursorTime, {
         when = this.context.currentTime,
         endTime = Number.POSITIVE_INFINITY,
+        append = false,
     } = {}) {
         if (this.destroyed) return 0;
-        this.cancel();
+        if (append) this._pruneEnded();
+        else this.cancel();
         const placements = compositeReferencePlacementsPure(
             this.snapshot, cursorTime, { endTime });
+        const outputGain = this.context.createGain();
+        outputGain.gain.setValueAtTime(1, Math.max(0, finite(this.context.currentTime)));
+        outputGain.connect(this.target);
         const sourceGains = new Map();
+        const batch = { outputGain, items: [], endsAt: Math.max(0, finite(when)) };
         for (const placement of placements) {
             let sourceGain = sourceGains.get(placement.sourceId);
             if (!sourceGain) {
                 sourceGain = this.context.createGain();
                 sourceGain.gain.setValueAtTime(
                     placement.gain, Math.max(0, finite(when)));
-                sourceGain.connect(this.target);
+                sourceGain.connect(outputGain);
                 sourceGains.set(placement.sourceId, sourceGain);
             }
             const node = this.context.createBufferSource();
             node.buffer = placement.buffer;
             const startsAt = Math.max(0, finite(when)) + placement.delay;
             let regionGain = null;
-            if (placement.trimmed) {
+            if (placement.fadeIn || placement.fadeOut) {
                 regionGain = this.context.createGain();
-                const envelope = _declickEnvelopePure(
-                    startsAt, placement.duration, COMPOSITE_REFERENCE_DECLICK_SECONDS);
+                const envelope = boundaryEnvelope(startsAt, placement.duration, {
+                    fadeIn: placement.fadeIn,
+                    fadeOut: placement.fadeOut,
+                });
                 regionGain.gain.setValueAtTime(envelope[0].gain, envelope[0].t);
                 for (let index = 1; index < envelope.length; index++) {
                     regionGain.gain.linearRampToValueAtTime(
@@ -283,28 +408,35 @@ export class CompositeReferenceMixer {
                 node.connect(sourceGain);
             }
             node.start(startsAt, placement.offset, placement.duration);
-            this.live.push({ node, regionGain });
+            batch.items.push({ node, regionGain });
+            batch.endsAt = Math.max(batch.endsAt, startsAt + placement.duration);
         }
-        for (const gain of sourceGains.values()) this.live.push({ gain });
+        for (const sourceGain of sourceGains.values()) {
+            batch.items.push({ sourceGain });
+        }
+        if (placements.length) this.live.push(batch);
+        else this._cleanupBatch(batch);
         return placements.length;
     }
 
-    cancel() {
-        for (const item of this.live) {
-            stopNode(item.node);
-            try { item.regionGain?.disconnect?.(); } catch (_) { /* already disconnected */ }
-            try { item.gain?.disconnect?.(); } catch (_) { /* already disconnected */ }
-        }
+    cancel({ immediate = false } = {}) {
+        for (const batch of this.live) this._retireBatch(batch, immediate);
         this.live = [];
     }
 
     destroy() {
         if (this.destroyed) return;
-        this.cancel();
+        this.cancel({ immediate: true });
         this.destroyed = true;
         this.generation++;
         for (const controller of this.fetchControllers) controller.abort();
         this.fetchControllers.clear();
+        for (const job of [...this.retired]) {
+            if (job.id !== null && typeof this.clearTimeoutFn === 'function') {
+                try { this.clearTimeoutFn(job.id); } catch (_) { /* timer already fired */ }
+            }
+            job.run();
+        }
         this.decodedByUrl.clear();
         this.snapshot = compositeReferenceSnapshotPure();
         this.target = null;

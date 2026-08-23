@@ -126,3 +126,51 @@ test('reference mixer decodes missing URLs once and reports an isolated source f
     assert.equal(result.snapshot.sources[1].buffer, decoded);
     assert.deepEqual(result.failures.map(item => item.sourceId), ['bad']);
 });
+
+test('reference mixer rejects when every requested audible source fails', async () => {
+    const context = new FakeAudioContext();
+    const mixer = new CompositeReferenceMixer({
+        context,
+        fetchFn: async () => ({ ok: false }),
+    });
+    await assert.rejects(
+        mixer.prepare({ sources: [
+            { id: 'master', url: '/missing.ogg', gain: 1 },
+            { id: 'stem', url: '/also-missing.ogg', gain: 1 },
+        ] }),
+        error => error.message.includes('could not load any audible')
+            && error.failures.length === 2,
+    );
+    assert.equal(mixer.schedule(0), 0,
+        'a failed preparation cannot silently schedule an empty playing pass');
+    mixer.destroy();
+});
+
+test('reference seek/end cuts and explicit Stop receive short feature-owned fades', async () => {
+    const context = new FakeAudioContext();
+    const timers = [];
+    const mixer = new CompositeReferenceMixer({
+        context,
+        setTimeoutFn: (callback, delay) => {
+            timers.push({ callback, delay });
+            return timers.length;
+        },
+        clearTimeoutFn: () => {},
+    });
+    await mixer.prepare({ sources: [
+        { id: 'master', buffer: buffer(10), gain: 1 },
+    ] });
+    mixer.schedule(2, { when: 5, endTime: 4 });
+    const regionGain = context.gains.find(node => node.gain.events.some(
+        event => event.type === 'ramp' && event.time === 7));
+    assert.ok(regionGain, 'both artificial edges use a click-free envelope');
+    const outputGain = context.gains.find(node => node.connections.length
+        && node.connections[0] === context.destination);
+    mixer.cancel();
+    assert.equal(outputGain.gain.events.at(-1).type, 'ramp');
+    assert.equal(outputGain.gain.events.at(-1).value, 0);
+    assert.equal(outputGain.gain.events.at(-1).time, 0.004);
+    assert.equal(timers[0].delay, 12);
+    timers[0].callback();
+    mixer.destroy();
+});

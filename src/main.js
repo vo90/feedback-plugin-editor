@@ -682,6 +682,7 @@ window.editorNewTrackSetType = editorNewTrackSetType;
 window.editorNewTrackSetInstrument = editorNewTrackSetInstrument;
 window.editorNewTrackSetSource = editorNewTrackSetSource;
 window.editorNewTrackCreate = editorNewTrackCreate;
+/* @pure:hybrid-lazy-loader:start */
 let _hybridFeatureModule = null;
 let _hybridFeatureImport = null;
 let _hybridFeatureGeneration = 0;
@@ -715,10 +716,10 @@ window.editorShowCompositeArrangementModal = async () => {
     const generation = _hybridFeatureGeneration;
     try {
         const feature = await _loadHybridFeature();
-        if (generation !== _hybridFeatureGeneration) {
-            feature.editorTeardownCompositeArrangementUi?.();
-            return false;
-        }
+        // Importing the entry module has no UI side effects. A stale caller
+        // therefore owns nothing to tear down; touching the shared ESM
+        // singleton here could close a newer Editor injection's modal.
+        if (generation !== _hybridFeatureGeneration) return false;
         return await feature.editorShowCompositeArrangementModal();
     } catch (error) {
         if (generation !== _hybridFeatureGeneration) return false;
@@ -727,6 +728,7 @@ window.editorShowCompositeArrangementModal = async () => {
         return false;
     }
 };
+/* @pure:hybrid-lazy-loader:end */
 
 // Save-format modal (file-ops.js owns the logic; HTML calls these by name).
 window.editorHideSaveFormatModal = editorHideSaveFormatModal;

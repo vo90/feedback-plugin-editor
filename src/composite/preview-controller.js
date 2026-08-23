@@ -11,6 +11,7 @@ import { CompositeGuideScheduler } from './audition-guide-scheduler.js';
 import { CompositeReferenceMixer } from './audition-reference.js';
 
 export const COMPOSITE_PREVIEW_START_LEAD_SECONDS = 0.005;
+export const COMPOSITE_PREVIEW_REFERENCE_LOOP_AHEAD_CYCLES = 2;
 
 function finite(value, fallback = 0) {
     const number = Number(value);
@@ -25,16 +26,49 @@ function gainValue(value, fallback = 1, maximum = 4) {
 function volumeValue(value, fallback = 0.75) {
     const number = Number(value);
     if (!Number.isFinite(number)) return fallback;
-    // Existing Hybrid preferences are percentages; direct controller clients
-    // may use normalized 0..1 values.
-    return Math.max(0, Math.min(1, number > 1 ? number / 100 : number));
+    // Hybrid's public control is a percentage. Preserve fractional normalized
+    // values used by older direct callers, while resolving the one ambiguous
+    // endpoint in favour of the documented UI contract: 1 means 1%, not 100%.
+    const normalized = number > 0 && number < 1 ? number : number / 100;
+    return Math.max(0, Math.min(1, normalized));
 }
 
 export function compositePreviewOutputLatencyPure(context) {
     const output = Number(context?.outputLatency);
-    if (Number.isFinite(output) && output > 0) return output;
     const base = Number(context?.baseLatency);
-    return Number.isFinite(base) && base > 0 ? base : 0;
+    return (Number.isFinite(base) && base > 0 ? base : 0)
+        + (Number.isFinite(output) && output > 0 ? output : 0);
+}
+
+// getOutputTimestamp() reports the AudioContext frame currently reaching the
+// device. When supported it is more accurate than subtracting nominal latency,
+// especially for ASIO/device stacks whose buffering changes after startup.
+export function compositePreviewAudibleContextTimePure(context, heldLatency = 0, nowMs = null) {
+    const renderNow = Math.max(0, finite(context?.currentTime));
+    try {
+        const timestamp = context?.getOutputTimestamp?.();
+        const timestampTime = Number(timestamp?.contextTime);
+        if (Number.isFinite(timestampTime) && timestampTime >= 0) {
+            const stampMs = Number(timestamp?.performanceTime);
+            const wallMs = Number(nowMs);
+            const elapsed = Number.isFinite(stampMs) && Number.isFinite(wallMs)
+                ? Math.max(0, Math.min(250, wallMs - stampMs)) / 1000
+                : 0;
+            return Math.max(0, Math.min(renderNow, timestampTime + elapsed));
+        }
+    } catch (_) { /* fall back to nominal latency below */ }
+    return Math.max(0, renderNow - Math.max(0, finite(heldLatency)));
+}
+
+export function compositePreviewLoopTimePure(anchorChartTime, elapsedSeconds, loop = null) {
+    const anchor = Math.max(0, finite(anchorChartTime));
+    const elapsed = Math.max(0, finite(elapsedSeconds));
+    const start = Math.max(0, finite(loop?.startTime));
+    const end = Math.max(start, finite(loop?.endTime, start));
+    if (!loop?.enabled || !(end > start)) return anchor + elapsed;
+    const firstSpan = Math.max(0, end - anchor);
+    if (elapsed < firstSpan) return anchor + elapsed;
+    return start + ((elapsed - firstSpan) % (end - start));
 }
 
 // Paint/presentation time only. Scheduling continues to use the raw transport
@@ -103,6 +137,8 @@ export class CompositePreviewController {
         cancelAnimationFrameFn = globalThis.cancelAnimationFrame?.bind(globalThis),
         setIntervalFn = globalThis.setInterval?.bind(globalThis),
         clearIntervalFn = globalThis.clearInterval?.bind(globalThis),
+        performanceNowFn = globalThis.performance?.now
+            ? globalThis.performance.now.bind(globalThis.performance) : null,
         onStateChange = null,
         onTimeUpdate = null,
         modes = {},
@@ -124,6 +160,7 @@ export class CompositePreviewController {
         this.cancelAnimationFrameFn = cancelAnimationFrameFn;
         this.setIntervalFn = setIntervalFn;
         this.clearIntervalFn = clearIntervalFn;
+        this.performanceNowFn = performanceNowFn;
         this.onStateChange = typeof onStateChange === 'function' ? onStateChange : null;
         this.onTimeUpdate = typeof onTimeUpdate === 'function' ? onTimeUpdate : null;
         this.modes = new Map(Object.entries(modes || {}).map(
@@ -158,7 +195,11 @@ export class CompositePreviewController {
         this.generation = 0;
         this.destroyed = false;
         this.lastError = null;
-        this.loopRestartPending = false;
+        this.warnings = [];
+        this.referenceLoopNextWhen = null;
+        this.referenceLoopDuration = 0;
+        this.contextStateListener = null;
+        this.contextSinkListener = null;
     }
 
     _definition(mode = this.mode) {
@@ -193,20 +234,39 @@ export class CompositePreviewController {
         return Math.max(range.startTime, Math.min(range.endTime, finite(value, range.startTime)));
     }
 
+    _activeLoop(definition = this._definition()) {
+        if (!this.loop.enabled) return null;
+        const endTime = this._effectiveEnd(definition);
+        const startTime = this._effectiveLoopStart(definition);
+        return endTime > startTime
+            ? { enabled: true, startTime, endTime }
+            : null;
+    }
+
+    _rawElapsed() {
+        if (!this.playing || !this.context) return 0;
+        return Math.max(0, finite(this.context.currentTime) - this.anchorContextTime);
+    }
+
+    _presentationElapsed() {
+        if (!this.playing || !this.context) return 0;
+        let nowMs = null;
+        try { nowMs = this.performanceNowFn?.(); } catch (_) { /* timestamp remains usable */ }
+        const audibleContextTime = compositePreviewAudibleContextTimePure(
+            this.context, this.heldOutputLatency, nowMs);
+        return Math.max(0, audibleContextTime - this.anchorContextTime);
+    }
+
     _rawCurrentTime() {
         if (!this.playing || !this.context) return this.cursor;
-        return this.anchorChartTime + Math.max(0,
-            finite(this.context.currentTime) - this.anchorContextTime);
+        return compositePreviewLoopTimePure(
+            this.anchorChartTime, this._rawElapsed(), this._activeLoop());
     }
 
     _presentationCurrentTime() {
         if (!this.playing || !this.context) return this.cursor;
-        return compositePreviewPresentationTimePure(
-            this.anchorChartTime,
-            this.anchorContextTime,
-            this.context.currentTime,
-            this.heldOutputLatency,
-        );
+        return compositePreviewLoopTimePure(
+            this.anchorChartTime, this._presentationElapsed(), this._activeLoop());
     }
 
     isPlaying() {
@@ -235,6 +295,7 @@ export class CompositePreviewController {
             tone: this.tone.id,
             loop: { ...this.loop },
             error: this.lastError,
+            warnings: this.warnings.slice(),
         };
     }
 
@@ -305,12 +366,33 @@ export class CompositePreviewController {
         if (!context) throw new Error('Hybrid preview could not create an AudioContext');
         this.context = context;
         this._buildAudioGraph();
+        if (typeof context.addEventListener === 'function') {
+            this.contextStateListener = () => {
+                if (this.destroyed || !this.playing) return;
+                if (!['closed', 'interrupted', 'suspended'].includes(context.state)) return;
+                const at = this.currentTime();
+                this._haltAt(at);
+                this.lastError = new Error(
+                    'Hybrid preview stopped because the audio device was interrupted');
+                this._emitTime(this.cursor);
+                this._emitState();
+            };
+            this.contextSinkListener = () => {
+                if (this.playing) {
+                    this.heldOutputLatency = compositePreviewOutputLatencyPure(context);
+                }
+            };
+            context.addEventListener('statechange', this.contextStateListener);
+            context.addEventListener('sinkchange', this.contextSinkListener);
+        }
         return context;
     }
 
     _stopScheduled() {
         this.guideScheduler?.stop?.();
         this.referenceMixer?.cancel?.();
+        this.referenceLoopNextWhen = null;
+        this.referenceLoopDuration = 0;
     }
 
     _cancelFrame() {
@@ -331,24 +413,56 @@ export class CompositePreviewController {
 
     _presentationTick() {
         if (!this.playing || this.destroyed) return;
-        const raw = this._rawCurrentTime();
+        this._ensureReferenceLoopSchedule();
         const end = this._effectiveEnd();
-        if (end > 0 && raw >= end) {
-            if (this.loop.enabled && !this.loopRestartPending) {
-                this.loopRestartPending = true;
-                const restartAt = this._effectiveLoopStart();
-                this._emitTime(end);
-                this._beginAt(restartAt).finally(() => {
-                    this.loopRestartPending = false;
-                });
-                return;
-            }
+        if (!this._activeLoop() && end > 0
+                && this._presentationCurrentTime() >= end - 1e-6) {
             this._haltAt(end, { emit: true });
             return;
         }
         this.cursor = this.currentTime();
         this._emitTime(this.cursor);
         this._requestFrame();
+    }
+
+    _ensureReferenceLoopSchedule() {
+        if (!this.playing || !(this.referenceLoopDuration > 0)
+                || !Number.isFinite(this.referenceLoopNextWhen)
+                || this._definition()?.kind !== 'reference') return;
+        const loop = this._activeLoop();
+        if (!loop) return;
+        const horizon = Math.max(0, finite(this.context?.currentTime))
+            + this.referenceLoopDuration * COMPOSITE_PREVIEW_REFERENCE_LOOP_AHEAD_CYCLES;
+        let count = 0;
+        while (this.referenceLoopNextWhen <= horizon && count < 8) {
+            this.referenceMixer.schedule(loop.startTime, {
+                when: this.referenceLoopNextWhen,
+                endTime: loop.endTime,
+                append: true,
+            });
+            this.referenceLoopNextWhen += this.referenceLoopDuration;
+            count++;
+        }
+    }
+
+    _scheduleReferencePass(cursor, startAt, endTime, definition) {
+        this.referenceMixer.schedule(cursor, { when: startAt, endTime });
+        const loop = this._activeLoop(definition);
+        if (!loop) return;
+        this.referenceLoopDuration = loop.endTime - loop.startTime;
+        const boundary = startAt + Math.max(0, loop.endTime - cursor);
+        this.referenceLoopNextWhen = boundary;
+        // Queue complete future cycles before playback reaches the first edge.
+        // Their `when` anchors meet exactly, independent of frame cadence.
+        for (let count = 0;
+            count < COMPOSITE_PREVIEW_REFERENCE_LOOP_AHEAD_CYCLES; count++) {
+            this.referenceMixer.schedule(loop.startTime, {
+                when: this.referenceLoopNextWhen,
+                endTime: loop.endTime,
+                append: true,
+            });
+            this.referenceLoopNextWhen += this.referenceLoopDuration;
+        }
     }
 
     _haltAt(time, { emit = false } = {}) {
@@ -376,7 +490,12 @@ export class CompositePreviewController {
         this.playing = false;
         this.loading = true;
         this.lastError = null;
+        this.warnings = [];
         this.cursor = this._clampTime(rawTime, definition);
+        const pendingLoop = this._activeLoop(definition);
+        if (pendingLoop && !(this.cursor < pendingLoop.endTime)) {
+            this.cursor = pendingLoop.startTime;
+        }
         this._emitState();
         try {
             const context = await this._ensureContext();
@@ -392,7 +511,11 @@ export class CompositePreviewController {
             } else {
                 const supplied = typeof definition.snapshot === 'function'
                     ? definition.snapshot() : definition.snapshot || definition.reference || {};
-                await this.referenceMixer.prepare(supplied);
+                const result = await this.referenceMixer.prepare(supplied);
+                this.warnings = (result?.failures || []).map(item => ({
+                    sourceId: item.sourceId,
+                    message: item.error?.message || String(item.error || 'Audio source failed to load'),
+                }));
             }
             if (this.destroyed || generation !== this.generation) return false;
             const startAt = Math.max(0, finite(context.currentTime)) + this.startLeadSeconds;
@@ -415,9 +538,13 @@ export class CompositePreviewController {
                     voiceCap: definition.voiceCap,
                     baseGain: gainValue(definition.voiceGain, 0.5, 1),
                 });
-                this.guideScheduler.start(this.cursor, { endTime });
+                this.guideScheduler.start(this.cursor, {
+                    endTime,
+                    startContextTime: startAt,
+                    loop: this._activeLoop(definition),
+                });
             } else {
-                this.referenceMixer.schedule(this.cursor, { when: startAt, endTime });
+                this._scheduleReferencePass(this.cursor, startAt, endTime, definition);
             }
             this._emitTime(this.cursor);
             this._emitState();
@@ -428,6 +555,10 @@ export class CompositePreviewController {
             this.loading = false;
             this.playing = false;
             this.lastError = error instanceof Error ? error : new Error(String(error));
+            this.warnings = (error?.failures || []).map(item => ({
+                sourceId: item.sourceId,
+                message: item.error?.message || String(item.error || 'Audio source failed to load'),
+            }));
             this._stopScheduled();
             this._emitState();
             return false;
@@ -590,6 +721,16 @@ export class CompositePreviewController {
             try { node?.disconnect?.(); } catch (_) { /* context already closed */ }
         }
         const context = this.context;
+        if (context && typeof context.removeEventListener === 'function') {
+            if (this.contextStateListener) {
+                context.removeEventListener('statechange', this.contextStateListener);
+            }
+            if (this.contextSinkListener) {
+                context.removeEventListener('sinkchange', this.contextSinkListener);
+            }
+        }
+        this.contextStateListener = null;
+        this.contextSinkListener = null;
         this.context = null;
         if (context && context.state !== 'closed' && typeof context.close === 'function') {
             try { await context.close(); } catch (_) { /* browser already closed it */ }

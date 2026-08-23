@@ -10,8 +10,11 @@ import {
     hybridPerfSample,
     hybridPerfSummaryPure,
     hybridPerformanceAssessmentPure,
+    hybridPerformanceEnabled,
     hybridPerformanceSnapshot,
+    installHybridPerformanceTools,
     setHybridPerformanceEnabled,
+    uninstallHybridPerformanceTools,
 } from '../src/composite/performance.js';
 
 test.afterEach(() => {
@@ -82,6 +85,55 @@ test('Hybrid telemetry records timings, counters, and gauges in memory only', ()
     assert.equal(snapshot.timings['timeline.renderMs'].p95, 18);
     assert.equal(snapshot.counters['guide.dropped'], 3);
     assert.equal(snapshot.gauges['timeline.nodes'], 975);
+});
+
+test('Hybrid diagnostic teardown detaches its observer and API without forgetting opt-in', () => {
+    const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const observerDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'PerformanceObserver');
+    const instances = [];
+    class FakePerformanceObserver {
+        static supportedEntryTypes = ['longtask'];
+        constructor(callback) {
+            this.callback = callback;
+            this.disconnected = 0;
+            this.observed = [];
+            instances.push(this);
+        }
+        observe(options) { this.observed.push(options); }
+        disconnect() { this.disconnected++; }
+    }
+    const fakeWindow = {};
+    Object.defineProperty(globalThis, 'window', {
+        configurable: true, writable: true, value: fakeWindow,
+    });
+    Object.defineProperty(globalThis, 'PerformanceObserver', {
+        configurable: true, writable: true, value: FakePerformanceObserver,
+    });
+    try {
+        setHybridPerformanceEnabled(true);
+        assert.equal(instances.length, 1);
+        assert.deepEqual(instances[0].observed, [{ type: 'longtask', buffered: true }]);
+        assert.equal(typeof fakeWindow.editorHybridPerformance?.snapshot, 'function');
+
+        uninstallHybridPerformanceTools();
+        assert.equal(instances[0].disconnected, 1);
+        assert.equal('editorHybridPerformance' in fakeWindow, false);
+        assert.equal(hybridPerformanceEnabled(), true,
+            'screen teardown must not clear the developer opt-in');
+
+        assert.equal(installHybridPerformanceTools(), true);
+        assert.equal(instances.length, 2, 'a later workspace installs a fresh observer');
+        assert.equal(typeof fakeWindow.editorHybridPerformance?.snapshot, 'function');
+    } finally {
+        uninstallHybridPerformanceTools();
+        if (windowDescriptor) Object.defineProperty(globalThis, 'window', windowDescriptor);
+        else delete globalThis.window;
+        if (observerDescriptor) {
+            Object.defineProperty(globalThis, 'PerformanceObserver', observerDescriptor);
+        } else {
+            delete globalThis.PerformanceObserver;
+        }
+    }
 });
 
 test('Hybrid frame traces reset between stopped preview sessions', () => {

@@ -41,8 +41,16 @@ Wen (MIT), fetched from `surikov.github.io` (the original defaults and kit on
 - `WebAudioFontPlayer.js` (~122 KB) — the WebAudioFont player.
 - `0000_FluidR3_GM_sf2_file.js` (~1.2 MB) — Grand piano, the keys default.
 - `0270_FluidR3_GM_sf2_file.js` (~250 KB) — Clean electric, the guitar default.
-- `0290_FluidR3_GM_sf2_file.js` (~830 KB) — Overdriven guitar, the Hybrid preview's Edge tone.
-- `0300_FluidR3_GM_sf2_file.js` (~763 KB) — Distortion guitar, the Hybrid preview's Distortion tone.
+- `0290_FluidR3_GM_sf2_file.js` (~830 KB) — Overdriven guitar, the Hybrid
+  preview's Edge tone. Source:
+  `https://surikov.github.io/webaudiofontdata/sound/0290_FluidR3_GM_sf2_file.js`;
+  SHA-256 of the vendored bytes:
+  `31e4313d80838b4430255e021061d5f5a236322db50245ce63585bb4f5da03a6`.
+- `0300_FluidR3_GM_sf2_file.js` (~763 KB) — Distortion guitar, the Hybrid
+  preview's Distortion tone. Source:
+  `https://surikov.github.io/webaudiofontdata/sound/0300_FluidR3_GM_sf2_file.js`;
+  SHA-256 of the vendored bytes:
+  `6cb34e1813daafde46e305b1751642c7b22faa614aa60e3cad13c92b15f67562`.
 - `0330_FluidR3_GM_sf2_file.js` (~440 KB) — Fingered, the bass default.
 
 - `128{36,37,38,41,42,44,45,46,47,49,50,51,52,53,55,56,57}_0_FluidR3_GM_sf2_file.js`

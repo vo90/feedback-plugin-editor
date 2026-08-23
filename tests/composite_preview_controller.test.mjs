@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
     CompositePreviewController,
+    compositePreviewAudibleContextTimePure,
+    compositePreviewLoopTimePure,
     compositePreviewOutputLatencyPure,
     compositePreviewPresentationTimePure,
 } from '../src/composite/preview-controller.js';
@@ -149,24 +151,37 @@ test('presentation time holds output latency per pass while scheduling stays raw
     const fixture = controllerFixture();
     fixture.context.outputLatency = 0.08;
     fixture.context.baseLatency = 0.02;
-    assert.equal(compositePreviewOutputLatencyPure(fixture.context), 0.08);
+    assert.equal(compositePreviewOutputLatencyPure(fixture.context), 0.1,
+        'render and device latency are sequential and therefore additive');
     assert.equal(compositePreviewOutputLatencyPure({ baseLatency: 0.02 }), 0.02);
     assert.equal(compositePreviewPresentationTimePure(5, 10, 10, 0.08), 5,
         'latency never paints behind a new seek anchor');
     await fixture.controller.start();
     fixture.context.currentTime = 1.005;
     assert.ok(Math.abs(fixture.controller.transportTime() - 1) < 1e-9);
-    assert.ok(Math.abs(fixture.controller.presentationTime() - 0.92) < 1e-9);
+    assert.ok(Math.abs(fixture.controller.presentationTime() - 0.9) < 1e-9);
     assert.ok(Math.abs(fixture.guide().options.nowChart() - 1) < 1e-9,
         'the guide scheduler retains the uncompensated sample clock');
     fixture.context.outputLatency = 0.2;
-    assert.ok(Math.abs(fixture.controller.presentationTime() - 0.92) < 1e-9,
+    assert.ok(Math.abs(fixture.controller.presentationTime() - 0.9) < 1e-9,
         'a pass holds its sampled latency instead of shimmering frame to frame');
     fixture.controller.stop();
     await fixture.controller.start();
     fixture.context.currentTime = 2.01;
-    assert.ok(Math.abs(fixture.controller.presentationTime() - 1.72) < 1e-9,
+    assert.ok(Math.abs(fixture.controller.presentationTime() - 1.68) < 1e-9,
         'the next start samples the newly reported output latency');
+});
+
+test('output timestamps override nominal latency without moving ahead of render time', () => {
+    const context = new FakeAudioContext({
+        outputTimestamp: { contextTime: 2.8, performanceTime: 1_000 },
+    });
+    context.currentTime = 3;
+    assert.ok(Math.abs(compositePreviewAudibleContextTimePure(
+        context, 0.5, 1_010) - 2.81) < 1e-9);
+    context.outputTimestamp = { contextTime: 4, performanceTime: 1_000 };
+    assert.equal(compositePreviewAudibleContextTimePure(context, 0.5, 1_010), 3,
+        'a buggy future device timestamp is clamped to the render clock');
 });
 
 test('controller seek/restart/mode/tone/mix operations preserve one authoritative cursor', async () => {
@@ -191,6 +206,9 @@ test('controller seek/restart/mode/tone/mix operations preserve one authoritativ
     assert.equal(controller.referenceGain.gain.value, 0.8);
     assert.ok(controller.guideGain.gain.value < 0.6,
         'distortion tone trim is applied after the common guide mix');
+    assert.equal(controller.setMix({ volume: 1 }).volume, 0.01,
+        'the public 1% volume value cannot become full scale');
+    assert.equal(controller.masterGain.gain.value, 0.01);
     controller.stop();
     await controller.seek(8);
     assert.equal(await controller.restart(), true);
@@ -207,8 +225,10 @@ test('controller loops and reaches EOF through its own frame clock', async () =>
     raf.step();
     await flush();
     assert.equal(controller.isPlaying(), true);
-    assert.equal(controller.currentTime(), 1,
-        'loop wrap establishes a fresh private transport anchor');
+    assert.ok(Math.abs(controller.currentTime() - 1.045) < 1e-9,
+        'loop time wraps continuously without a frame-clock restart');
+    assert.equal(fixture.guide().starts.length, 1,
+        'crossing a loop boundary keeps the original sample-clock pass');
     const startsBeforeLoopOff = fixture.guide().starts.length;
     controller.setLoop(false);
     await flush();
@@ -219,6 +239,84 @@ test('controller loops and reaches EOF through its own frame clock', async () =>
     raf.step();
     assert.equal(controller.isPlaying(), false);
     assert.equal(controller.currentTime(), 5, 'EOF leaves the marker at the song end');
+});
+
+test('latency-delayed EOF remains playing until the final audio reaches the device', async () => {
+    const fixture = controllerFixture({ endTime: 1 });
+    fixture.context.baseLatency = 0.02;
+    fixture.context.outputLatency = 0.08;
+    await fixture.controller.start();
+    fixture.context.currentTime = 1.005;
+    fixture.raf.step();
+    assert.equal(fixture.controller.isPlaying(), true,
+        'raw scheduling EOF must not stop the audible presentation early');
+    assert.ok(Math.abs(fixture.controller.currentTime() - 0.9) < 1e-9);
+    fixture.context.currentTime = 1.105;
+    fixture.raf.step();
+    assert.equal(fixture.controller.isPlaying(), false);
+    assert.equal(fixture.controller.currentTime(), 1);
+});
+
+test('reference loops pre-schedule exact adjacent anchors without rAF restarts', async () => {
+    const fixture = controllerFixture({ mode: 'song', endTime: 5 });
+    fixture.controller.setLoop({ enabled: true, startTime: 1, endTime: 2 });
+    await fixture.controller.seek(1.8);
+    assert.equal(await fixture.controller.start(), true);
+    const schedules = fixture.reference().schedules;
+    assert.deepEqual(schedules.slice(0, 3).map(item => ({
+        time: item.time,
+        when: Math.round(item.options.when * 1000) / 1000,
+        append: item.options.append || false,
+    })), [
+        { time: 1.8, when: 0.005, append: false },
+        { time: 1, when: 0.205, append: true },
+        { time: 1, when: 1.205, append: true },
+    ]);
+    fixture.context.currentTime = 0.255;
+    fixture.raf.step();
+    assert.equal(fixture.controller.isPlaying(), true);
+    assert.ok(Math.abs(fixture.controller.currentTime() - 1.05) < 1e-9);
+});
+
+test('a total reference preparation failure never enters playing state', async () => {
+    const failure = new Error('all reference sources failed');
+    failure.failures = [{ sourceId: 'master', error: new Error('decode failed') }];
+    let schedules = 0;
+    const fixture = controllerFixture({
+        mode: 'song',
+        referenceMixerFactory: () => ({
+            async prepare() { throw failure; },
+            schedule() { schedules++; },
+            cancel() {},
+            destroy() {},
+        }),
+    });
+    assert.equal(await fixture.controller.start(), false);
+    assert.equal(fixture.controller.isPlaying(), false);
+    assert.equal(fixture.controller.state().error, failure);
+    assert.equal(fixture.controller.state().warnings[0].sourceId, 'master');
+    assert.equal(schedules, 0);
+});
+
+test('an audio-device interruption stops the private pass and reports an error', async () => {
+    const fixture = controllerFixture();
+    await fixture.controller.start();
+    fixture.context.currentTime = 0.505;
+    fixture.context.state = 'interrupted';
+    fixture.context.emit('statechange');
+    assert.equal(fixture.controller.isPlaying(), false);
+    assert.ok(fixture.controller.state().error.message.includes('audio device'));
+    assert.equal(fixture.controller.currentTime(), 0.5);
+    await fixture.controller.destroy();
+    assert.equal(fixture.context.listeners.get('statechange').size, 0);
+    assert.equal(fixture.context.listeners.get('sinkchange').size, 0);
+});
+
+test('loop time projection keeps the initial tail and every later cycle contiguous', () => {
+    const loop = { enabled: true, startTime: 1, endTime: 2 };
+    assert.equal(compositePreviewLoopTimePure(1.8, 0.199, loop), 1.999);
+    assert.equal(compositePreviewLoopTimePure(1.8, 0.2, loop), 1);
+    assert.equal(compositePreviewLoopTimePure(1.8, 1.2, loop), 1);
 });
 
 test('mode generation replaces stale loading audio with the newly selected mode', async () => {

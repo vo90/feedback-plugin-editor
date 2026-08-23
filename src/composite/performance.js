@@ -18,6 +18,7 @@ const telemetry = {
     gauges: new Map(),
     frames: new Map(),
     observer: null,
+    api: null,
 };
 
 function storedEnabled() {
@@ -221,6 +222,22 @@ function disconnectLongTaskObserver() {
     telemetry.observer = null;
 }
 
+// Screen teardown should detach feature-owned diagnostics without changing the
+// developer's opt-in. A later Hybrid workspace can install a fresh observer
+// and API while hybridPerformanceEnabled() keeps the same remembered value.
+export function uninstallHybridPerformanceTools() {
+    disconnectLongTaskObserver();
+    const api = telemetry.api;
+    const target = typeof globalThis.window !== 'undefined' ? globalThis.window : null;
+    if (target && api && target.editorHybridPerformance === api) {
+        try { delete target.editorHybridPerformance; }
+        catch (_) {
+            try { target.editorHybridPerformance = undefined; } catch (_) { /* diagnostic only */ }
+        }
+    }
+    telemetry.api = null;
+}
+
 export function setHybridPerformanceEnabled(enabled) {
     telemetry.enabled = !!enabled;
     globalThis.__EDITOR_HYBRID_PERF__ = !!enabled;
@@ -243,19 +260,22 @@ export function installHybridPerformanceTools() {
         } catch (_) { disconnectLongTaskObserver(); }
     }
     if (typeof globalThis.window !== 'undefined') {
-        globalThis.window.editorHybridPerformance = Object.freeze({
-            snapshot: hybridPerformanceSnapshot,
-            assess: hybridPerformanceAssessment,
-            reset: resetHybridPerformanceTelemetry,
-            enable: setHybridPerformanceEnabled,
-        });
+        if (!telemetry.api) {
+            telemetry.api = Object.freeze({
+                snapshot: hybridPerformanceSnapshot,
+                assess: hybridPerformanceAssessment,
+                reset: resetHybridPerformanceTelemetry,
+                enable: setHybridPerformanceEnabled,
+            });
+        }
+        globalThis.window.editorHybridPerformance = telemetry.api;
     }
     return true;
 }
 
 // Test seam: reset the cached opt-in decision without requiring a DOM.
 export function _resetHybridPerformanceForTest() {
-    disconnectLongTaskObserver();
+    uninstallHybridPerformanceTools();
     telemetry.enabled = null;
     resetHybridPerformanceTelemetry();
 }

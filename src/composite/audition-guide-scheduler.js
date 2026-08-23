@@ -85,6 +85,62 @@ export function compositeGuideScheduleWindowPure(nowChart, scheduledUntil, {
     };
 }
 
+// Project chart events onto an elapsed, monotonically increasing loop clock.
+// The first segment runs from the requested cursor to loopEnd; every later
+// segment starts at loopStart. This lets Web Audio queue both sides of a loop
+// boundary on one sample-clock pass instead of restarting from requestAnimationFrame.
+export function compositeGuideLoopGroupsInWindowPure(events, from, to, {
+    cursorTime = 0,
+    loopStart = 0,
+    loopEnd = 0,
+    voiceCap = 6,
+} = {}) {
+    if (!Array.isArray(events) || !events.length || !(to > from)) return [];
+    const cursor = finite(cursorTime);
+    const end = finite(loopEnd);
+    const start = Math.max(0, Math.min(end, finite(loopStart)));
+    const period = end - start;
+    if (!(period > 0)) return [];
+    const firstSpan = Math.max(0, end - cursor);
+    const groups = [];
+    const boundedFrom = Math.max(0, finite(from));
+    const boundedTo = Math.max(boundedFrom, finite(to));
+    const append = (chartFrom, chartTo, elapsedBase, chartBase, cycleKey) => {
+        if (!(chartTo > chartFrom)) return;
+        for (const group of compositeGuideGroupsInWindowPure(
+                events, chartFrom, chartTo, voiceCap)) {
+            groups.push({
+                ...group,
+                elapsed: Math.round((elapsedBase + (group.t - chartBase)) * 1e9) / 1e9,
+                key: `${cycleKey}:${group.key}`,
+            });
+        }
+    };
+
+    if (boundedFrom < firstSpan) {
+        const segmentFrom = boundedFrom;
+        const segmentTo = Math.min(firstSpan, boundedTo);
+        append(cursor + segmentFrom, cursor + segmentTo, 0, cursor, 'first');
+    }
+    if (boundedTo > firstSpan) {
+        const repeatFrom = Math.max(firstSpan, boundedFrom);
+        let cycle = Math.max(0, Math.floor((repeatFrom - firstSpan) / period));
+        // A lookahead normally spans at most one or two cycles. The bound is a
+        // defensive guard against a malformed sub-millisecond loop.
+        for (let count = 0; count < 2048; count++, cycle++) {
+            const cycleElapsed = firstSpan + cycle * period;
+            if (cycleElapsed >= boundedTo) break;
+            const localFrom = Math.max(0, repeatFrom - cycleElapsed);
+            const localTo = Math.min(period, boundedTo - cycleElapsed);
+            append(start + localFrom, start + localTo,
+                cycleElapsed, start, `loop-${cycle}`);
+        }
+    }
+    return groups.filter(group => group.elapsed >= boundedFrom - 1e-9
+        && group.elapsed < boundedTo - 1e-9).sort((left, right) => left.elapsed - right.elapsed
+        || left.t - right.t || String(left.key).localeCompare(String(right.key)));
+}
+
 function cancelVoice(voice) {
     try {
         if (typeof voice?.cancel === 'function') voice.cancel();
@@ -138,11 +194,15 @@ export class CompositeGuideScheduler {
         this.voiceCap = 6;
         this.baseGain = 0.5;
         this.endTime = Number.POSITIVE_INFINITY;
+        this.loop = null;
+        this.startContextTime = 0;
+        this.cursorTime = 0;
         this.scheduledUntil = 0;
         this.includeCursor = false;
         this.lastBucketKey = null;
         this.voices = [];
         this.activePass = null;
+        this.passPool = [];
         this.retiredCleanups = new Set();
         this.timer = null;
         this.running = false;
@@ -165,13 +225,24 @@ export class CompositeGuideScheduler {
         return true;
     }
 
-    start(cursorTime, { endTime = Number.POSITIVE_INFINITY } = {}) {
+    start(cursorTime, {
+        endTime = Number.POSITIVE_INFINITY,
+        startContextTime = this.context.currentTime,
+        loop = null,
+    } = {}) {
         if (this.destroyed) return false;
         this.stop();
         this.running = true;
         this.endTime = Number.isFinite(Number(endTime))
             ? Number(endTime) : Number.POSITIVE_INFINITY;
-        this.scheduledUntil = Math.max(0, finite(cursorTime));
+        this.cursorTime = Math.max(0, finite(cursorTime));
+        const loopStart = Math.max(0, finite(loop?.startTime));
+        this.loop = loop && loop.enabled !== false && this.endTime > loopStart
+            ? { startTime: loopStart, endTime: this.endTime }
+            : null;
+        this.startContextTime = Math.max(0, finite(
+            startContextTime, this.context.currentTime));
+        this.scheduledUntil = this.loop ? 0 : this.cursorTime;
         this.includeCursor = true;
         this.lastBucketKey = null;
         this.generation++;
@@ -198,12 +269,14 @@ export class CompositeGuideScheduler {
             return false;
         });
         pass.voices = this.voices;
-        const now = Math.max(0, finite(this.nowChart()));
+        const now = this.loop
+            ? Math.max(0, contextNow - this.startContextTime)
+            : Math.max(0, finite(this.nowChart()));
         const window = compositeGuideScheduleWindowPure(now, this.scheduledUntil, {
             includeCursor: this.includeCursor,
             lookahead: this.lookahead,
             lateRecovery: this.lateRecovery,
-            endTime: this.endTime,
+            endTime: this.loop ? Number.POSITIVE_INFINITY : this.endTime,
         });
         if (!(window.to > window.from)) {
             this.includeCursor = false;
@@ -211,13 +284,24 @@ export class CompositeGuideScheduler {
         }
         const generation = this.generation;
         let scheduled = 0;
-        for (const group of compositeGuideGroupsInWindowPure(
-                this.events, window.from, window.to, this.voiceCap)) {
+        const groups = this.loop
+            ? compositeGuideLoopGroupsInWindowPure(
+                this.events, window.from, window.to, {
+                    cursorTime: this.cursorTime,
+                    loopStart: this.loop.startTime,
+                    loopEnd: this.loop.endTime,
+                    voiceCap: this.voiceCap,
+                })
+            : compositeGuideGroupsInWindowPure(
+                this.events, window.from, window.to, this.voiceCap);
+        for (const group of groups) {
             if (generation !== this.generation || !this.running) break;
             if (group.key === this.lastBucketKey) continue;
             this.lastBucketKey = group.key;
-            const when = Math.max(contextNow, finite(
-                this.chartToContext(group.t), contextNow));
+            const desiredWhen = this.loop
+                ? this.startContextTime + group.elapsed
+                : this.chartToContext(group.t);
+            const when = Math.max(contextNow, finite(desiredWhen, contextNow));
             const voiceGain = compositeChordVoiceGainPure(
                 group.voices.length, this.baseGain);
             for (const event of group.voices) {
@@ -255,10 +339,15 @@ export class CompositeGuideScheduler {
     }
 
     _createPass(generation) {
-        let node = null;
+        let node = this.passPool.pop() || null;
         try {
-            if (typeof this.context?.createGain === 'function') {
+            if (!node && typeof this.context?.createGain === 'function') {
                 node = this.context.createGain();
+            }
+            if (node) {
+                const now = Math.max(0, finite(this.context?.currentTime));
+                node.gain?.cancelScheduledValues?.(now);
+                node.gain?.setValueAtTime?.(1, now);
                 node.connect(this.target);
             }
         } catch (_) {
@@ -313,7 +402,12 @@ export class CompositeGuideScheduler {
         if (!pass?.disconnected) {
             try { pass?.node?.disconnect?.(); } catch (_) { /* already disconnected */ }
         }
-        if (pass) pass.voices = [];
+        if (pass) {
+            pass.voices = [];
+            if (pass.node && !this.destroyed && this.passPool.length < 4) {
+                this.passPool.push(pass.node);
+            }
+        }
     }
 
     _deferPassCleanup(pass) {
@@ -408,6 +502,10 @@ export class CompositeGuideScheduler {
         if (contextWillClose) this._discardRetiredCleanups();
         else this._flushRetiredCleanups();
         this.events = [];
+        for (const node of this.passPool) {
+            try { node?.disconnect?.(); } catch (_) { /* already disconnected */ }
+        }
+        this.passPool = [];
         this.target = null;
     }
 }

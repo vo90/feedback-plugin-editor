@@ -7,6 +7,7 @@
 export function createHybridBuilderSession() {
     return {
         plan: null,
+        planSessionId: null,
         planRevision: 0,
         resolutionRevision: 0,
         viewRevision: 0,
@@ -99,13 +100,20 @@ export function cancelHybridAnalysis(session) {
     return wasAnalyzing;
 }
 
-export function installHybridPlan(session, plan) {
+export function installHybridPlan(session, plan, sessionId = null) {
     if (!session) return 0;
     session.plan = plan || null;
+    session.planSessionId = session.plan && sessionId ? sessionId : null;
     session.planRevision++;
     session.resolutionRevision = 0;
     session.viewRevision++;
     return session.planRevision;
+}
+
+export function hybridPlanSessionIsCurrent(session, { sessionId, format } = {}) {
+    return !!(session?.plan && session.planSessionId
+        && session.planSessionId === sessionId
+        && format === 'sloppak');
 }
 
 export function markHybridResolutionChanged(session) {
