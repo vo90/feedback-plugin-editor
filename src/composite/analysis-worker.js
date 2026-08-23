@@ -38,18 +38,19 @@ function workerError(cause) {
 
 // Guarded so importing the pure dispatcher on Window (analysis-runner's local
 // fallback) never replaces the application's global message handler.
-const hybridWorkerScope = typeof WorkerGlobalScope !== 'undefined'
-    && typeof self !== 'undefined' && self instanceof WorkerGlobalScope;
+const hybridWorkerType = globalThis.WorkerGlobalScope;
+const hybridWorkerScope = typeof hybridWorkerType === 'function'
+    && globalThis instanceof hybridWorkerType;
 if (hybridWorkerScope) {
-    self.onmessage = async (event) => {
+    globalThis.onmessage = async (event) => {
         const request = event?.data || {};
         if (!request.id) return;
         try {
-            self.postMessage({ id: request.id, kind: 'progress', phase: request.action });
+            globalThis.postMessage({ id: request.id, kind: 'progress', phase: request.action });
             const result = await runHybridWorkerTaskPure(request.action, request.payload);
-            self.postMessage({ id: request.id, kind: 'result', result });
+            globalThis.postMessage({ id: request.id, kind: 'result', result });
         } catch (cause) {
-            self.postMessage({ id: request.id, kind: 'error', error: workerError(cause) });
+            globalThis.postMessage({ id: request.id, kind: 'error', error: workerError(cause) });
         }
     };
 }

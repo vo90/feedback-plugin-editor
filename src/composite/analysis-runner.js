@@ -4,7 +4,7 @@ import { hybridPerfCount, hybridPerfEnd, hybridPerfStart } from './performance.j
 let nextRequestId = 0;
 
 function abortError() {
-    try { return new DOMException('Hybrid task cancelled', 'AbortError'); }
+    try { return new globalThis.DOMException('Hybrid task cancelled', 'AbortError'); }
     catch (_) {
         const error = new Error('Hybrid task cancelled');
         error.name = 'AbortError';
@@ -13,8 +13,8 @@ function abortError() {
 }
 
 function defaultWorkerFactory() {
-    if (typeof Worker !== 'function') return null;
-    return new Worker(new URL('./analysis-worker.js', import.meta.url), {
+    if (typeof globalThis.Worker !== 'function') return null;
+    return new globalThis.Worker(new URL('./analysis-worker.js', import.meta.url), {
         type: 'module',
         name: 'feedback-hybrid-analysis',
     });
