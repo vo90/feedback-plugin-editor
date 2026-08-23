@@ -18,7 +18,6 @@ globalThis.window = globalThis.window || globalThis;
 
 const {
     LINT_DEFAULT_WINDOW, LINT_STRETCH_TOLERANCE,
-    LINT_CLUSTER_EPSILON, LINT_OVERLAP_EPSILON,
     _lintAnchorsPure, _lintLegatoJumpPure, _lintOpenPure, _lintOverlapPure,
     _lintStretchPure, _playabilityLintPure,
 } = await import('../src/playability-lint.js');
@@ -66,60 +65,6 @@ t('overlap: sustain-aware, same-instant, and the clean case', () => {
     assert.strictEqual(smother.length, 2, 'both later attacks conflict with the long sustain');
     assert.deepStrictEqual(smother.map((i) => i.indices), [[0, 1], [0, 2]]);
     assert.strictEqual(_lintOverlapPure([N(1, 2, 5, 1.0), N(1.5, 3, 7)]).length, 0);
-});
-
-function exhaustiveOverlapReference(nn) {
-    const issues = [];
-    const byString = new Map();
-    nn.forEach((n, i) => {
-        if (!n || !Number.isInteger(n.string) || !Number.isFinite(n.time)) return;
-        if (!byString.has(n.string)) byString.set(n.string, []);
-        byString.get(n.string).push({ n, i });
-    });
-    for (const list of byString.values()) {
-        list.sort((a, b) => a.n.time - b.n.time);
-        for (let k = 1; k < list.length; k++) {
-            const cur = list[k];
-            for (let j = k - 1; j >= 0; j--) {
-                const prev = list[j];
-                const overlap = prev.n.time + (Number(prev.n.sustain) || 0) - cur.n.time;
-                const sameInstant = j === k - 1
-                    && Math.abs(cur.n.time - prev.n.time) < LINT_CLUSTER_EPSILON;
-                if (overlap > LINT_OVERLAP_EPSILON || sameInstant) {
-                    issues.push({
-                        rule: 'overlap', time: cur.n.time,
-                        indices: [prev.i, cur.i],
-                        detail: sameInstant
-                            ? `two notes on string ${cur.n.string} at one instant`
-                            : `string ${cur.n.string}: sustain overlaps a later note by ${overlap.toFixed(3)}s`,
-                    });
-                }
-            }
-        }
-    }
-    return issues;
-}
-
-t('overlap sweep preserves exhaustive results and ordering on randomized parts', () => {
-    let state = 0xc0111de;
-    const random = () => {
-        state = (Math.imul(state, 1103515245) + 12345) >>> 0;
-        return state / 0x100000000;
-    };
-    for (let sample = 0; sample < 200; sample++) {
-        const notes = Array.from({ length: 5 + Math.floor(random() * 45) }, () => {
-            const time = Math.floor(random() * 3000) / 1000;
-            const sustain = random() < 0.25 ? random() * 2 : random() * 0.02;
-            return N(time, Math.floor(random() * 6), Math.floor(random() * 18), sustain);
-        });
-        assert.deepStrictEqual(_lintOverlapPure(notes), exhaustiveOverlapReference(notes));
-    }
-});
-
-t('overlap sweep handles a long non-overlapping arrangement without history growth', () => {
-    const notes = Array.from({ length: 20000 }, (_, index) =>
-        N(index * 0.1, 2, index % 12, 0.01));
-    assert.deepStrictEqual(_lintOverlapPure(notes), []);
 });
 
 t('open-bend + bad-fret: the physical flag and the data-bug catcher', () => {

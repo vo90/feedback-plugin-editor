@@ -7,8 +7,8 @@
  */
 
 import { beatOf, timeOf } from '../beats.js';
-import { _playabilityLintPure } from '../playability-lint.js';
 import { analyzeGapFillComposite, normalizeCompositeGapFillOptions } from './gap-fill-engine.js';
+import { compositePlayabilityLintPure } from './playability-lint.js';
 import {
     COMPOSITE_BEAT_EPS,
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
@@ -899,10 +899,10 @@ function passageForTime(passages, beat) {
 function differentialPlayability(primaryEntries, hybridEntries, beats, passages = [], anchors = [],
     inheritedIssues = null) {
     const hybridNotes = entriesToNotes(hybridEntries, beats);
-    const inherited = inheritedIssues || _playabilityLintPure(
+    const inherited = inheritedIssues || compositePlayabilityLintPure(
         entriesToNotes(primaryEntries, beats), anchors);
     const inheritedSignatures = new Set(inherited.map(issueSignature));
-    const all = _playabilityLintPure(hybridNotes, anchors);
+    const all = compositePlayabilityLintPure(hybridNotes, anchors);
     const selectedIds = new Set(hybridEntries.map(entry => entry.id));
     const lintWarnings = all.filter(issue => !inheritedSignatures.has(issueSignature(issue)))
         .map(issue => {
@@ -1211,7 +1211,7 @@ export function refreshExperimentalPlayability(plan) {
     const anchors = primaryUserAnchors.length ? primaryUserAnchors : primaryAnchors;
     const inheritedInputsMatch = cached?.primaryEntries === primaryEntries
         && cached.beats === beats && cached.anchors === anchors;
-    const inherited = inheritedInputsMatch ? cached.inherited : _playabilityLintPure(
+    const inherited = inheritedInputsMatch ? cached.inherited : compositePlayabilityLintPure(
         entriesToNotes(primaryEntries, beats), anchors);
     plan.playability = differentialPlayability(
         primaryEntries, compositeResolvedEntries(plan), beats, passages, anchors, inherited,
