@@ -703,6 +703,14 @@ function _loadHybridFeature() {
     return pending;
 }
 
+function _teardownHybridFeature() {
+    _hybridFeatureGeneration++;
+    const hybridFeature = _hybridFeatureModule;
+    _hybridFeatureModule = null;
+    _hybridFeatureImport = null;
+    try { hybridFeature?.editorTeardownCompositeArrangementUi?.(); } catch (_) {}
+}
+
 window.editorShowCompositeArrangementModal = async () => {
     const generation = _hybridFeatureGeneration;
     try {
@@ -922,11 +930,7 @@ window.__editorScreenTeardown = () => {
     // Unblock any awaiting session-transition prompt before its listener is
     // swept below, so a re-injection can't strand guardSessionTransition.
     try { dismissSessionPrompt(); } catch (_) {}
-    _hybridFeatureGeneration++;
-    const hybridFeature = _hybridFeatureModule;
-    _hybridFeatureModule = null;
-    _hybridFeatureImport = null;
-    try { hybridFeature?.editorTeardownCompositeArrangementUi?.(); } catch (_) {}
+    if (typeof _teardownHybridFeature === 'function') _teardownHybridFeature();
     _globalListeners.removeAll();
     // Stop any playback this injection owns — the audio graph outlives the
     // DOM, so a replaced screen would otherwise keep sounding.

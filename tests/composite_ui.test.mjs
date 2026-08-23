@@ -268,7 +268,7 @@ test('Hybrid analysis and creation use cancellable background tasks with stale g
     assert.match(resolver, /runHybridAnalysisTask/);
     assert.match(resolver, /runHybridMaterializationTask/);
     const analyzeStart = resolver.indexOf('async function analyzeFromDialog');
-    const analyzeEnd = resolver.indexOf('function clearEditorSelection', analyzeStart);
+    const analyzeEnd = resolver.indexOf('async function finishMerge', analyzeStart);
     const analyzeBody = resolver.slice(analyzeStart, analyzeEnd);
     assert.match(analyzeBody, /beginHybridAnalysis\(hybridSession, \{ sessionId, configToken \}\)/);
     assert.match(analyzeBody, /signal:\s*request\.controller\.signal/);
@@ -361,7 +361,7 @@ test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () 
         'Space or click on the active sound button toggles it off instead of restarting it');
     assert.match(resolver, /export function editorTeardownCompositeArrangementUi/);
     assert.match(main,
-        /window\.__editorScreenTeardown = \(\) => \{[\s\S]*hybridFeature\?\.editorTeardownCompositeArrangementUi\?\.\(\)/,
+        /window\.__editorScreenTeardown = \(\) => \{[\s\S]*_teardownHybridFeature\(\)/,
         'Editor reinjection removes the Hybrid document listener and body-mounted modal');
 });
 
