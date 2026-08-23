@@ -595,6 +595,16 @@ function _audioTimelineDuration() {
     return _audioTimelineDurationPure(S.duration, S.audioShift, S.masterAudioDuration || S.duration);
 }
 
+// A focused generated-part audition explicitly mutes the recording. When a
+// decoded recording exists it still defines the authoritative song duration,
+// but constructing muted BufferSources (plus every stem/region source) buys
+// nothing and adds start/seek latency. Original Song (`audible`) and ordinary
+// Editor playback (`null`) deliberately return false and retain their existing
+// source path unchanged.
+export function _focusedGuideClockOnlyPure(preview, hasRecording) {
+    return !!hasRecording && !!preview && preview.referenceAudio === 'muted';
+}
+
 // ── Audition speed (design slice 5): pitch-preserving slow practice ──────────
 // Playback-only, ≤100%, one toggle back to 100%. Never touches source time, the
 // tempo map, exported audio, or dirty state — it is an editor pref, not pack
@@ -940,12 +950,19 @@ export function _restartPlaybackAt(t) {
         try { S.audioSource.stop(); } catch (_) {}
         S.audioSource = null;
     }
-    _stopStemSources();   // re-scheduled by _startAudioSourceAtCursor below
+    _stopStemSources();   // re-scheduled below only when reference audio is part of this pass
     S.cursorTime = Math.max(0, Math.min(_audioTimelineDuration() || Infinity, t));
     // Compose mode re-anchors the clock without a BufferSource — the guide/
     // click scheduler is the only sound (charrette §1.7).
-    if (S.audioBuffer) _startAudioSourceAtCursor();
-    else _anchorTransportAtCursor();
+    if (S.audioBuffer && !_focusedGuideClockOnlyPure(_editorGuidePreview, !!S.audioBuffer)) {
+        _startAudioSourceAtCursor();
+    } else {
+        // Compose mode and focused generated-part previews share the same
+        // AudioContext transport clock. In the latter case the real recording
+        // remains loaded and continues to bound `_audioTimelineDuration()`.
+        _stopRefMedia();
+        _anchorTransportAtCursor();
+    }
 }
 
 export function startPlayback() {
@@ -992,7 +1009,21 @@ export function startPlayback() {
         // is the last automation written to the ref gain, not clobbered by this.
         _abPhase = 'recording';
         _abApplyRefGain();
-        _startAudioSourceAtCursor(preRoll);
+        if (_focusedGuideClockOnlyPure(_editorGuidePreview, !!S.audioBuffer)) {
+            // The preview policy already seated the reference gain at zero.
+            // Clear any stale prior source once, then let the AudioContext
+            // anchor drive cursor + guide scheduling without allocating muted
+            // recording/stem nodes.
+            if (S.audioSource) {
+                try { S.audioSource.stop(); } catch (_) {}
+                S.audioSource = null;
+            }
+            _stopStemSources();
+            _stopRefMedia();
+            _anchorTransportAtCursor(preRoll);
+        } else {
+            _startAudioSourceAtCursor(preRoll);
+        }
     }
     // Schedule the count-in clicks AFTER the anchor: both branches run
     // _guideResetSchedule() → _guideCancelVoices(), which stops every voice in
