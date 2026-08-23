@@ -66,6 +66,10 @@ import {
     hybridPerformanceEnabled,
 } from './performance.js';
 import {
+    compositeTimelineCameraCoveragePure,
+    compositeTimelineCameraUrgencyPure,
+} from './timeline-camera-policy.js';
+import {
     buildCompositeConflictViewModel,
     buildCompositeReviewToolbarModel,
     compositeTechniqueLabels,
@@ -2000,9 +2004,9 @@ function cancelCompositeTimelineStandbyWork(dom = timelineViewportDom) {
 
 function scheduleCompositeTimelineIdle(callback, timeoutMs = 0) {
     if (typeof globalThis.requestIdleCallback === 'function') {
-        // Do not use a timeout here. A timed-out idle callback is allowed to
-        // run with no frame budget, which previously forced a dense lane into
-        // the middle of playback every 50 ms.
+        // Soft preparation has no timeout. Urgent coverage and exact-zoom work
+        // supply one explicitly so Chromium cannot starve the finite strip
+        // throughout uninterrupted playback.
         const timeout = Math.max(0, Number(timeoutMs) || 0);
         const id = globalThis.requestIdleCallback(
             callback, timeout ? { timeout } : undefined);
@@ -2230,6 +2234,7 @@ function refreshCompositeTimelineZoomControls(dom) {
 
 function stopCompositeTimelineUi() {
     timelineReviewRefreshGeneration += 1;
+    cancelCompositeTimelineCoverageRepair(timelineViewportDom);
     cancelCompositeTimelineStandbyWork();
     if (timelineViewportFrame) cancelAnimationFrame(timelineViewportFrame);
     if (timelinePlayheadFrame) cancelAnimationFrame(timelinePlayheadFrame);
@@ -2381,11 +2386,201 @@ function compositeTimelineVisualScrollLeft(dom = timelineViewportDom) {
         ? Number(dom.visualScrollLeft) : scroller.scrollLeft);
 }
 
+function compositeTimelineCameraCoverage(dom, slot, visualScroll, direction = 1) {
+    if (!dom?.view || !dom.scroller || !slot) {
+        return compositeTimelineCameraCoveragePure();
+    }
+    return compositeTimelineCameraCoveragePure({
+        context: dom.view.context,
+        zoom: hybridPreviewPreferences.timelineZoom,
+        renderedRange: slot.renderedRange,
+        viewportRange: timelineActualViewportRange(
+            dom.view, dom.scroller, visualScroll, dom.viewportWidth),
+        direction,
+    });
+}
+
+function compositeTimelineCurrentDirection(dom, visualScroll) {
+    const previous = Number(dom?.lastCoverageVisualScroll);
+    let direction = Number(dom?.travelDirection) || 1;
+    if (Number.isFinite(previous)) {
+        if (visualScroll > previous + 0.25) direction = 1;
+        else if (visualScroll < previous - 0.25) direction = -1;
+    }
+    if (dom) {
+        dom.lastCoverageVisualScroll = visualScroll;
+        dom.travelDirection = direction;
+    }
+    return direction;
+}
+
+function compositeTimelineSlotReadyForViewport(dom, slot, visualScroll, direction = 1) {
+    return Boolean(slot?.ready
+        && slot.renderSignature === compositeTimelineRenderSignature(dom)
+        && compositeTimelineCameraCoverage(
+            dom, slot, visualScroll, direction).coversViewport);
+}
+
+function commitCompositeTimelineCameraSlot(dom, slotIndex, visualScroll) {
+    const next = dom?.cameraSlots?.[slotIndex];
+    if (!next) return false;
+    const previous = dom.cameraSlots?.[dom.activeCameraIndex];
+    const focusKey = compositeTimelineFocusedControl(previous?.camera);
+    next.camera.style.transform = `translate3d(${compositeTimelineCameraOffsetPure(
+        dom.nativeScrollLeft, visualScroll)}px,0,0)`;
+    setCompositeTimelineCameraSlotActive(next, true);
+    activateCompositeTimelineCameraSlot(dom, slotIndex);
+    restoreCompositeTimelineFocus(dom, next, focusKey);
+    if (previous && previous !== next) {
+        // Move focus before making the old subtree inert; Chromium otherwise
+        // rejects aria-hidden on its active node.
+        setCompositeTimelineCameraSlotActive(previous, false);
+        previous.ready = false;
+    }
+    dom.standbyPending = false;
+    next.pendingSignature = '';
+    next.pendingRange = null;
+    updateCompositeTimelineFixedLaneHeights(dom);
+    return true;
+}
+
+function synchronouslyRepairCompositeTimelineCoverage(dom, visualScroll) {
+    if (!dom?.view || !dom.scroller) return false;
+    const startedAt = hybridPerfStart();
+    hybridPerfCount('timeline.camera.criticalFallback');
+    cancelCompositeTimelineStandbyWork(dom);
+    const slotIndex = dom.activeCameraIndex === 0 ? 1 : 0;
+    const slot = dom.cameraSlots?.[slotIndex];
+    if (!slot) {
+        hybridPerfCount('timeline.camera.coverageRepairFailure');
+        hybridPerfEnd('timeline.camera.criticalFallbackMs', startedAt);
+        return false;
+    }
+    slot.ready = false;
+    slot.pendingSignature = '';
+    slot.pendingRange = null;
+    try {
+        const geometry = compositeTimelineStripGeometryPure({
+            context: dom.view.context,
+            zoom: hybridPreviewPreferences.timelineZoom,
+            visualScrollLeft: visualScroll,
+            viewportWidth: dom.viewportWidth,
+        });
+        renderCompositeTimelineCameraSlot(
+            dom, slot, geometry, hybridPreviewPreferences.timelineZoom);
+        const repaired = compositeTimelineSlotReadyForViewport(
+            dom, slot, visualScroll, dom.travelDirection || 1);
+        if (!repaired) {
+            slot.ready = false;
+            hybridPerfCount('timeline.camera.coverageRepairFailure');
+            hybridPerfEnd('timeline.camera.criticalFallbackMs', startedAt);
+            return false;
+        }
+        commitCompositeTimelineCameraSlot(dom, slotIndex, visualScroll);
+        hybridPerfEnd('timeline.camera.criticalFallbackMs', startedAt);
+        return true;
+    } catch (_) {
+        slot.ready = false;
+        hybridPerfCount('timeline.camera.coverageRepairFailure');
+        hybridPerfEnd('timeline.camera.criticalFallbackMs', startedAt);
+        return false;
+    }
+}
+
+function cancelCompositeTimelineCoverageRepair(dom = timelineViewportDom) {
+    if (!dom?.coverageRepairTimer) return;
+    clearTimeout(dom.coverageRepairTimer);
+    dom.coverageRepairTimer = 0;
+    dom.coverageRepairTarget = null;
+}
+
+// Critical coverage repair is deliberately queued outside the display-rate
+// playhead callback. Until this task runs, the compositor stays at the last
+// painted position instead of exposing an empty strip.
+function scheduleCompositeTimelineCoverageRepair(dom, visualScroll) {
+    if (!dom) return;
+    dom.coverageRepairTarget = visualScroll;
+    if (dom.coverageRepairTimer) return;
+    hybridPerfCount('timeline.camera.criticalRepairQueued');
+    dom.coverageRepairTimer = setTimeout(() => {
+        dom.coverageRepairTimer = 0;
+        if (timelineViewportDom !== dom || !dom.view || !dom.scroller) return;
+        const target = clampCompositeTimelineScroll(dom, dom.coverageRepairTarget);
+        dom.coverageRepairTarget = null;
+        const direction = dom.travelDirection || 1;
+        const active = dom.cameraSlots?.[dom.activeCameraIndex];
+        if (compositeTimelineCameraCoverage(
+                dom, active, target, direction).coversViewport) {
+            applyCompositeTimelineCamera(dom, target);
+            return;
+        }
+        const readyIndex = (dom.cameraSlots || []).findIndex((slot, index) =>
+            index !== dom.activeCameraIndex
+            && compositeTimelineSlotReadyForViewport(dom, slot, target, direction));
+        let repaired = false;
+        if (readyIndex >= 0) {
+            cancelCompositeTimelineStandbyWork(dom);
+            repaired = commitCompositeTimelineCameraSlot(dom, readyIndex, target);
+        } else {
+            repaired = synchronouslyRepairCompositeTimelineCoverage(dom, target);
+        }
+        if (repaired) {
+            applyCompositeTimelineCamera(dom, target);
+        } else {
+            hybridPerfCount('timeline.camera.coverageMiss');
+        }
+    }, 0);
+}
+
+// A compositor transform must never move the finite active SVG strip away
+// from the visible viewport. Ordinarily the idle/urgent standby is ready first;
+// this check is the bounded correctness fallback for a starved browser.
+function ensureCompositeTimelineCameraCoverage(dom, requestedVisualScroll) {
+    const previousVisual = compositeTimelineVisualScrollLeft(dom);
+    const direction = compositeTimelineCurrentDirection(dom, requestedVisualScroll);
+    const active = dom?.cameraSlots?.[dom.activeCameraIndex];
+    const coverage = compositeTimelineCameraCoverage(
+        dom, active, requestedVisualScroll, direction);
+    hybridPerfGauge('timeline.camera.travelHeadroomPx', coverage.travelHeadroomPx);
+    if (coverage.coversViewport) return requestedVisualScroll;
+
+    const readyIndex = (dom.cameraSlots || []).findIndex((slot, index) =>
+        index !== dom.activeCameraIndex
+        && compositeTimelineSlotReadyForViewport(
+            dom, slot, requestedVisualScroll, direction));
+    if (readyIndex >= 0) {
+        cancelCompositeTimelineStandbyWork(dom);
+        commitCompositeTimelineCameraSlot(dom, readyIndex, requestedVisualScroll);
+        hybridPerfCount('timeline.camera.readyCoverageSwap');
+        return requestedVisualScroll;
+    }
+    // Keep the display-rate path compositor-only. A queued user-visible task
+    // repairs the hidden slot while this frame retains the last covered camera.
+    scheduleCompositeTimelineCoverageRepair(dom, requestedVisualScroll);
+    hybridPerfCount('timeline.camera.coverageClamp');
+    return previousVisual;
+}
+
 function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
     if (!dom?.view || !dom.scroller || (dom.cameraSlots?.length || 0) < 2) return;
     const retainedOptions = dom.reviewRefreshOptions || {};
-    const freshnessDeadlineAt = Math.max(0, Number(
+    const now = globalThis.performance?.now?.() || Date.now();
+    const activeCoverage = compositeTimelineCameraCoverage(
+        dom, dom.cameraSlots[dom.activeCameraIndex],
+        clampCompositeTimelineScroll(dom, rawVisualScroll), dom.travelDirection || 1);
+    const urgency = compositeTimelineCameraUrgencyPure({
+        coverage: activeCoverage,
+        viewportWidth: dom.viewportWidth,
+        exactRenderPending: dom.zoomPreviewPending,
+    });
+    const requestedDeadline = Math.max(0, Number(
         options.freshnessDeadlineAt ?? retainedOptions.freshnessDeadlineAt) || 0);
+    // An active transport and exact zoom both need bounded progress. The
+    // ordinary soft path remains idle-only while ample painted runway exists.
+    const freshnessDeadlineAt = requestedDeadline || (S.playing
+        || urgency === 'urgent' || urgency === 'critical'
+        || dom.zoomPreviewPending ? now + 240 : 0);
+    if (freshnessDeadlineAt) hybridPerfCount('timeline.camera.urgentPreparation');
     const onCommitted = options.onCommitted || retainedOptions.onCommitted || null;
     const beforeCommit = options.beforeCommit || retainedOptions.beforeCommit || null;
     const zoom = hybridPreviewPreferences.timelineZoom;
@@ -2473,7 +2668,7 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
     const queueStep = () => {
         const now = globalThis.performance?.now?.() || Date.now();
         const timeout = freshnessDeadlineAt
-            ? Math.max(S.playing ? 100 : 16, freshnessDeadlineAt - now) : 0;
+            ? Math.max(16, freshnessDeadlineAt - now) : 0;
         cancelPendingIdle = scheduleCompositeTimelineIdle(deadline => {
             cancelPendingIdle = null;
             if (cancelled || generation !== timelineRenderGeneration
@@ -2483,12 +2678,12 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
                 return;
             }
             const currentTime = globalThis.performance?.now?.() || Date.now();
-            // Ordinary scroll/render-ahead work remains purely idle. A review
-            // choice gets a bounded paused-transport escape hatch so the
-            // visible lanes cannot disagree with the chosen/audio result
-            // indefinitely under continuous pointer movement.
-            const freshnessDue = freshnessDeadlineAt && currentTime >= freshnessDeadlineAt
-                && !S.playing;
+            // Soft preparation remains purely idle while enough painted runway
+            // exists. Coverage, zoom, and review deadlines advance one bounded
+            // ruler/lane step even during playback so the finite strip cannot
+            // be starved until it leaves the viewport.
+            const freshnessDue = Boolean(deadline?.didTimeout)
+                || freshnessDeadlineAt && currentTime >= freshnessDeadlineAt;
             if (!freshnessDue && (compositeTimelineInputPending()
                     || Math.max(0, Number(deadline?.timeRemaining?.()) || 0) < 8)) {
                 queueStep();
@@ -2522,21 +2717,8 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
                         rescheduleLatest();
                         return;
                     }
-                    const previous = dom.cameraSlots[dom.activeCameraIndex];
-                    const focusKey = compositeTimelineFocusedControl(previous.camera);
-                    standby.camera.style.transform = `translate3d(${compositeTimelineCameraOffsetPure(
-                        dom.nativeScrollLeft, swapState.currentVisual)}px,0,0)`;
-                    setCompositeTimelineCameraSlotActive(standby, true);
-                    activateCompositeTimelineCameraSlot(dom, standbyIndex);
-                    restoreCompositeTimelineFocus(dom, standby, focusKey);
-                    // Move keyboard focus before making the old subtree inert;
-                    // Chromium otherwise rejects aria-hidden on its active node.
-                    setCompositeTimelineCameraSlotActive(previous, false);
-                    previous.ready = false;
-                    dom.standbyPending = false;
-                    standby.pendingSignature = '';
-                    standby.pendingRange = null;
-                    updateCompositeTimelineFixedLaneHeights(dom);
+                    commitCompositeTimelineCameraSlot(
+                        dom, standbyIndex, swapState.currentVisual);
                     applyCompositeTimelineCamera(dom, swapState.currentVisual);
                     onCommitted?.();
                 });
@@ -2584,7 +2766,11 @@ function applyCompositeTimelineCamera(dom = timelineViewportDom, rawVisualScroll
     rawPlayheadX = dom?.playheadX) {
     const scroller = dom?.scroller;
     if (!dom || !scroller) return 0;
-    const visualScroll = clampCompositeTimelineScroll(dom, rawVisualScroll);
+    const requestedVisualScroll = clampCompositeTimelineScroll(dom, rawVisualScroll);
+    // Correctness boundary: repair or atomically swap the bounded strip before
+    // its compositor transform can expose an unpainted viewport.
+    const visualScroll = ensureCompositeTimelineCameraCoverage(
+        dom, requestedVisualScroll);
     const cameraOffset = compositeTimelineCameraOffsetPure(
         dom.nativeScrollLeft, visualScroll);
     const renderedZoom = Number(dom.renderedZoom);
@@ -2958,6 +3144,8 @@ function bindCompositeTimelineEvents() {
         surfaceWidth: 0,
         visualScrollLeft: scroller.scrollLeft,
         nativeScrollLeft: scroller.scrollLeft,
+        lastCoverageVisualScroll: scroller.scrollLeft,
+        travelDirection: 1,
         playheadX: compositeTimelineXForBeatPure(
             compositeTimelineDisplayBeatAtTime(view, hybridSession.timelineSeekTime),
             view.context, hybridPreviewPreferences.timelineZoom),
@@ -3384,24 +3572,37 @@ function bindCompositeTimelineEvents() {
         timelineBindFrame = 0;
         if (timelineViewportDom !== boundDom) return;
         const liveView = boundDom.view;
+        let nextScroll;
         if (liveView.review && hybridSession.timelineFocusReview) {
-            centerCurrentReviewInTimeline(liveView, scroller);
-        } else if (liveView.passageFocus && hybridSession.timelineFocusPassage) {
-            const beat = (liveView.passageFocus.startBeat
-                + liveView.passageFocus.endBeat) / 2;
-            const nextScroll = clampTimelineScroll(scroller,
+            const beat = (liveView.review.startBeat + liveView.review.endBeat) / 2;
+            nextScroll = clampTimelineScroll(scroller,
                 compositeTimelineCenteredScrollPure({
                     beat, context: liveView.context,
                     zoom: hybridPreviewPreferences.timelineZoom,
                     viewportWidth: scroller.clientWidth,
                 }));
-            setCompositeTimelineNativeCamera(timelineViewportDom, nextScroll, false);
+            hybridSession.timelineFocusReview = false;
+        } else if (liveView.passageFocus && hybridSession.timelineFocusPassage) {
+            const beat = (liveView.passageFocus.startBeat
+                + liveView.passageFocus.endBeat) / 2;
+            nextScroll = clampTimelineScroll(scroller,
+                compositeTimelineCenteredScrollPure({
+                    beat, context: liveView.context,
+                    zoom: hybridPreviewPreferences.timelineZoom,
+                    viewportWidth: scroller.clientWidth,
+                }));
             hybridSession.timelineFocusPassage = false;
         } else {
-            const nextScroll = clampTimelineScroll(scroller,
+            nextScroll = clampTimelineScroll(scroller,
                 hybridSession.timelineScrollLeft);
-            setCompositeTimelineNativeCamera(timelineViewportDom, nextScroll, false);
         }
+        const primedScroll = clampCompositeTimelineScroll(boundDom, nextScroll);
+        timelineProgrammaticScrollTarget = primedScroll;
+        scroller.scrollLeft = primedScroll;
+        boundDom.nativeScrollLeft = scroller.scrollLeft;
+        boundDom.visualScrollLeft = primedScroll;
+        boundDom.lastCoverageVisualScroll = primedScroll;
+        hybridSession.timelineScrollLeft = primedScroll;
         refreshCompositeTimelineViewport(true);
         refreshCompositeTimelinePlayheadNow();
     });

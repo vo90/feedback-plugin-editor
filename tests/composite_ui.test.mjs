@@ -383,10 +383,15 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
     assert.match(resolver, /compositeTimelineInputPending\(\)/,
         'pending input wins over background strip generation');
     assert.doesNotMatch(resolver, /requestIdleCallback\(callback,\s*\{\s*timeout:/,
-        'idle rendering is never forced into a busy playback frame by a timeout');
+        'ordinary soft preparation remains an untimed idle task');
+    assert.match(resolver, /Boolean\(deadline\?\.didTimeout\)/,
+        'urgent camera work progresses when its deadline expires');
+    assert.match(resolver, /S\.playing[\s\S]*now \+ 240/,
+        'playback gives finite-strip preparation a bounded deadline');
     assert.match(resolver, /requestAnimationFrame\(\(\) =>\s*refreshCompositeTimelineViewport\(false\)\)/,
         'the animation timestamp can never be mistaken for a forced synchronous rebuild');
-    assert.match(resolver, /setCompositeTimelineCameraSlotActive\(standby, true\)/);
+    assert.match(resolver, /function commitCompositeTimelineCameraSlot/);
+    assert.match(resolver, /setCompositeTimelineCameraSlotActive\(next, true\)/);
     assert.match(resolver, /setCompositeTimelineCameraSlotActive\(previous, false\)/,
         'the prepared strip swaps atomically instead of replacing visible lane markup');
     assert.match(resolver, /toggleAttribute\('inert', !active\)/,
@@ -407,7 +412,29 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
         'the display-rate camera path uses cached geometry and compositor transforms only');
     assert.match(cameraBody, /dom\.nativeScrollLeft/,
         'the display-rate camera also uses cached native-scroll state');
+    assert.match(cameraBody, /ensureCompositeTimelineCameraCoverage/,
+        'coverage is repaired before an uncovered compositor transform is applied');
+    assert.match(resolver, /timeline\.camera\.criticalFallback/,
+        'the exceptional synchronous correctness fallback is telemetered');
+    const coverageStart = resolver.indexOf('function ensureCompositeTimelineCameraCoverage');
+    const coverageEnd = resolver.indexOf('\nfunction scheduleCompositeTimelineStandby', coverageStart);
+    const coverageBody = resolver.slice(coverageStart, coverageEnd);
+    assert.match(coverageBody, /scheduleCompositeTimelineCoverageRepair/,
+        'an uncovered display frame queues repair outside the playhead callback');
+    assert.doesNotMatch(coverageBody, /synchronouslyRepairCompositeTimelineCoverage\(/,
+        'the display-rate coverage guard never rebuilds SVG synchronously');
+    assert.match(cameraBody,
+        /!dom\.zoomPreviewPending[\s\S]*scheduleCompositeTimelineRenderAhead/,
+        'zoom owns the standby callback until its exact commit clears pending state');
     assert.match(resolver, /data-composite-map-viewport-window/);
+    const bindFrameStart = resolver.indexOf(
+        'timelineBindFrame = requestAnimationFrame');
+    const bindFrameEnd = resolver.indexOf('\n    });\n}', bindFrameStart);
+    const bindFrameBody = resolver.slice(bindFrameStart, bindFrameEnd);
+    assert.doesNotMatch(bindFrameBody, /setCompositeTimelineNativeCamera/,
+        'initial binding primes scroll state before the first exact render instead of rendering twice');
+    assert.match(bindFrameBody,
+        /boundDom\.visualScrollLeft = primedScroll[\s\S]*refreshCompositeTimelineViewport\(true\)/);
     assert.match(resolver, /mapPlayhead\.style\.transform\s*=\s*`translate3d/);
     assert.match(resolver, /mapViewport\.style\.transform\s*=\s*`translate3d/);
     assert.doesNotMatch(resolver, /mapPaintAt|< 33/,
