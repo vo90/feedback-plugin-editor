@@ -119,6 +119,20 @@ test('same-decision Hybrid choices retain the workspace and update its live mode
     assert.match(resolver,
         /laneId:\s*note\.closest[\s\S]*slot\.lanes\.get\(focusKey\.laneId\)/,
         'camera swaps restore a duplicate note id inside its original track');
+    const toolbarStart = resolver.indexOf('function bindCompositeReviewToolbarEvents');
+    const toolbarEnd = resolver.indexOf('\nfunction bindResultEvents', toolbarStart);
+    const toolbarBody = resolver.slice(toolbarStart, toolbarEnd);
+    assert.match(toolbarBody,
+        /const moveDecision[\s\S]*refreshReviewDecision\(\)[\s\S]*review\.navigate/,
+        'Previous and Next replace the toolbar immediately instead of rebuilding the workspace');
+    assert.match(toolbarBody,
+        /splitGuidedRepeatGroup\([\s\S]*scheduleCompositePreviewEventPrewarm\(hybridSession\.plan\)/,
+        'splitting a review section rewarms the structurally replaced conflict index');
+    const seekStart = resolver.indexOf('function seekCompositeTimelineAtTime');
+    const seekEnd = resolver.indexOf('\nfunction commitCompositeTimelineZoom', seekStart);
+    assert.match(resolver.slice(seekStart, seekEnd),
+        /const view = center \? currentTimelineView\(\) : null/,
+        'an ordinary navigation seek cannot synchronously rebuild the full-song model');
 });
 
 test('Hybrid review navigation and guide playback reuse indexed revision caches', () => {
@@ -128,6 +142,22 @@ test('Hybrid review navigation and guide playback reuse indexed revision caches'
     assert.match(resolver.slice(guidedStart, guidedEnd),
         /return guidedReviewContext\(plan, block\)/,
         'render/navigation consumes the engine index instead of rescanning groups and members');
+    const resolvedStart = resolver.indexOf('function resolvedCompositeEntriesForPlan');
+    const resolvedEnd = resolver.indexOf('\nfunction entryLastBeat', resolvedStart);
+    assert.match(resolver.slice(resolvedStart, resolvedEnd),
+        /compositePlanResolutionRevision\(plan\)[\s\S]*cached\.conflicts === plan\.conflicts[\s\S]*cached\.fixedEntries === plan\.fixedEntries[\s\S]*compositeResolvedEntries\(plan\)/,
+        'whole-song Hybrid entries are sorted once per resolution and structural revision');
+    assert.equal((resolver.match(/compositeResolvedEntries\(/g) || []).length, 1,
+        'all timeline and guide consumers share the resolved-entry cache');
+    const wholeStart = resolver.indexOf('function wholePlanPreviewView');
+    const wholeEnd = resolver.indexOf('\nfunction reviewPlanTimelineView', wholeStart);
+    assert.match(resolver.slice(wholeStart, wholeEnd), /resultEntriesPrepared:\s*true/,
+        'the full-song view does not sort the cached resolved revision again');
+    const reviewStart = wholeEnd;
+    const reviewEnd = resolver.indexOf('\nfunction currentTimelineView', reviewStart);
+    assert.match(resolver.slice(reviewStart, reviewEnd),
+        /resultEntriesPrepared = true[\s\S]*compositeEntriesKeepSortPosition[\s\S]*resultEntriesPrepared,/,
+        'review skips sorting only while local annotations preserve the resolved order');
     const eventsStart = resolver.indexOf('function compositePreviewEventsForMode');
     const eventsEnd = resolver.indexOf('\nfunction scheduleCompositePreviewEventPrewarm', eventsStart);
     const eventsBody = resolver.slice(eventsStart, eventsEnd);
@@ -140,6 +170,14 @@ test('Hybrid review navigation and guide playback reuse indexed revision caches'
     assert.match(previewBody,
         /compositePreviewEventsForMode\(mode\)[\s\S]*preSanitized:\s*mode !== 'song'/,
         'the gesture path skips duplicate conversion, filtering, and sorting');
+    const prewarmStart = resolver.indexOf('function scheduleCompositePreviewEventPrewarm');
+    const prewarmEnd = resolver.indexOf('\nfunction setCompositeContextLoop', prewarmStart);
+    assert.match(resolver.slice(prewarmStart, prewarmEnd),
+        /prewarmCompositeConflictResolutionIndex\(plan\)[\s\S]*compositePreviewEventsForMode/,
+        'idle time prepares both first-choice validation and all guide-event caches');
+    assert.doesNotMatch(resolver.slice(prewarmStart, prewarmEnd),
+        /resolutionRevision\s*!==/,
+        'an early review choice cannot permanently cancel source-event prewarming');
 });
 
 test('Hybrid playback keeps heavy rendering off the per-frame follow path and shares seek state', () => {
@@ -177,6 +215,38 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
         'only the cancel-before-refresh helper invokes the self-rescheduling callback directly');
     assert.match(resolver, /function refreshCompositeTimelinePlayheadNow\(\)[\s\S]*cancelAnimationFrame\(timelinePlayheadFrame\)[\s\S]*updateCompositeTimelinePlayhead\(\)/,
         'seek, bind, and maximize cannot multiply the playback animation loop');
+});
+
+test('Hybrid release telemetry covers transport latency, display cadence, and input work', () => {
+    const resolver = fs.readFileSync(
+        new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const previewStart = resolver.indexOf('async function startCompositePreview');
+    const previewEnd = resolver.indexOf('\nfunction keepCompositeContextLoop', previewStart);
+    assert.match(resolver.slice(previewStart, previewEnd),
+        /previewRequestStartedAt = hybridPerfStart\(\)[\s\S]*currentPreviewView\(\)[\s\S]*startPlayback\(\)[\s\S]*hybridPerfEnd\('ui\.preview\.requestMs'/,
+        'successful Play requests include model lookup through the running transport state');
+    const playheadStart = resolver.indexOf('function updateCompositeTimelinePlayhead');
+    const playheadEnd = resolver.indexOf('function startCompositeTimelinePlayhead', playheadStart);
+    assert.match(resolver.slice(playheadStart, playheadEnd),
+        /activelyPlaying[\s\S]*hybridPerfFrame\('timeline\.playhead', frameTime\)/,
+        'active preview frames expose display cadence without rendering markup');
+    assert.match(resolver,
+        /hybridPerfResetFrame\('timeline\.playhead'\)/,
+        'separate playback sessions cannot report stopped time as a dropped frame');
+    const renderPlanStart = resolver.indexOf('function compositeTimelineCameraRenderPlan');
+    const renderPlanEnd = resolver.indexOf(
+        '\nfunction renderCompositeTimelineCameraSlot', renderPlanStart);
+    const renderPlan = resolver.slice(renderPlanStart, renderPlanEnd);
+    assert.match(renderPlan, /timeline\.ruler\.renderMs/);
+    assert.match(renderPlan, /timeline\.lane\.renderMs/);
+    assert.match(resolver,
+        /finishCompositeInteraction\('review\.choice'[\s\S]*finishCompositeInteraction\('review\.reset'/,
+        'review choice and reset handlers contribute to the strict interaction gate');
+    assert.match(resolver,
+        /interactionStartedAt: hybridPerfStart\(\)[\s\S]*finishCompositeInteraction\('zoom\.response'/,
+        'coalesced zoom reports input-to-visible response rather than each raw wheel event');
+    assert.match(resolver, /hybridPerformanceEnabled\(\)[\s\S]*timeline\.domNodes/,
+        'expensive DOM-size gauges remain behind the explicit developer opt-in');
 });
 
 test('Original-song Hybrid playback reuses waveform levels instead of scanning PCM on Space', () => {
@@ -364,6 +434,18 @@ test('Hybrid overview drag previews visually and commits transport once on relea
     'pointer release performs one authoritative transport seek');
     assert.match(body, /resumePlaying[\s\S]*resumeMapPreview/,
         'playback that was active resumes once after the committed seek');
+    assert.match(body,
+        /closest\?\.\('\[data-composite-map-density-kind\]'\)[\s\S]*compositeTimelineOverviewIntervalAtBeatPure\([\s\S]*compositeMapDensityKind[\s\S]*compositeMapDensityState/,
+        'a grouped marker resolves the exact visible kind and state before opening a section');
+    assert.match(body,
+        /overviewIntervalIndex:\s*compositeTimelineOverviewIntervalIndexPure\(view\)/,
+        'the initial dense map retains one logarithmic hit index');
+    const refreshStart = resolver.indexOf('function refreshCompositeTimelineStaticMap');
+    const refreshEnd = resolver.indexOf(
+        '\nfunction scheduleCompositeReviewTimelineRefresh', refreshStart);
+    assert.match(resolver.slice(refreshStart, refreshEnd),
+        /dom\.overviewIntervalIndex = compositeTimelineOverviewIntervalIndexPure\(view\)/,
+        'retained review rebuilds the hit index whenever marker states and SVG change');
 });
 
 test('Hybrid lane resizing coalesces visual updates and rerenders only on release', () => {

@@ -26,8 +26,10 @@ import {
     clearCompositeConflictResolution,
     compositeCompatibility,
     compositeExperimentalMetadataPreview,
+    compositePlanResolutionRevision,
     compositeResolvedEntries,
     compositeSelectionUnitIds,
+    prewarmCompositeConflictResolutionIndex,
     resolveCompositeConflict,
 } from './merge-engine.js';
 import {
@@ -53,6 +55,16 @@ import {
     runHybridAnalysisTask,
     runHybridMaterializationTask,
 } from './analysis-runner.js';
+import {
+    hybridPerfCount,
+    hybridPerfEnd,
+    hybridPerfFrame,
+    hybridPerfGauge,
+    hybridPerfResetFrame,
+    hybridPerfSample,
+    hybridPerfStart,
+    hybridPerformanceEnabled,
+} from './performance.js';
 import {
     buildCompositeConflictViewModel,
     buildCompositeReviewToolbarModel,
@@ -100,6 +112,8 @@ import {
     compositeTimelineLaneHeightPure,
     compositeTimelineMapViewportPure,
     compositeTimelineMapBeatPure,
+    compositeTimelineOverviewIntervalAtBeatPure,
+    compositeTimelineOverviewIntervalIndexPure,
     compositeTimelineRenderGuardPure,
     compositeTimelineRenderWindowNeedsRefreshPure,
     compositeTimelineSteppedZoomPure,
@@ -192,10 +206,19 @@ let timelineViewportDom = null;
 let compositeModalDocumentKeydown = null;
 const convertCompositePreviewEvents = createCompositePreviewEventCache();
 const compositePreviewEventPlanCache = new WeakMap();
+const compositeResolvedEntryPlanCache = new WeakMap();
 const COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES = new Set([
     'button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio',
     'range', 'reset', 'submit',
 ]);
+
+function finishCompositeInteraction(name, startedAt) {
+    const duration = hybridPerfEnd('ui.interactionMs', startedAt);
+    if (!Number.isFinite(startedAt)) return duration;
+    hybridPerfSample(`ui.${name}Ms`, duration);
+    hybridPerfCount(`ui.${name}`);
+    return duration;
+}
 
 function setHybridPreviewPreferences(preferences, { deferred = false } = {}) {
     // Normalization is intentionally separate from persistence: sliders and
@@ -680,6 +703,7 @@ function endCompositePreviewPlayback() {
     hybridSession.previewRecordingGain = 1;
     if (timelinePlayheadFrame) cancelAnimationFrame(timelinePlayheadFrame);
     timelinePlayheadFrame = 0;
+    hybridPerfResetFrame('timeline.playhead');
     updateCompositePreviewButtons();
     // Leave both the main line and overview marker at the exact captured
     // transport position instead of the previous animation-frame sample.
@@ -895,6 +919,30 @@ function currentConflictView() {
     });
 }
 
+function resolvedCompositeEntriesForPlan(plan) {
+    if (!plan) return [];
+    const revision = compositePlanResolutionRevision(plan);
+    const cached = compositeResolvedEntryPlanCache.get(plan);
+    if (cached?.revision === revision
+            && cached.conflicts === plan.conflicts
+            && cached.fixedEntries === plan.fixedEntries) return cached.entries;
+    const entries = compositeResolvedEntries(plan);
+    compositeResolvedEntryPlanCache.set(plan, {
+        revision,
+        conflicts: plan.conflicts,
+        fixedEntries: plan.fixedEntries,
+        entries,
+    });
+    return entries;
+}
+
+function compositeEntriesKeepSortPosition(left, right) {
+    return Number(left?.startBeat) === Number(right?.startBeat)
+        && Number(left?.string) === Number(right?.string)
+        && Number(left?.fret) === Number(right?.fret)
+        && String(left?.id) === String(right?.id);
+}
+
 function entryLastBeat(entry) {
     return Math.max(Number(entry?.startBeat) || 0, Number(entry?.endBeat) || 0,
         Number(entry?.effectiveEndBeat) || 0);
@@ -903,7 +951,7 @@ function entryLastBeat(entry) {
 function wholePlanPreviewView() {
     if (!hybridSession.plan) return null;
     const names = selectedSourceNames();
-    const result = compositeResolvedEntries(hybridSession.plan);
+    const result = resolvedCompositeEntriesForPlan(hybridSession.plan);
     const audioShift = (Number(S.audioShift) || 0) + (Number(S.activeAudioSourceOffset) || 0);
     const recordingEnd = S.audioBuffer ? Math.max(0, Number(S.audioBuffer.duration) + audioShift) : 0;
     const durationSeconds = Math.max(0, Number(S.duration) || 0,
@@ -913,6 +961,7 @@ function wholePlanPreviewView() {
         primaryName: names.primary,
         secondaryName: names.secondary,
         resultEntries: result,
+        resultEntriesPrepared: true,
         durationSeconds,
         passageFocusId: hybridSession.inspectedPassageId,
     });
@@ -937,9 +986,16 @@ function reviewPlanTimelineView() {
     const conflictView = currentConflictView();
     if (!conflictView || !hybridSession.plan) return null;
     const localResult = conflictView.lanes.find(lane => lane.id === 'result')?.entries || [];
-    const resultById = new Map(compositeResolvedEntries(hybridSession.plan)
+    const resultById = new Map(resolvedCompositeEntriesForPlan(hybridSession.plan)
         .map(entry => [entry.id, entry]));
-    for (const entry of localResult) resultById.set(entry.id, entry);
+    let resultEntriesPrepared = true;
+    for (const entry of localResult) {
+        const previous = resultById.get(entry.id);
+        if (!previous || !compositeEntriesKeepSortPosition(previous, entry)) {
+            resultEntriesPrepared = false;
+        }
+        resultById.set(entry.id, entry);
+    }
     const names = selectedSourceNames();
     const audioShift = (Number(S.audioShift) || 0) + (Number(S.activeAudioSourceOffset) || 0);
     const recordingEnd = S.audioBuffer ? Math.max(0, Number(S.audioBuffer.duration) + audioShift) : 0;
@@ -961,6 +1017,7 @@ function reviewPlanTimelineView() {
         primaryName: names.primary,
         secondaryName: names.secondary,
         resultEntries: [...resultById.values()],
+        resultEntriesPrepared,
         durationSeconds,
         review,
     });
@@ -1018,7 +1075,7 @@ function compositePreviewEventsForMode(mode) {
     if (mode === 'result' && cache.result !== null
             && cache.resultRevision === hybridSession.resolutionRevision) return cache.result;
     const entries = mode === 'result'
-        ? compositeResolvedEntries(plan) : plan.sourceEntries?.[mode] || [];
+        ? resolvedCompositeEntriesForPlan(plan) : plan.sourceEntries?.[mode] || [];
     const events = convertCompositePreviewEvents(
         entries, arrangement, plan.beats, stringCount);
     cache[mode] = events;
@@ -1028,19 +1085,22 @@ function compositePreviewEventsForMode(mode) {
 
 function scheduleCompositePreviewEventPrewarm(plan = hybridSession.plan) {
     if (!plan) return;
-    const resolutionRevision = hybridSession.resolutionRevision;
-    const modes = ['primary', 'secondary', 'result'];
+    const tasks = [
+        ...(plan.conflicts?.length
+            ? [() => prewarmCompositeConflictResolutionIndex(plan)] : []),
+        ...['primary', 'secondary', 'result'].map(mode =>
+            () => compositePreviewEventsForMode(mode)),
+    ];
     let index = 0;
     const queue = () => scheduleCompositeTimelineIdle(deadline => {
-        if (hybridSession.plan !== plan
-                || hybridSession.resolutionRevision !== resolutionRevision) return;
+        if (hybridSession.plan !== plan) return;
         if (compositeTimelineInputPending()
                 || Math.max(0, Number(deadline?.timeRemaining?.()) || 0) < 8) {
             queue();
             return;
         }
-        compositePreviewEventsForMode(modes[index++]);
-        if (index < modes.length) queue();
+        tasks[index++]();
+        if (index < tasks.length) queue();
     });
     queue();
 }
@@ -1067,6 +1127,7 @@ async function startCompositePreview(mode) {
         setStatus(`Hybrid preview: ${message}`);
         return;
     }
+    const previewRequestStartedAt = hybridPerfStart();
     const view = currentPreviewView();
     if (!view) return;
     const requestedStartTime = (hybridSession.previewPlaying || hybridSession.previewMode)
@@ -1137,6 +1198,9 @@ async function startCompositePreview(mode) {
         setStatus(`Hybrid preview: ${message}`);
         return;
     }
+    hybridPerfCount('ui.preview.started');
+    hybridPerfEnd('ui.preview.requestMs', previewRequestStartedAt);
+    hybridPerfResetFrame('timeline.playhead');
     startCompositeTimelinePlayhead();
     const help = mode === 'song'
         ? 'Original song · level-matched.'
@@ -1309,6 +1373,7 @@ function enterCompositeFinalPreview() {
 function toggleCompositeCustomEntry(entryId) {
     const conflict = hybridSession.plan?.conflicts?.[hybridSession.conflictIndex];
     if (!conflict) return;
+    const interactionStartedAt = hybridPerfStart();
     const draft = new Set(hybridSession.customDrafts.get(conflict.id)
         || (conflict.resolution === 'custom' ? conflict.selectedEntryIds : []));
     const unitIds = compositeSelectionUnitIds(conflict, entryId);
@@ -1322,6 +1387,7 @@ function toggleCompositeCustomEntry(entryId) {
     markHybridResolutionChanged(hybridSession);
     markHybridReviewWork(hybridSession);
     refreshCurrentCompositeReview();
+    finishCompositeInteraction('review.manual', interactionStartedAt);
 }
 
 function inspectExperimentalPassage(passageId) {
@@ -1373,6 +1439,9 @@ function bindCompositeReviewDetails(details) {
 
 function bindCompositeReviewToolbarEvents(toolbar) {
     if (!toolbar) return;
+    const refreshReviewDecision = () => {
+        if (!refreshCurrentCompositeReview()) renderResult();
+    };
     for (const details of toolbar.querySelectorAll('.editor-composite-review-details')) {
         bindCompositeReviewDetails(details);
     }
@@ -1380,7 +1449,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         marker.addEventListener('click', () => {
             hybridSession.conflictIndex = Number(marker.dataset.conflictIndex) || 0;
             prepareCurrentReviewFocus(true);
-            renderResult();
+            refreshReviewDecision();
         });
     }
     for (const button of toolbar.querySelectorAll('[data-guided-split-beat]')) {
@@ -1400,6 +1469,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
             }
             hybridSession.conflictIndex = split.index;
             prepareCurrentReviewFocus(true);
+            scheduleCompositePreviewEventPrewarm(hybridSession.plan);
             renderResult();
         });
     }
@@ -1418,6 +1488,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         enterCompositeFinalPreview();
     });
     const moveDecision = offset => {
+        const interactionStartedAt = hybridPerfStart();
         const block = hybridSession.plan.conflicts[hybridSession.conflictIndex];
         const context = guidedRepeatContext(hybridSession.plan, block);
         const target = context?.groups[context.groupIndex + offset];
@@ -1431,7 +1502,8 @@ function bindCompositeReviewToolbarEvents(toolbar) {
             ));
             prepareCurrentReviewFocus(true);
         }
-        renderResult();
+        refreshReviewDecision();
+        finishCompositeInteraction('review.navigate', interactionStartedAt);
     };
     toolbar.querySelector('#editor-composite-prev')?.addEventListener(
         'click', () => moveDecision(-1));
@@ -1439,6 +1511,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         'click', () => moveDecision(1));
     for (const button of toolbar.querySelectorAll('[data-resolution]')) {
         button.addEventListener('click', () => {
+            const interactionStartedAt = hybridPerfStart();
             const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
             const resolution = button.dataset.resolution;
             if (resolution === 'custom') {
@@ -1462,6 +1535,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
             markHybridResolutionChanged(hybridSession);
             markHybridReviewWork(hybridSession);
             refreshCurrentCompositeReview();
+            finishCompositeInteraction('review.choice', interactionStartedAt);
         });
     }
     for (const checkbox of toolbar.querySelectorAll('[data-entry-id]')) {
@@ -1470,6 +1544,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         });
     }
     toolbar.querySelector('#editor-composite-reset-choice')?.addEventListener('click', () => {
+        const interactionStartedAt = hybridPerfStart();
         const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
         const context = guidedRepeatContext(hybridSession.plan, conflict);
         for (const member of context?.members || [{ block: conflict }]) {
@@ -1479,6 +1554,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         markHybridResolutionChanged(hybridSession);
         markHybridReviewWork(hybridSession);
         refreshCurrentCompositeReview();
+        finishCompositeInteraction('review.reset', interactionStartedAt);
     });
     toolbar.querySelector('#editor-composite-detach-occurrence')?.addEventListener('click', () => {
         const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
@@ -1492,13 +1568,14 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         renderResult();
     });
     toolbar.querySelector('#editor-composite-apply-next')?.addEventListener('click', () => {
+        const interactionStartedAt = hybridPerfStart();
         const context = guidedRepeatContext(hybridSession.plan,
             hybridSession.plan.conflicts[hybridSession.conflictIndex]);
         const target = context?.nextUnresolvedGroup || null;
         if (target) {
             activateGuidedReviewGroup(hybridSession.plan, target);
             prepareCurrentReviewFocus(true);
-            renderResult();
+            refreshReviewDecision();
         } else if (!context) {
             const next = hybridSession.plan.conflicts.findIndex((block, index) =>
                 index > hybridSession.conflictIndex && !block.resolution);
@@ -1507,13 +1584,14 @@ function bindCompositeReviewToolbarEvents(toolbar) {
             if (wrapped >= 0) {
                 hybridSession.conflictIndex = wrapped;
                 prepareCurrentReviewFocus(true);
-                renderResult();
+                refreshReviewDecision();
             } else {
                 enterCompositeFinalPreview();
             }
         } else {
             enterCompositeFinalPreview();
         }
+        finishCompositeInteraction('review.continue', interactionStartedAt);
     });
 }
 
@@ -2008,6 +2086,17 @@ function activateCompositeTimelineCameraSlot(dom, slotIndex) {
     return slot;
 }
 
+function recordCompositeTimelineGauges(dom) {
+    if (!hybridPerformanceEnabled() || !dom?.view) return;
+    const nodeCount = dom.content?.querySelectorAll?.('*')?.length || 0;
+    const entryCount = dom.view.lanes.reduce(
+        (total, lane) => total + (lane.entries?.length || 0), 0);
+    hybridPerfGauge('timeline.domNodes', nodeCount);
+    hybridPerfGauge('timeline.entries', entryCount);
+    hybridPerfGauge('timeline.cameraSlots', dom.cameraSlots?.length || 0);
+    hybridPerfSample('timeline.domNodes.sample', nodeCount);
+}
+
 function compositeTimelineCameraRenderPlan(dom, slot, geometry, zoom) {
     const view = dom.view;
     const visible = geometry.renderRange;
@@ -2022,10 +2111,12 @@ function compositeTimelineCameraRenderPlan(dom, slot, geometry, zoom) {
         slot.camera.dataset.compositeRenderOriginX = String(geometry.renderOriginX);
         if (slot.ruler) slot.ruler.style.width = `${geometry.surfaceWidth}px`;
         if (slot.rulerSvg) {
+            const renderStartedAt = hybridPerfStart();
             slot.rulerSvg.setAttribute('width', String(geometry.surfaceWidth));
             slot.rulerSvg.style.width = `${geometry.surfaceWidth}px`;
             slot.rulerSvg.innerHTML = renderCompositeTimelineRulerContents(
                 view, visible, zoom, renderOptions);
+            hybridPerfEnd('timeline.ruler.renderMs', renderStartedAt);
         }
     }];
     for (const lane of view.lanes) {
@@ -2039,12 +2130,14 @@ function compositeTimelineCameraRenderPlan(dom, slot, geometry, zoom) {
                 laneDom.row.style.height = `${height}px`;
             }
             if (laneDom?.svg) {
+                const renderStartedAt = hybridPerfStart();
                 laneDom.svg.setAttribute('width', String(geometry.surfaceWidth));
                 laneDom.svg.setAttribute('height', String(height));
                 laneDom.svg.style.width = `${geometry.surfaceWidth}px`;
                 laneDom.svg.style.height = `${height}px`;
                 laneDom.svg.innerHTML = renderCompositeTimelineLaneContents(
                     view, lane.id, height, visible, zoom, renderOptions);
+                hybridPerfEnd('timeline.lane.renderMs', renderStartedAt);
             }
         });
     }
@@ -2057,6 +2150,7 @@ function compositeTimelineCameraRenderPlan(dom, slot, geometry, zoom) {
         slot.timelineHeight = timelineHeight;
         slot.renderSignature = compositeTimelineRenderSignature(dom, zoom);
         slot.ready = true;
+        recordCompositeTimelineGauges(dom);
     });
     return { steps, timelineHeight };
 }
@@ -2150,6 +2244,7 @@ function stopCompositeTimelineUi() {
     timelineZoomCommitTimer = 0;
     timelineBindFrame = 0;
     timelineReviewRefreshFrame = 0;
+    hybridPerfResetFrame('timeline.playhead');
     timelinePendingZoom = null;
     timelineProgrammaticScrollTarget = null;
     timelineResizeObserver?.disconnect();
@@ -2545,7 +2640,10 @@ function seekCompositeTimelineAtTime(rawTime, {
     center = false,
 } = {}) {
     const time = Math.max(0, Number(rawTime) || 0);
-    const view = currentTimelineView();
+    // Ordinary seeks only move the retained camera/playhead. Building a fresh
+    // full-song model is necessary solely when the caller asks us to derive a
+    // new centered scroll position from that model.
+    const view = center ? currentTimelineView() : null;
     const dom = timelineViewportDom;
     const scroller = dom?.scroller
         || byId('editor-composite-timeline-scroller');
@@ -2673,14 +2771,23 @@ function pendingCompositeTimelineZoom() {
 // and render exact note/ruler SVG only after the gesture goes quiet.
 function scheduleCompositeTimelineZoom(zoom, anchorX = null, forceStart = false,
     flushPreference = false) {
-    timelinePendingZoom = { zoom, anchorX, forceStart, flushPreference };
+    timelinePendingZoom = {
+        zoom,
+        anchorX,
+        forceStart,
+        flushPreference,
+        interactionStartedAt: hybridPerfStart(),
+    };
     if (timelineZoomFrame) return;
     timelineZoomFrame = requestAnimationFrame(() => {
         timelineZoomFrame = 0;
         const pending = timelinePendingZoom;
         timelinePendingZoom = null;
-        if (pending) applyCompositeTimelineZoom(
-            pending.zoom, pending.anchorX, pending.forceStart, pending.flushPreference);
+        if (pending) {
+            applyCompositeTimelineZoom(
+                pending.zoom, pending.anchorX, pending.forceStart, pending.flushPreference);
+            finishCompositeInteraction('zoom.response', pending.interactionStartedAt);
+        }
     });
 }
 
@@ -2711,6 +2818,9 @@ function updateCompositeTimelinePlayhead(frameTime = 0) {
     if (!view || !scroller || !playhead) return;
     const activelyPlaying = hybridSession.previewPlaying && S.playing;
     const playbackSettled = hybridSession.previewPlaying && !S.playing;
+    if (activelyPlaying && Number(frameTime) > 0) {
+        hybridPerfFrame('timeline.playhead', frameTime);
+    }
     if (playbackSettled && Number.isFinite(Number(S.cursorTime))) {
         // Natural completion resets the Editor transport to zero. Adopt that
         // exact stopped position before the Hybrid animation loop ends.
@@ -2743,6 +2853,7 @@ function updateCompositeTimelinePlayhead(frameTime = 0) {
         updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime, true);
         syncCompositeTimelineNativeCamera(dom);
         hybridSession.previewPlaying = false;
+        hybridPerfResetFrame('timeline.playhead');
         updateCompositePreviewButtons();
     } else {
         applyCompositeTimelineCamera(dom, visualScroll, frame.contentX);
@@ -2832,6 +2943,7 @@ function bindCompositeTimelineEvents() {
         mapViewport: map?.querySelector('#editor-composite-map-viewport'),
         mapViewportWindow: map?.querySelector('[data-composite-map-viewport-window]'),
         mapPlayhead: map?.querySelector('#editor-composite-map-playhead'),
+        overviewIntervalIndex: compositeTimelineOverviewIntervalIndexPure(view),
         playhead: content?.querySelector('#editor-composite-timeline-playhead'),
         zoomOutput: byId('editor-composite-time-zoom-value'),
         zoomSlider: byId('editor-composite-time-zoom'),
@@ -3018,7 +3130,21 @@ function bindCompositeTimelineEvents() {
         event.preventDefault();
         const passage = event.target.closest?.('[data-composite-map-passage]');
         const decision = event.target.closest?.('[data-composite-map-decision]');
+        const density = event.target.closest?.('[data-composite-map-density-kind]');
         const surface = map.querySelector('svg') || map;
+        const rect = surface.getBoundingClientRect();
+        const densityLocation = density ? mapLocationAt(event.clientX, rect) : null;
+        const densityItem = density ? compositeTimelineOverviewIntervalAtBeatPure(
+            boundDom.overviewIntervalIndex,
+            densityLocation.beat,
+            {
+                kind: density.dataset.compositeMapDensityKind,
+                state: density.dataset.compositeMapDensityState,
+            },
+        ) : null;
+        const densityKind = density?.dataset.compositeMapDensityKind;
+        const densityPassageId = densityKind === 'passage' && densityItem?.id != null
+            ? String(densityItem.id) : '';
         const resumeMode = hybridSession.previewMode;
         const resumePlaying = hybridSession.previewPlaying && S.playing;
         const gestureStartTime = hybridSession.timelineSeekTime;
@@ -3034,9 +3160,12 @@ function bindCompositeTimelineEvents() {
             startY: event.clientY,
             latestClientX: event.clientX,
             moved: false,
-            passageId: passage?.dataset.compositeMapPassage || '',
-            decisionIndex: decision ? Number(decision.dataset.compositeMapDecision) : -1,
-            rect: surface.getBoundingClientRect(),
+            passageId: passage?.dataset.compositeMapPassage
+                || densityPassageId,
+            decisionIndex: decision ? Number(decision.dataset.compositeMapDecision)
+                : densityKind === 'decision' && Number.isInteger(densityItem?.index)
+                    ? densityItem.index : -1,
+            rect,
             frame: 0,
             location: null,
             resumeMode,
@@ -3094,7 +3223,7 @@ function bindCompositeTimelineEvents() {
             hybridSession.timelineFocusReview = false;
             hybridSession.timelineSeekTime = location.time;
             hybridSession.timelineScrollLeft = location.scrollLeft;
-            renderResult();
+            if (!refreshCurrentCompositeReview()) renderResult();
             return;
         }
         resumeMapPreview(gesture);
@@ -3449,6 +3578,7 @@ function refreshCompositeTimelineStaticMap(dom, view) {
     const replacementSvg = elementFromCompositeMarkup(
         renderCompositeTimelineMapSvg(view, viewport));
     if (previousSvg && replacementSvg) previousSvg.replaceWith(replacementSvg);
+    dom.overviewIntervalIndex = compositeTimelineOverviewIntervalIndexPure(view);
     const key = map.parentElement?.querySelector('[data-composite-map-key]');
     if (key) key.innerHTML = compositeTimelineMapKeyMarkup(view);
     updateCompositeTimelineMapViewport(dom, view, dom.scroller,
@@ -3483,6 +3613,9 @@ function scheduleCompositeReviewTimelineRefresh(conflictId) {
             const presentation = currentCompositeReviewPresentation(plan);
             if (!presentation?.timelineView) return;
             dom.view = presentation.timelineView;
+            if (hybridSession.timelineFocusReview) {
+                centerCurrentReviewInTimeline(presentation.timelineView, dom.scroller);
+            }
             dom.reviewRefreshPending = true;
             refreshCompositePreviewAvailability(presentation.timelineView);
             refreshCompositeTimelineHeaders(dom, presentation.timelineView);
@@ -3517,10 +3650,9 @@ function scheduleCompositeReviewTimelineRefresh(conflictId) {
     });
 }
 
-// Resolution and manual-note changes keep the same review decision in place.
-// Retain its workspace, controls, scroll camera, and listeners; replace only
-// the decision toolbar, then build updated lane SVGs in the hidden camera and
-// atomically swap them during idle time.
+// Choices, manual-note edits, and decision navigation retain the review
+// workspace, controls, and listeners. Replace only the decision toolbar, then
+// build the new focused model and lane SVGs after paint in the hidden camera.
 function refreshCurrentCompositeReview() {
     const plan = hybridSession.plan;
     const previousToolbar = byId('editor-composite-result')
@@ -3528,7 +3660,7 @@ function refreshCurrentCompositeReview() {
     const dom = timelineViewportDom;
     const conflict = plan?.conflicts?.[hybridSession.conflictIndex];
     if (hybridSession.stage !== 'review' || !plan || !conflict || !previousToolbar
-            || !dom?.view?.review || dom.view.review.id !== conflict.id) {
+            || !dom?.view?.review) {
         return false;
     }
     if (hybridSession.previewMode) endCompositePreviewPlayback();

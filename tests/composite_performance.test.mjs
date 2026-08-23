@@ -4,7 +4,9 @@ import test from 'node:test';
 import {
     _resetHybridPerformanceForTest,
     hybridPerfCount,
+    hybridPerfFrame,
     hybridPerfGauge,
+    hybridPerfResetFrame,
     hybridPerfSample,
     hybridPerfSummaryPure,
     hybridPerformanceAssessmentPure,
@@ -26,6 +28,7 @@ test('Hybrid release assessment never turns missing traces into false passes', (
     const assessed = hybridPerformanceAssessmentPure({
         timings: {
             'audio.preview.startMs': { count: 3, p95: 7 },
+            'ui.preview.requestMs': { count: 3, p95: 18 },
             'audio.preview.stopMs': { count: 3, p95: 3 },
             'audio.preview.muteScheduleMs': { count: 1, max: 2 },
             'timeline.playhead.frameMs': { count: 120, p95: 16.9 },
@@ -79,4 +82,17 @@ test('Hybrid telemetry records timings, counters, and gauges in memory only', ()
     assert.equal(snapshot.timings['timeline.renderMs'].p95, 18);
     assert.equal(snapshot.counters['guide.dropped'], 3);
     assert.equal(snapshot.gauges['timeline.nodes'], 975);
+});
+
+test('Hybrid frame traces reset between stopped preview sessions', () => {
+    setHybridPerformanceEnabled(true);
+    hybridPerfFrame('timeline.playhead', 100);
+    hybridPerfFrame('timeline.playhead', 116);
+    hybridPerfResetFrame('timeline.playhead');
+    hybridPerfFrame('timeline.playhead', 5_000);
+    hybridPerfFrame('timeline.playhead', 5_017);
+    const summary = hybridPerformanceSnapshot().timings['timeline.playhead.frameMs'];
+    assert.equal(summary.count, 2);
+    assert.equal(summary.max, 17,
+        'time spent stopped is not misreported as a dropped display frame');
 });

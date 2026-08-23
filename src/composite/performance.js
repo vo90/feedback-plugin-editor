@@ -84,6 +84,10 @@ export function hybridPerfFrame(name, timestamp) {
     if (Number.isFinite(previous)) boundedPush(telemetry.samples, `${key}.frameMs`, Number(timestamp) - previous);
 }
 
+export function hybridPerfResetFrame(name) {
+    telemetry.frames.delete(String(name));
+}
+
 function percentile(sorted, ratio) {
     if (!sorted.length) return 0;
     const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1));
@@ -121,6 +125,10 @@ const RELEASE_GATES = Object.freeze([
     Object.freeze({
         id: 'transport-start', label: 'Warm preview start',
         timing: 'audio.preview.startMs', limit: 8, statistic: 'p95', unit: 'ms',
+    }),
+    Object.freeze({
+        id: 'preview-request', label: 'Warm Play request to running transport',
+        timing: 'ui.preview.requestMs', limit: 25, statistic: 'p95', unit: 'ms',
     }),
     Object.freeze({
         id: 'transport-stop', label: 'Preview stop',
