@@ -25,6 +25,9 @@ import {
     normalizeCompositeGapFillOptions,
 } from '../src/composite/gap-fill-engine.js';
 import { analyzeGuidedComposite } from '../src/composite/guided-engine.js';
+import { flattenChords, reconstructChords } from '../src/chords.js';
+import { LC } from '../src/lanes.js';
+import { S } from '../src/state.js';
 
 test('gap window lookup preserves exhaustive results without rescanning earlier gaps', () => {
     const windows = Array.from({ length: 2000 }, (_, index) => ({
@@ -1040,4 +1043,291 @@ test('materialization preserves beat timing and leaves both sources untouched', 
     assert.equal(result.notes[0].techniques.vibrato, true);
     assert.deepEqual({ primary, secondary }, before);
     assert.notEqual(result.tones, primary.tones);
+});
+
+test('materialization preserves complete flattened chords through the save-shaped rebuild', t => {
+    const chordNote = (time, string, fret, chordId, highDensity = false, fn = null) => ({
+        time,
+        sustain: 0,
+        string,
+        fret,
+        techniques: {},
+        _fromChord: true,
+        _chordId: chordId,
+        _highDensity: highDensity,
+        _fn: fn,
+    });
+    const baseFn = { rn: 'I', q: 'maj', deg: 0 };
+    const primary = arr('Base', [
+        chordNote(1, 0, 3, 0, true, baseFn),
+        chordNote(1, 1, 2, 0, true, baseFn),
+    ], {
+        chord_templates: [{
+            name: 'Base A',
+            displayName: 'A major',
+            frets: [3, 2, -1, -1, -1, -1],
+            fingers: [2, 1, -1, -1, -1, -1],
+            arp: false,
+            voicing: 'open',
+            caged: 'A',
+            guideTones: [0, 4, 7],
+        }],
+        handshapes: [{ chord_id: 0, start_time: 0.9, end_time: 1.1, arp: false }],
+        anchors: [{ time: 0, fret: 1 }],
+        anchors_user: [{ time: 0.5, fret: 2 }],
+        phrases: [{ start_time: 0, name: 'Verse' }],
+    });
+    const secondary = arr('Fill', [
+        // Same voicing: Base metadata wins the deterministic fret-pattern dedupe.
+        chordNote(3, 0, 3, 0),
+        chordNote(3, 1, 2, 0),
+    ], {
+        // Also cover a source still in save-shaped (non-flattened) form.
+        chords: [{
+            time: 5,
+            chord_id: 1,
+            high_density: false,
+            notes: [
+                { time: 5, string: 2, fret: 7, sustain: 0, techniques: {} },
+                { time: 5, string: 3, fret: 9, sustain: 0, techniques: {} },
+            ],
+        }],
+        chord_templates: [
+            {
+                name: 'Fill A alias',
+                frets: [3, 2, -1, -1, -1, -1],
+                fingers: [1, 1, -1, -1, -1, -1],
+            },
+            {
+                name: 'Fill B',
+                displayName: 'B fill',
+                frets: [-1, -1, 7, 9, -1, -1],
+                fingers: [-1, -1, 1, 3, -1, -1],
+                arp: true,
+            },
+        ],
+        handshapes: [
+            { chord_id: 0, start_time: 2.9, end_time: 3.1, arp: false },
+            { chord_id: 1, start_time: 4.9, end_time: 5.1, arp: true },
+        ],
+        anchors: [{ time: 4, fret: 9 }],
+        phrases: [{ start_time: 4, name: 'Fill only' }],
+    });
+    const beforeSources = structuredClone({ primary, secondary });
+    const plan = sharedPlan(primary, secondary);
+    const result = materializeCompositeArrangement(plan, 'Metadata Hybrid');
+
+    assert.deepEqual(result.chord_templates.map(template => template.name), ['Base A', 'Fill B']);
+    assert.deepEqual(result.chord_templates[0], {
+        name: 'Base A',
+        displayName: 'A major',
+        frets: [3, 2, -1, -1, -1, -1],
+        fingers: [2, 1, -1, -1, -1, -1],
+        arp: false,
+        voicing: 'open',
+        caged: 'A',
+        guideTones: [0, 4, 7],
+    });
+    assert.deepEqual(result.notes.map(entry => entry._chordId), [0, 0, 0, 0, 1, 1]);
+    assert.deepEqual(result.handshapes.map(handshape => handshape.chord_id), [0, 0, 1]);
+    assert.deepEqual(result.anchors, primary.anchors);
+    assert.deepEqual(result.anchors_user, primary.anchors_user);
+    assert.deepEqual(result.phrases, primary.phrases);
+    assert.notEqual(result.anchors, primary.anchors);
+    assert.notEqual(result.phrases, primary.phrases);
+    assert.deepEqual({ primary, secondary }, beforeSources,
+        'analysis and materialization leave both source arrangements untouched');
+
+    const previousState = {
+        arrangements: S.arrangements,
+        currentArr: S.currentArr,
+        history: S.history,
+        handshapeSel: S.handshapeSel,
+        laneCacheActive: LC.active,
+    };
+    t.after(() => {
+        S.arrangements = previousState.arrangements;
+        S.currentArr = previousState.currentArr;
+        S.history = previousState.history;
+        S.handshapeSel = previousState.handshapeSel;
+        LC.active = previousState.laneCacheActive;
+    });
+    S.arrangements = [result];
+    S.currentArr = 0;
+    S.history = { reset() {} };
+    S.handshapeSel = null;
+    LC.active = false;
+
+    reconstructChords();
+    const saveShaped = S.arrangements[0];
+    assert.equal(saveShaped.notes.length, 0);
+    assert.deepEqual(saveShaped.chords.map(chord => [chord.time, chord.chord_id,
+        chord.high_density]), [
+        [1, 0, true],
+        [3, 0, false],
+        [5, 1, false],
+    ]);
+    assert.deepEqual(saveShaped.chords[0].fn, baseFn);
+    assert.deepEqual(saveShaped.chord_templates.map(template => template.name),
+        ['Base A', 'Fill B']);
+    assert.deepEqual(saveShaped.handshapes.map(handshape => handshape.chord_id), [0, 0, 1]);
+    assert.deepEqual(saveShaped.anchors, primary.anchors);
+    assert.deepEqual(saveShaped.phrases, primary.phrases);
+    assert.deepEqual({ primary, secondary }, beforeSources);
+
+    // Exercise the editor's inverse half too: reopening/editing flattens the
+    // save-shaped chord instances before the following save rebuilds them.
+    flattenChords();
+    assert.equal(S.arrangements[0].notes.filter(note => note._highDensity).length, 2);
+    reconstructChords();
+    assert.deepEqual(S.arrangements[0].chords.map(chord => chord.high_density),
+        [true, false, false]);
+    assert.deepEqual(S.arrangements[0].chord_templates.map(template => template.name),
+        ['Base A', 'Fill B']);
+    assert.deepEqual(S.arrangements[0].handshapes.map(handshape => handshape.chord_id), [0, 0, 1]);
+});
+
+test('a partially selected source chord becomes a stable metadata-neutral reduced chord', t => {
+    const chord = [
+        { time: 1, sustain: 0, string: 0, fret: 3, techniques: {},
+            _fromChord: true, _chordId: 0, _fn: { rn: 'I' } },
+        { time: 1, sustain: 0, string: 1, fret: 2, techniques: {},
+            _fromChord: true, _chordId: 0, _fn: { rn: 'I' } },
+        { time: 1, sustain: 0, string: 2, fret: 0, techniques: {},
+            _fromChord: true, _chordId: 0, _fn: { rn: 'I' } },
+    ];
+    const primary = arr('Base', chord, {
+        chord_templates: [{
+            name: 'Full triad',
+            frets: [3, 2, 0, -1, -1, -1],
+            fingers: [3, 2, 1, -1, -1, -1],
+        }],
+        handshapes: [{ chord_id: 0, start_time: 0.9, end_time: 1.1, arp: false }],
+    });
+    const secondary = arr('Fill', []);
+    const beforeSources = structuredClone({ primary, secondary });
+    const plan = sharedPlan(primary, secondary);
+    plan.fixedEntries = plan.fixedEntries.slice(0, 2);
+    const result = materializeCompositeArrangement(plan, 'Partial Hybrid');
+
+    assert.equal(result.notes.length, 2);
+    assert.ok(result.notes.every(entry => entry._fromChord === undefined
+        && entry._chordId === undefined && entry._fn === undefined));
+    assert.deepEqual(result.chord_templates, []);
+    assert.deepEqual(result.handshapes, []);
+    assert.deepEqual({ primary, secondary }, beforeSources);
+
+    const previousState = {
+        arrangements: S.arrangements,
+        currentArr: S.currentArr,
+        history: S.history,
+        handshapeSel: S.handshapeSel,
+        laneCacheActive: LC.active,
+    };
+    t.after(() => {
+        S.arrangements = previousState.arrangements;
+        S.currentArr = previousState.currentArr;
+        S.history = previousState.history;
+        S.handshapeSel = previousState.handshapeSel;
+        LC.active = previousState.laneCacheActive;
+    });
+    S.arrangements = [result];
+    S.currentArr = 0;
+    S.history = { reset() {} };
+    S.handshapeSel = null;
+    LC.active = false;
+
+    reconstructChords();
+    assert.equal(S.arrangements[0].notes.length, 0);
+    assert.equal(S.arrangements[0].chords.length, 1);
+    assert.equal(S.arrangements[0].chords[0].fn, null);
+    assert.deepEqual(S.arrangements[0].chords[0].notes.map(entry => [entry.string, entry.fret]), [
+        [0, 3],
+        [1, 2],
+    ]);
+    assert.equal(S.arrangements[0].chord_templates.length, 1);
+    assert.deepEqual(S.arrangements[0].chord_templates[0].frets,
+        [3, 2, -1, -1, -1, -1]);
+    assert.equal(S.arrangements[0].chord_templates[0].name, '');
+    assert.deepEqual(S.arrangements[0].handshapes, []);
+
+    // Reopen/edit/save shape: the reduced chord remains a reduced chord and
+    // cannot regain the source triad's harmony, template name, or handshape.
+    flattenChords();
+    reconstructChords();
+    assert.equal(S.arrangements[0].notes.length, 0);
+    assert.equal(S.arrangements[0].chords.length, 1);
+    assert.equal(S.arrangements[0].chords[0].fn, null);
+    assert.deepEqual(S.arrangements[0].chords[0].notes.map(entry => [entry.string, entry.fret]), [
+        [0, 3],
+        [1, 2],
+    ]);
+    assert.equal(S.arrangements[0].chord_templates.length, 1);
+    assert.equal(S.arrangements[0].chord_templates[0].name, '');
+    assert.deepEqual(S.arrangements[0].handshapes, []);
+    assert.deepEqual({ primary, secondary }, beforeSources);
+});
+
+test('an authored chord plus an unrelated same-time note saves as one neutral chord', t => {
+    const baseFn = { rn: 'I', q: 'maj', deg: 0 };
+    const primary = arr('Base', [
+        { time: 1, sustain: 0, string: 0, fret: 3, techniques: {},
+            _fromChord: true, _chordId: 0, _fn: baseFn },
+        { time: 1, sustain: 0, string: 1, fret: 2, techniques: {},
+            _fromChord: true, _chordId: 0, _fn: baseFn },
+    ], {
+        chord_templates: [{
+            name: 'Authored dyad',
+            frets: [3, 2, -1, -1, -1, -1],
+            fingers: [2, 1, -1, -1, -1, -1],
+        }],
+        handshapes: [{ chord_id: 0, start_time: 0.9, end_time: 1.1, arp: false }],
+    });
+    const secondary = arr('Fill', [
+        { time: 1, sustain: 0, string: 2, fret: 7, techniques: {} },
+    ]);
+    const beforeSources = structuredClone({ primary, secondary });
+    const result = materializeCompositeArrangement(
+        sharedPlan(primary, secondary), 'Same-time Hybrid');
+
+    assert.equal(result.notes.length, 3);
+    assert.deepEqual(result.chord_templates, [],
+        'source metadata is not attached to only a subset of the save-time chord');
+    assert.deepEqual(result.handshapes, []);
+    assert.ok(result.notes.every(entry => entry._fromChord === undefined
+        && entry._chordId === undefined && entry._fn === undefined));
+
+    const previousState = {
+        arrangements: S.arrangements,
+        currentArr: S.currentArr,
+        history: S.history,
+        handshapeSel: S.handshapeSel,
+        laneCacheActive: LC.active,
+    };
+    t.after(() => {
+        S.arrangements = previousState.arrangements;
+        S.currentArr = previousState.currentArr;
+        S.history = previousState.history;
+        S.handshapeSel = previousState.handshapeSel;
+        LC.active = previousState.laneCacheActive;
+    });
+    S.arrangements = [result];
+    S.currentArr = 0;
+    S.history = { reset() {} };
+    S.handshapeSel = null;
+    LC.active = false;
+
+    reconstructChords();
+    assert.equal(S.arrangements[0].chords.length, 1);
+    assert.deepEqual(S.arrangements[0].chords[0].notes.map(entry => entry.string), [0, 1, 2]);
+    assert.equal(S.arrangements[0].chords[0].fn, null);
+    assert.equal(S.arrangements[0].chord_templates.length, 1);
+    assert.equal(S.arrangements[0].chord_templates[0].name, '');
+    assert.deepEqual(S.arrangements[0].handshapes, []);
+
+    flattenChords();
+    reconstructChords();
+    assert.deepEqual(S.arrangements[0].chords[0].notes.map(entry => entry.string), [0, 1, 2]);
+    assert.equal(S.arrangements[0].chord_templates[0].name, '');
+    assert.deepEqual({ primary, secondary }, beforeSources);
 });

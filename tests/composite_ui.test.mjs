@@ -18,7 +18,6 @@ import {
     markHybridReviewWork,
     installHybridPlan,
     markHybridResolutionChanged,
-    markHybridViewChanged,
     resetHybridBuilderReview,
 } from '../src/composite/session.js';
 import { createHybridPreferenceWriter } from '../src/composite/preferences.js';
@@ -58,7 +57,7 @@ test('Hybrid review uses one responsive sticky toolbar instead of a side or belo
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
     const theme = fs.readFileSync(new URL('../assets/composite/hybrid.css', import.meta.url), 'utf8');
     assert.match(resolver, /editor-composite-review-toolbar/);
-    assert.match(resolver, /Decision details/);
+    assert.match(resolver, /Section details/);
     assert.match(resolver,
         /renderCompositeTimelineWorkspace\(\s*presentation\.timelineView, false, presentation\.reviewToolbar\)/);
     assert.match(resolver, /editor-composite-review-details-open-up/);
@@ -141,6 +140,8 @@ test('same-decision Hybrid choices retain the workspace and update its live mode
 
 test('Hybrid review navigation and guide playback reuse indexed revision caches', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const modelCache = fs.readFileSync(
+        new URL('../src/composite/review-model-cache.js', import.meta.url), 'utf8');
     const guidedStart = resolver.indexOf('function guidedRepeatContext');
     const guidedEnd = resolver.indexOf('\nfunction resolveReviewChoice', guidedStart);
     assert.match(resolver.slice(guidedStart, guidedEnd),
@@ -155,13 +156,21 @@ test('Hybrid review navigation and guide playback reuse indexed revision caches'
         'all timeline and guide consumers share the resolved-entry cache');
     const wholeStart = resolver.indexOf('function wholePlanPreviewView');
     const wholeEnd = resolver.indexOf('\nfunction reviewPlanTimelineView', wholeStart);
-    assert.match(resolver.slice(wholeStart, wholeEnd), /resultEntriesPrepared:\s*true/,
-        'the full-song view does not sort the cached resolved revision again');
+    const wholeBody = resolver.slice(wholeStart, wholeEnd);
+    assert.match(wholeBody,
+        /compositeBaseTimelineViews\.get\(plan, signature,[\s\S]*resultEntriesPrepared:\s*true/,
+        'the immutable full-song model is built once per plan/resolution signature');
     const reviewStart = wholeEnd;
     const reviewEnd = resolver.indexOf('\nfunction currentTimelineView', reviewStart);
-    assert.match(resolver.slice(reviewStart, reviewEnd),
-        /resultEntriesPrepared = true[\s\S]*compositeEntriesKeepSortPosition[\s\S]*resultEntriesPrepared,/,
-        'review skips sorting only while local annotations preserve the resolved order');
+    const reviewBody = resolver.slice(reviewStart, reviewEnd);
+    assert.match(reviewBody,
+        /const baseView = wholePlanPreviewView\(\)[\s\S]*compositeReviewResultEntries\(baseResult, localResult\)[\s\S]*entryAnnotations: annotations/,
+        'decision navigation shares full lanes and applies only conflict-local annotations');
+    assert.doesNotMatch(reviewBody, /buildCompositeTimelineViewModel|lane\.entries\.map/,
+        'moving between decisions never rebuilds the base timeline or clones every lane entry');
+    assert.match(modelCache,
+        /IMMUTABLE_ENTRY_INDEXES[\s\S]*BEAT_BOUNDARY_INDEXES[\s\S]*createCompositeBaseTimelineCache/,
+        'feature-owned indexes retain immutable source, beat, and base timeline work');
     const eventsStart = resolver.indexOf('function compositePreviewEventsForMode');
     const eventsEnd = resolver.indexOf('\nfunction scheduleCompositePreviewEventPrewarm', eventsStart);
     const eventsBody = resolver.slice(eventsStart, eventsEnd);
@@ -277,13 +286,18 @@ test('Hybrid analysis and creation use cancellable background tasks with stale g
     const analyzeStart = resolver.indexOf('async function analyzeFromDialog');
     const analyzeEnd = resolver.indexOf('async function finishMerge', analyzeStart);
     const analyzeBody = resolver.slice(analyzeStart, analyzeEnd);
-    assert.match(analyzeBody, /beginHybridAnalysis\(hybridSession, \{ sessionId, configToken \}\)/);
+    assert.match(analyzeBody,
+        /beginHybridAnalysis\(hybridSession, \{[\s\S]*sessionId,[\s\S]*configToken,[\s\S]*editGeneration:\s*editor\.editGeneration/,
+        'analysis records the exact Editor edit generation that produced its snapshot');
     assert.match(analyzeBody, /signal:\s*request\.controller\.signal/);
     assert.match(analyzeBody, /hybridAnalysisIsCurrent/);
     assert.match(analyzeBody, /completeHybridAnalysis/);
     assert.match(analyzeBody,
-        /installHybridPlan\(hybridSession, plan, request\.sessionId\)/,
-        'the completed plan retains the song session that produced it');
+        /settleStaleRequest[\s\S]*source tracks or Setup settings changed[\s\S]*editor-composite-setup-notice[\s\S]*setCompositeEditorStatus/,
+        'same-song invalidation explains why analysis returned to Setup');
+    assert.match(analyzeBody,
+        /installHybridPlan\(hybridSession, plan, request\.sessionId, request\.editGeneration,[\s\S]*request\.sourceGuard\)/,
+        'the completed plan retains the song, edit generation, and direct-source guard that produced it');
     assert.doesNotMatch(analyzeBody,
         /analyzeGapFillComposite|analyzeGuidedComposite/,
         'the modal must not run a planner directly on the renderer thread');
@@ -298,8 +312,11 @@ test('Hybrid analysis and creation use cancellable background tasks with stale g
         /beginHybridCreation\(hybridSession, \{[\s\S]*sessionId:\s*hybridSession\.planSessionId/,
         'creation uses plan ownership, not whichever Editor session is current later');
     assert.match(finishBody,
-        /creationRequestIsCurrent[\s\S]*editor\.format === 'sloppak'[\s\S]*editor\.sessionId === hybridSession\.planSessionId/,
-        'every delayed creation checkpoint validates both project format and plan owner');
+        /beginHybridCreation\(hybridSession, \{[\s\S]*editGeneration:\s*hybridSession\.planEditGeneration/,
+        'creation retains the exact Editor edit generation that was reviewed');
+    assert.match(finishBody,
+        /creationRequestIsCurrent[\s\S]*hybridPlanEditorIsCurrent\(editor\)[\s\S]*hybridCreationIsCurrent/,
+        'every delayed creation checkpoint validates project, plan, edits, and direct source identity');
     assert.ok(finishBody.indexOf('setCompositeCreationUi(true)')
         < finishBody.indexOf('await waitForCompositeUiPaint()'),
     'Creating state is installed before yielding a paint');
@@ -377,14 +394,14 @@ test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () 
     assert.doesNotMatch(resolver, /action\.kind === 'native-activation'/,
         'focused modal controls do not create a second Space-button activation path');
     assert.match(resolver,
-        /editable:\s*compositeModalControlEditingTarget\(target\)[\s\S]*spaceEditable:\s*textEditing/,
-        'range/select navigation stays native while only actual text editing suppresses Space');
+        /editable:\s*compositeModalControlEditingTarget\(target\)[\s\S]*spaceEditable:\s*compositeModalSpaceReservedTarget\(target\)/,
+        'focused controls keep native Space activation while the timeline background owns transport Space');
     assert.match(resolver,
         /transportAvailable:\s*compositePreviewTransportAvailable\(\)/,
         'modal shortcuts are gated by the visible, non-inert review workspace');
     assert.match(resolver,
         /COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES[\s\S]*'range'[\s\S]*return !COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES\.has/,
-        'range inputs remain transport controls while text-like inputs keep Space');
+        'range inputs remain non-text controls while their native Space behavior is reserved separately');
     assert.doesNotMatch(resolver, /function compositeModalNativeActivationTarget/);
     const shortcutStart = resolver.indexOf('function handleCompositeModalShortcut');
     const shortcutBody = resolver.slice(shortcutStart,
@@ -429,7 +446,7 @@ test('Hybrid preview lifecycle blocks loading races and stale review work', () =
     const previewEnd = resolver.indexOf('function keepCompositeContextLoop', previewStart);
     const previewBody = resolver.slice(previewStart, previewEnd);
     assert.match(previewBody,
-        /previewRequestIsCurrent[\s\S]*hybridPlanSessionIsCurrent[\s\S]*await controller\.setMode[\s\S]*previewRequestIsCurrent[\s\S]*await controller\.setTone[\s\S]*previewRequestIsCurrent/,
+        /previewRequestIsCurrent[\s\S]*hybridPlanEditorIsCurrent[\s\S]*await controller\.setMode[\s\S]*previewRequestIsCurrent[\s\S]*await controller\.setTone[\s\S]*previewRequestIsCurrent/,
         'each asynchronous preview preparation step retains request and song ownership');
     const controllerStart = resolver.indexOf('function ensureCompositePreviewController');
     const controllerEnd = resolver.indexOf(
@@ -618,7 +635,7 @@ test('Guided review navigation atomically moves distant decisions with the blue 
         "toolbar.querySelector('#editor-composite-apply-next')");
     assert.match(toolbarBody.slice(continueStart),
         /prepareCurrentReviewFocus\(true\)[\s\S]*refreshReviewDecision\(\)/,
-        'Continue to next choice uses the same explicit camera focus');
+        'Next unresolved uses the same explicit camera focus');
 
     const refreshStart = resolver.indexOf('function scheduleCompositeReviewTimelineRefresh');
     const refreshEnd = resolver.indexOf('\nfunction refreshCurrentCompositeReview', refreshStart);
@@ -1051,7 +1068,7 @@ test('Hybrid analysis requests are cancellable and stale results cannot replace 
     assert.equal(completeHybridAnalysis(session, second), true);
 });
 
-test('Hybrid revisions distinguish plan, resolution, and view-only changes', () => {
+test('Hybrid revisions distinguish plan replacement from resolution changes', () => {
     const session = createHybridBuilderSession();
     const plan = { strategy: 'guided' };
     assert.equal(installHybridPlan(session, plan, 'song-a'), 1);
@@ -1059,10 +1076,8 @@ test('Hybrid revisions distinguish plan, resolution, and view-only changes', () 
     assert.equal(session.planSessionId, 'song-a');
     assert.equal(session.resolutionRevision, 0);
     assert.equal(markHybridResolutionChanged(session), 1);
-    assert.equal(markHybridViewChanged(session), 3);
     assert.equal(session.planRevision, 1);
     assert.equal(session.resolutionRevision, 1);
-    assert.equal(session.viewRevision, 3);
 });
 
 test('Hybrid creation becomes stale after a song switch or plan replacement', () => {
@@ -1119,4 +1134,40 @@ test('a stale Hybrid response cannot complete a newer creation request', () => {
     assert.equal(hybridCreationIsCurrent(session, second, {
         sessionId: 'song-a', plan: secondPlan,
     }), true);
+});
+
+test('Hybrid timeline seek and resize surfaces expose keyboard slider semantics', () => {
+    const resolver = fs.readFileSync(
+        new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const theme = fs.readFileSync(
+        new URL('../assets/composite/hybrid.css', import.meta.url), 'utf8');
+    assert.match(resolver,
+        /data-composite-lane-resize="\$\{lane\.id\}" role="separator" tabindex="0" aria-orientation="horizontal" \$\{compositeTimelineLaneResizeAriaAttributes\(height\)\}/,
+        'lane edges are focusable value separators');
+    assert.match(resolver,
+        /data-composite-timeline-ruler-svg[^>]*role="slider" tabindex="0" focusable="true" aria-orientation="horizontal" \$\{compositeTimelineSeekAriaAttributes\(view, initialPlayheadBeat\)\}/,
+        'each camera ruler is keyboard focusable with slider values');
+    assert.match(resolver,
+        /id="editor-composite-timeline-map" role="slider" tabindex="0" aria-orientation="horizontal" \$\{compositeTimelineSeekAriaAttributes\(view, initialPlayheadBeat\)\}/,
+        'the whole-song map exposes its current seek position');
+    assert.match(resolver,
+        /aria-valuemin="\$\{HYBRID_TIMELINE_LANE_MIN\}"[\s\S]*aria-valuemax="\$\{HYBRID_TIMELINE_LANE_MAX\}"[\s\S]*aria-valuenow="\$\{value\}"[\s\S]*aria-valuetext="\$\{value\} pixels high"/);
+    assert.match(resolver,
+        /function compositeModalControlEditingTarget[\s\S]*\[role="slider"\], \[role="separator"\]/,
+        'local timeline keys are not interpreted as global decision shortcuts');
+
+    const bindStart = resolver.indexOf('function bindCompositeTimelineEvents');
+    const bindEnd = resolver.indexOf('\nfunction renderFinalPreviewResult', bindStart);
+    const binding = resolver.slice(bindStart, bindEnd);
+    assert.match(binding,
+        /const seekFromTimelineKeyboard = event =>[\s\S]*_compositeTimelineKeyboardSeekPure[\s\S]*event\.preventDefault\(\);[\s\S]*event\.stopPropagation\(\);[\s\S]*seekCompositeTimelineAtTime/);
+    assert.match(binding,
+        /rulerSvg\?\.addEventListener\('keydown', seekFromTimelineKeyboard\)[\s\S]*map\?\.addEventListener\('keydown', seekFromTimelineKeyboard\)/);
+    assert.match(binding,
+        /grip\.addEventListener\('keydown', event =>[\s\S]*_compositeTimelineLaneResizeKeyPure[\s\S]*previewCompositeLaneHeight/);
+    assert.match(resolver,
+        /COMPOSITE_TIMELINE_ARIA_UPDATE_INTERVAL_MS = 1000[\s\S]*function updateCompositeTimelineSeekAria[\s\S]*aria-valuenow[\s\S]*function updateCompositeTimelineMapFrame[\s\S]*updateCompositeTimelineSeekAria\(dom, beat\)/,
+        'playback keeps values current at a human-scale cadence instead of every frame');
+    assert.match(theme,
+        /#editor-composite-modal #editor-composite-timeline-map:focus-visible,[\s\S]*data-composite-timeline-ruler-svg[^\n]*:focus-visible,[\s\S]*data-composite-lane-resize[^\n]*:focus-visible/);
 });

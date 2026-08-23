@@ -28,19 +28,19 @@ export function flattenChords() {
 // produce identical state each time — regardless of which arrangement is active.
 export function _flattenArrChords(arr) {
     if (!arr) return;
-    // Harmony function (§6.3.1) rides the chord INSTANCE. We carry it on the
-    // spread note objects — every note of the chord gets the same `_fn` — so it
-    // travels with the notes through ANY edit that mutates note.time (drag,
-    // global shift, time-scale, tempo remap). reconstructChords adopts a group's
-    // fn by majority vote (_groupFn), so a single note dragged into another chord
-    // is outvoted and can't impose a stale fn. (Supersedes the old time-keyed
-    // `arr._chordFn` store, which silently lost fn whenever a chord moved.)
+    // Harmony function (§6.3.1) and high-density both ride the chord INSTANCE.
+    // Carry them on the spread note objects so they travel through edits that
+    // mutate note.time (drag, global shift, time-scale, tempo remap).
+    // reconstructChords adopts each by majority vote, so a single note dragged
+    // into another chord cannot impose stale instance metadata. (`_fn`
+    // supersedes the old time-keyed `arr._chordFn` store.)
     delete arr._chordFn;
     if (!Array.isArray(arr.notes)) arr.notes = [];
     for (const ch of arr.chords || []) {
         const fn = _normChordFn(ch.fn);
+        const highDensity = _safeWireBool(ch.high_density, false);
         for (const cn of ch.notes || []) {
-            arr.notes.push({
+            const flattened = {
                 time: cn.time || ch.time,
                 string: cn.string,
                 fret: cn.fret,
@@ -49,7 +49,9 @@ export function _flattenArrChords(arr) {
                 _fromChord: true,
                 _chordId: ch.chord_id,
                 _fn: fn || null,
-            });
+            };
+            if (highDensity) flattened._highDensity = true;
+            arr.notes.push(flattened);
         }
     }
     arr.chords = [];
@@ -260,6 +262,15 @@ export function _groupFn(groupNotes) {
     for (const e of counts.values()) if (!best || e.n > best.n) best = e;
     return best && best.n * 2 > groupNotes.length ? best.fn : null;
 }
+
+function _groupHighDensity(groupNotes) {
+    if (!Array.isArray(groupNotes) || !groupNotes.length) return false;
+    let votes = 0;
+    for (const note of groupNotes) {
+        if (_safeWireBool(note && note._highDensity, false)) votes++;
+    }
+    return votes * 2 > groupNotes.length;
+}
 // E2: build an old-template-index -> new-template-index map for handshapes'
 // `chord_id` references after reconstructChords() rebuilt the template list.
 // `templateMap` (new fret-key -> new index) and `chordTemplates` (the new
@@ -375,6 +386,7 @@ export function reconstructChords() {
             delete group[0]._fn;
             delete group[0]._fromChord;
             delete group[0]._chordId;
+            delete group[0]._highDensity;
             newNotes.push(group[0]);
         } else {
             // Multiple notes at same time = chord
@@ -410,7 +422,7 @@ export function reconstructChords() {
             newChords.push({
                 time: group[0].time,
                 chord_id: tmplIdx,
-                high_density: false,
+                high_density: _groupHighDensity(group),
                 fn: _fn,
                 notes: group.map(n => ({
                     time: n.time,

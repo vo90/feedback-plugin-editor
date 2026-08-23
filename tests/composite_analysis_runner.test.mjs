@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { runHybridBackgroundTask } from '../src/composite/analysis-runner.js';
+import {
+    hybridLocalFallbackWorkSizePure,
+    runHybridBackgroundTask,
+} from '../src/composite/analysis-runner.js';
 import {
     _resetHybridPerformanceForTest,
     hybridPerformanceSnapshot,
@@ -85,6 +88,26 @@ test('Hybrid analysis remains functional when module Workers are unavailable', a
     assert.deepEqual(progress, ['analyze']);
     assert.doesNotThrow(() => structuredClone(result),
         'a plan returned through Worker.postMessage must remain cloneable');
+});
+
+test('Hybrid local fallback estimates expanded chord work and rejects renderer-blocking jobs', async () => {
+    const payload = analysisPayload();
+    payload.sources.primary.notes = [{}, {}];
+    payload.sources.secondary.chords = [{}];
+    assert.equal(hybridLocalFallbackWorkSizePure('analyze', payload), 8);
+
+    const progress = [];
+    await assert.rejects(
+        runHybridBackgroundTask('analyze', payload, {
+            workerFactory: () => null,
+            localWorkLimit: 7,
+            onProgress: phase => progress.push(phase),
+        }),
+        error => error?.name === 'NotSupportedError'
+            && error?.code === 'HYBRID_WORKER_REQUIRED'
+            && error?.workSize === 8,
+    );
+    assert.deepEqual(progress, [], 'unsupported work never begins on the renderer thread');
 });
 
 test('Hybrid analysis falls back locally when Worker postMessage cannot clone its payload', async () => {

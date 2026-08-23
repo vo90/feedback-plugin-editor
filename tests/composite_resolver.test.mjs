@@ -7,11 +7,16 @@ import {
     _compositeAnalysisConfigEqualPure,
     _compositeDefaultNameForSourcePure,
     _compositeGapFillPreferencesPure,
+    _compositeGuidedSummaryPure,
     _compositeGuidedPreferencesPure,
     _compositeModalShortcutPure,
     _compositePreviewPreferencesPure,
     _compositeReviewContinueLabelPure,
+    _compositeReviewCustomSelectionPure,
     _compositeSourcePairStatePure,
+    _compositeTimelineKeyboardSeekPure,
+    _compositeTimelineLaneResizeKeyPure,
+    _compositeTimelineSeekAriaPure,
     _compositeTimelineStageActivePure,
     _compositeTimelineEffectiveZoomPure,
     _compositeTimelineZoomControlsPure,
@@ -274,9 +279,20 @@ test('Hybrid timeline zoom defaults migrate once without losing other audition s
 });
 
 test('the guided review CTA becomes a full-song preview action after the final choice', () => {
-    assert.equal(_compositeReviewContinueLabelPure(3), 'Continue to next choice →');
-    assert.equal(_compositeReviewContinueLabelPure(1), 'Continue to next choice →');
+    assert.equal(_compositeReviewContinueLabelPure(3), 'Next unresolved →');
+    assert.equal(_compositeReviewContinueLabelPure(1), 'Next unresolved →');
     assert.equal(_compositeReviewContinueLabelPure(0), 'Preview full song →');
+});
+
+test('a repeated manual choice remains editable without a local draft', () => {
+    const selectedEntryIds = ['repeat-primary-1', 'repeat-secondary-2'];
+    const conflict = { resolution: 'custom', selectedEntryIds };
+    assert.equal(_compositeReviewCustomSelectionPure(conflict), selectedEntryIds,
+        'the mapped committed selection is used when visiting another occurrence');
+    const localDraft = ['repeat-secondary-2'];
+    assert.equal(_compositeReviewCustomSelectionPure(conflict, localDraft, true), localDraft,
+        'an occurrence-local draft still wins while editing');
+    assert.equal(_compositeReviewCustomSelectionPure({ resolution: 'primary' }), null);
 });
 
 test('the shared timeline and modal shortcuts cover review and final preview coherently', () => {
@@ -290,10 +306,9 @@ test('the shared timeline and modal shortcuts cover review and final preview coh
         kind: 'preview', mode: 'result',
     });
     assert.deepEqual(_compositeModalShortcutPure({ key: ' ' }), { kind: 'play-toggle' });
-    assert.deepEqual(_compositeModalShortcutPure({
-        key: ' ', editable: true, spaceEditable: false,
-    }), { kind: 'play-toggle' },
-    'a range or select keeps native editing keys but not a separate Space behavior');
+    assert.equal(_compositeModalShortcutPure({
+        key: ' ', editable: true, spaceEditable: true,
+    }), null, 'an interactive control keeps its native Space behavior');
     assert.equal(_compositeModalShortcutPure({
         key: ' ', editable: true, spaceEditable: true,
     }), null, 'text-editing controls keep literal Space input');
@@ -306,6 +321,16 @@ test('the shared timeline and modal shortcuts cover review and final preview coh
     assert.deepEqual(_compositeModalShortcutPure({ key: 'ArrowRight', stage: 'review' }), {
         kind: 'next',
     });
+    assert.equal(_compositeModalShortcutPure({
+        key: 'ArrowRight', stage: 'review', navigationReserved: true,
+    }), null, 'the focused timeline scroller keeps native horizontal keyboard panning');
+    assert.deepEqual(_compositeModalShortcutPure({
+        key: ' ', stage: 'review', navigationReserved: true,
+    }), { kind: 'play-toggle' }, 'native panning does not steal timeline transport Space');
+    assert.deepEqual(_compositeModalShortcutPure({
+        key: '2', stage: 'review', navigationReserved: true,
+    }), { kind: 'preview', mode: 'primary' },
+    'native panning does not disable sound-selection shortcuts');
     assert.equal(_compositeModalShortcutPure({ key: ' ', stage: 'setup' }), null,
         'Setup never exposes Hybrid transport shortcuts');
     assert.equal(_compositeModalShortcutPure({ key: '1', stage: 'setup' }), null);
@@ -323,6 +348,40 @@ test('the shared timeline and modal shortcuts cover review and final preview coh
     }), null);
     assert.equal(_compositeModalShortcutPure({ key: '2', editable: true }), null);
     assert.equal(_compositeModalShortcutPure({ key: '2', modified: true }), null);
+});
+
+test('timeline seek sliders and lane separators use bounded keyboard steps', () => {
+    const context = { startBeat: 4, endBeat: 36 };
+    assert.deepEqual(_compositeTimelineSeekAriaPure({ context }, 12.125), {
+        min: '4', max: '36', now: '12.125', text: 'Beat 12.125 of 36',
+    });
+    assert.deepEqual(_compositeTimelineSeekAriaPure({ context }, 99), {
+        min: '4', max: '36', now: '36', text: 'Beat 36 of 36',
+    }, 'ARIA values stay inside the same seek bounds as keyboard input');
+    const seek = (key, currentBeat = 12) => _compositeTimelineKeyboardSeekPure({
+        key, currentBeat, context, pageBeats: 8,
+    });
+    assert.equal(seek('ArrowLeft'), 11);
+    assert.equal(seek('ArrowDown'), 11);
+    assert.equal(seek('ArrowRight'), 13);
+    assert.equal(seek('ArrowUp'), 13);
+    assert.equal(seek('PageUp'), 4);
+    assert.equal(seek('PageDown'), 20);
+    assert.equal(seek('Home'), 4);
+    assert.equal(seek('End'), 36);
+    assert.equal(seek('ArrowLeft', 4), 4);
+    assert.equal(seek('ArrowRight', 36), 36);
+    assert.equal(seek('Enter'), null);
+
+    assert.equal(_compositeTimelineLaneResizeKeyPure('ArrowUp', 158), 150);
+    assert.equal(_compositeTimelineLaneResizeKeyPure('ArrowDown', 158), 166);
+    assert.equal(_compositeTimelineLaneResizeKeyPure('PageUp', 158), 128);
+    assert.equal(_compositeTimelineLaneResizeKeyPure('PageDown', 158), 190);
+    assert.equal(_compositeTimelineLaneResizeKeyPure('Home', 200), 128);
+    assert.equal(_compositeTimelineLaneResizeKeyPure('End', 200), 320);
+    assert.equal(_compositeTimelineLaneResizeKeyPure('ArrowUp', 128), 128);
+    assert.equal(_compositeTimelineLaneResizeKeyPure('ArrowDown', 320), 320);
+    assert.equal(_compositeTimelineLaneResizeKeyPure('ArrowLeft', 158), null);
 });
 
 test('Escape stops one active Hybrid preview before a separate press may close', () => {
@@ -410,6 +469,17 @@ test('automatic result summary uses player-facing track names and outcomes', () 
         description: 'Lead unchanged · 1 Rhythm note added · 2 skipped (too close)',
         added: 1,
         skipped: 2,
+    });
+});
+
+test('manual review summary distinguishes a completed review from no work needed', () => {
+    assert.deepEqual(_compositeGuidedSummaryPure({ reviewDecisions: 2 }, 2), {
+        title: 'Review complete ✓',
+        description: '2 choices complete · inspect or listen before creating',
+    });
+    assert.deepEqual(_compositeGuidedSummaryPure({ reviewDecisions: 0 }, 0), {
+        title: 'No review needed ✓',
+        description: 'The tracks match, or only one track plays at a time · inspect or listen before creating',
     });
 });
 

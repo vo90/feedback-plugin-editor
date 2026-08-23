@@ -10,7 +10,7 @@ import { arrKind } from '../instrument.js';
 import { timeOf } from '../beats.js';
 import { stopPlayback } from '../audio.js';
 import { _setBarSel, _setLoopRegionEnabled } from '../loop.js';
-import { S } from '../state.js';
+import { S, editGen } from '../state.js';
 import { setStatus } from '../ui.js';
 
 function editorState(bindings = {}) {
@@ -36,19 +36,76 @@ export function readCompositeEditorSnapshot(state = S) {
         sections: Array.isArray(state.sections) ? state.sections : [],
         sessionId: state.sessionId,
         format: state.format,
+        editGeneration: Number.isFinite(Number(editGen)) ? Number(editGen) : 0,
         currentIndex: Number.isInteger(state.currentArr) ? state.currentArr : 0,
     };
 }
 
 export function readCompositeAnalysisSnapshot(primaryIndex, secondaryIndex, state = S) {
     const editor = readCompositeEditorSnapshot(state);
+    const primary = editor.arrangements[primaryIndex];
+    const secondary = editor.arrangements[secondaryIndex];
     return {
         ...editor,
         primaryIndex,
         secondaryIndex,
-        primary: editor.arrangements[primaryIndex],
-        secondary: editor.arrangements[secondaryIndex],
+        primary,
+        secondary,
+        sourceGuard: createCompositeEditorSourceGuard({
+            primary, secondary, beats: editor.beats, sections: editor.sections,
+        }),
     };
+}
+
+const COMPOSITE_GUARDED_ARRAY_KEYS = Object.freeze([
+    'notes', 'chords', 'chord_templates', 'tuning', 'handshapes',
+    'anchors', 'anchors_user', 'phrases',
+]);
+
+function compositeGuardedArrangement(arrangement) {
+    const arrays = {};
+    for (const key of COMPOSITE_GUARDED_ARRAY_KEYS) {
+        const value = arrangement?.[key];
+        arrays[key] = { value, length: Array.isArray(value) ? value.length : null };
+    }
+    return { arrangement, arrays };
+}
+
+// Several legacy Editor import/remove paths replace arrays directly rather
+// than entering EditHistory (and therefore do not bump editGen). Keep this
+// feature-owned identity guard next to the normal generation check so an
+// asynchronous Hybrid analysis can never commit a snapshot of a source that
+// was removed or wholesale replaced while its Worker was running.
+export function createCompositeEditorSourceGuard({
+    primary, secondary, beats, sections,
+} = {}) {
+    return {
+        primary: compositeGuardedArrangement(primary),
+        secondary: compositeGuardedArrangement(secondary),
+        beats: { value: beats, length: Array.isArray(beats) ? beats.length : null },
+        sections: { value: sections, length: Array.isArray(sections) ? sections.length : null },
+    };
+}
+
+function compositeGuardedArrayIsCurrent(snapshot, value) {
+    return snapshot?.value === value
+        && snapshot?.length === (Array.isArray(value) ? value.length : null);
+}
+
+function compositeGuardedArrangementIsCurrent(snapshot, arrangements) {
+    const arrangement = snapshot?.arrangement;
+    if (!arrangement || !arrangements.includes(arrangement)) return false;
+    return COMPOSITE_GUARDED_ARRAY_KEYS.every(key =>
+        compositeGuardedArrayIsCurrent(snapshot.arrays?.[key], arrangement[key]));
+}
+
+export function compositeEditorSourceGuardIsCurrent(guard, state = S) {
+    if (!guard) return false;
+    const editor = readCompositeEditorSnapshot(state);
+    return compositeGuardedArrangementIsCurrent(guard.primary, editor.arrangements)
+        && compositeGuardedArrangementIsCurrent(guard.secondary, editor.arrangements)
+        && compositeGuardedArrayIsCurrent(guard.beats, editor.beats)
+        && compositeGuardedArrayIsCurrent(guard.sections, editor.sections);
 }
 
 export function compositeEditorSessionIsCurrent(sessionId, state = S) {

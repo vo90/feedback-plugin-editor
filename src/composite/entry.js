@@ -19,9 +19,8 @@ import {
 const STYLE_OWNER = 'hybrid-track-builder';
 const STYLE_URL = new URL('../../assets/composite/hybrid.css', import.meta.url).href;
 
-let stylePromise = null;
-let styleElement = null;
-let rejectStyleLoad = null;
+let styleLoadGeneration = 0;
+let activeStyleLoad = null;
 let editorScreenVisibilityObserver = null;
 
 // The Hybrid modal is mounted under <body> so it can fill the desktop window,
@@ -89,14 +88,86 @@ function matchingStyleElement() {
         .find(link => link.href === STYLE_URL) || null;
 }
 
+function ownsHybridStyleLoad(record) {
+    return !!record && activeStyleLoad === record
+        && activeStyleLoad.generation === record.generation;
+}
+
+function cancelHybridStyleLoad(cause) {
+    const record = activeStyleLoad;
+    if (!record) return false;
+    activeStyleLoad = null;
+    record.cleanup();
+    if (record.link?.isConnected) record.link.remove();
+    if (!record.settled) {
+        record.settled = true;
+        record.reject(cause);
+    }
+    return true;
+}
+
+function createHybridStyleLoad(link) {
+    let resolvePromise;
+    let rejectPromise;
+    const promise = new Promise((resolve, reject) => {
+        resolvePromise = resolve;
+        rejectPromise = reject;
+    });
+    const record = {
+        generation: ++styleLoadGeneration,
+        link,
+        promise,
+        resolve: resolvePromise,
+        reject: rejectPromise,
+        settled: false,
+        cleanup: () => {},
+    };
+    const loaded = () => {
+        // A removed link can still have a queued load event. Only the record
+        // that currently owns the feature stylesheet may settle shared state.
+        if (!ownsHybridStyleLoad(record) || record.settled) {
+            record.cleanup();
+            return;
+        }
+        record.settled = true;
+        record.cleanup();
+        link.dataset.loaded = 'true';
+        record.resolve(link);
+    };
+    const failed = () => {
+        if (!ownsHybridStyleLoad(record) || record.settled) {
+            record.cleanup();
+            return;
+        }
+        record.settled = true;
+        record.cleanup();
+        activeStyleLoad = null;
+        if (link.isConnected) link.remove();
+        record.reject(new Error('Hybrid Track stylesheet could not be loaded'));
+    };
+    record.cleanup = () => {
+        link.removeEventListener('load', loaded);
+        link.removeEventListener('error', failed);
+    };
+    activeStyleLoad = record;
+    link.addEventListener('load', loaded, { once: true });
+    link.addEventListener('error', failed, { once: true });
+    // A loaded link can be adopted from an earlier Editor injection.
+    if (link.dataset.loaded === 'true' || link.sheet) loaded();
+    return record;
+}
+
 export function ensureHybridTrackStyles() {
     if (typeof document === 'undefined') return Promise.resolve(null);
-    const existing = matchingStyleElement();
-    if (existing?.dataset.loaded === 'true') {
-        styleElement = existing;
-        return Promise.resolve(existing);
+    if (activeStyleLoad?.link?.isConnected
+            && activeStyleLoad.link.href === STYLE_URL) {
+        return activeStyleLoad.promise;
     }
-    if (stylePromise && styleElement?.isConnected) return stylePromise;
+    if (activeStyleLoad) {
+        cancelHybridStyleLoad(new Error('Hybrid Track stylesheet load was replaced'));
+    }
+
+    const existing = matchingStyleElement();
 
     for (const stale of document.querySelectorAll(
             `link[data-editor-feature-style="${STYLE_OWNER}"]`)) {
@@ -106,36 +177,9 @@ export function ensureHybridTrackStyles() {
     link.rel = 'stylesheet';
     link.href = STYLE_URL;
     link.dataset.editorFeatureStyle = STYLE_OWNER;
-    link.dataset.loaded = 'false';
+    if (link.dataset.loaded !== 'true') link.dataset.loaded = 'false';
     if (!link.isConnected) (document.head || document.documentElement).appendChild(link);
-    styleElement = link;
-
-    stylePromise = new Promise((resolve, reject) => {
-        rejectStyleLoad = reject;
-        const loaded = () => {
-            cleanup();
-            rejectStyleLoad = null;
-            link.dataset.loaded = 'true';
-            resolve(link);
-        };
-        const failed = () => {
-            cleanup();
-            rejectStyleLoad = null;
-            if (styleElement === link) styleElement = null;
-            link.remove();
-            stylePromise = null;
-            reject(new Error('Hybrid Track stylesheet could not be loaded'));
-        };
-        const cleanup = () => {
-            link.removeEventListener('load', loaded);
-            link.removeEventListener('error', failed);
-        };
-        link.addEventListener('load', loaded, { once: true });
-        link.addEventListener('error', failed, { once: true });
-        // A link adopted from an earlier in-flight import may already be ready.
-        if (link.sheet) loaded();
-    });
-    return stylePromise;
+    return createHybridStyleLoad(link).promise;
 }
 
 export async function editorShowCompositeArrangementModal() {
@@ -152,11 +196,7 @@ export function editorTeardownCompositeArrangementUi() {
         teardownCompositeArrangementUi();
     } finally {
         uninstallHybridPerformanceTools();
-        const rejectPending = rejectStyleLoad;
-        rejectStyleLoad = null;
-        rejectPending?.(new Error('Hybrid Track stylesheet load was cancelled'));
-        stylePromise = null;
-        if (styleElement?.isConnected) styleElement.remove();
-        styleElement = null;
+        cancelHybridStyleLoad(
+            new Error('Hybrid Track stylesheet load was cancelled'));
     }
 }

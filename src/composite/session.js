@@ -8,9 +8,10 @@ export function createHybridBuilderSession() {
     return {
         plan: null,
         planSessionId: null,
+        planEditGeneration: null,
+        planSourceGuard: null,
         planRevision: 0,
         resolutionRevision: 0,
-        viewRevision: 0,
         analysisConfig: null,
         setupDirty: false,
         setupDirtyMessage: '',
@@ -18,7 +19,9 @@ export function createHybridBuilderSession() {
         analysisRequestId: 0,
         analysisController: null,
         analysisSessionId: null,
+        analysisEditGeneration: null,
         analysisConfigToken: null,
+        analysisSourceGuard: null,
         stage: 'setup',
         hasReviewWork: false,
         conflictIndex: 0,
@@ -28,6 +31,9 @@ export function createHybridBuilderSession() {
         previewRequestId: 0,
         previewController: null,
         previewControllerSessionId: null,
+        previewControllerGeneration: 0,
+        previewControllerPending: null,
+        previewControllerDestroyPromise: null,
         previewRecordingGain: 1,
         wholeSongLoop: false,
         timelineSeekTime: 0,
@@ -40,6 +46,7 @@ export function createHybridBuilderSession() {
         createRequestId: 0,
         createController: null,
         createSessionId: null,
+        createEditGeneration: null,
         createPlan: null,
         closePromptPending: false,
         closeDecisionPromise: null,
@@ -47,30 +54,44 @@ export function createHybridBuilderSession() {
     };
 }
 
-export function beginHybridAnalysis(session, { sessionId, configToken } = {}) {
+export function beginHybridAnalysis(session, {
+    sessionId, configToken, editGeneration, sourceGuard = null,
+} = {}) {
     if (!session || session.analyzing || !sessionId || !configToken) return null;
     const controller = new AbortController();
     const request = {
         id: ++session.analysisRequestId,
         sessionId,
+        editGeneration: Number.isFinite(Number(editGeneration))
+            ? Math.trunc(Number(editGeneration)) : null,
         configToken,
+        sourceGuard,
         controller,
     };
     session.analyzing = true;
     session.analysisController = controller;
     session.analysisSessionId = sessionId;
+    session.analysisEditGeneration = request.editGeneration;
     session.analysisConfigToken = configToken;
+    session.analysisSourceGuard = sourceGuard;
     return request;
 }
 
-export function hybridAnalysisIsCurrent(session, request, { sessionId, configToken } = {}) {
+export function hybridAnalysisIsCurrent(session, request, {
+    sessionId, configToken, editGeneration, sourceGuard = request?.sourceGuard,
+} = {}) {
     return !!(session && request && session.analyzing
         && session.analysisRequestId === request.id
         && session.analysisController === request.controller
         && session.analysisSessionId === request.sessionId
+        && session.analysisEditGeneration === request.editGeneration
         && session.analysisConfigToken === request.configToken
+        && session.analysisSourceGuard === request.sourceGuard
         && sessionId === request.sessionId
+        && (request.editGeneration === null
+            || request.editGeneration === Math.trunc(Number(editGeneration)))
         && configToken === request.configToken
+        && sourceGuard === request.sourceGuard
         && !request.controller.signal.aborted);
 }
 
@@ -80,7 +101,9 @@ export function completeHybridAnalysis(session, request) {
     session.analyzing = false;
     session.analysisController = null;
     session.analysisSessionId = null;
+    session.analysisEditGeneration = null;
     session.analysisConfigToken = null;
+    session.analysisSourceGuard = null;
     return true;
 }
 
@@ -92,37 +115,40 @@ export function cancelHybridAnalysis(session) {
     session.analyzing = false;
     session.analysisController = null;
     session.analysisSessionId = null;
+    session.analysisEditGeneration = null;
     session.analysisConfigToken = null;
+    session.analysisSourceGuard = null;
     if (controller && !controller.signal.aborted) controller.abort();
     return wasAnalyzing;
 }
 
-export function installHybridPlan(session, plan, sessionId = null) {
+export function installHybridPlan(session, plan, sessionId = null, editGeneration = null,
+    sourceGuard = null) {
     if (!session) return 0;
     session.plan = plan || null;
     session.planSessionId = session.plan && sessionId ? sessionId : null;
+    session.planEditGeneration = session.plan && Number.isFinite(Number(editGeneration))
+        ? Math.trunc(Number(editGeneration)) : null;
+    session.planSourceGuard = session.plan ? sourceGuard : null;
     session.planRevision++;
     session.resolutionRevision = 0;
-    session.viewRevision++;
     return session.planRevision;
 }
 
-export function hybridPlanSessionIsCurrent(session, { sessionId, format } = {}) {
+export function hybridPlanSessionIsCurrent(session, {
+    sessionId, format, editGeneration,
+} = {}) {
     return !!(session?.plan && session.planSessionId
         && session.planSessionId === sessionId
+        && (session.planEditGeneration === null
+            || session.planEditGeneration === Math.trunc(Number(editGeneration)))
         && format === 'sloppak');
 }
 
 export function markHybridResolutionChanged(session) {
     if (!session) return 0;
     session.resolutionRevision++;
-    session.viewRevision++;
     return session.resolutionRevision;
-}
-
-export function markHybridViewChanged(session) {
-    if (!session) return 0;
-    return ++session.viewRevision;
 }
 
 export function markHybridReviewWork(session) {
@@ -143,29 +169,39 @@ export function hybridCloseAction(kind, choice) {
     return kind === 'creating' ? 'cancel-creation' : 'discard-review';
 }
 
-export function beginHybridCreation(session, { sessionId, plan } = {}) {
+export function beginHybridCreation(session, {
+    sessionId, plan, editGeneration,
+} = {}) {
     if (!session || session.creating || !sessionId || !plan) return null;
     const controller = new AbortController();
     const request = {
         id: ++session.createRequestId,
         sessionId,
+        editGeneration: Number.isFinite(Number(editGeneration))
+            ? Math.trunc(Number(editGeneration)) : null,
         plan,
         controller,
     };
     session.creating = true;
     session.createController = controller;
     session.createSessionId = sessionId;
+    session.createEditGeneration = request.editGeneration;
     session.createPlan = plan;
     return request;
 }
 
-export function hybridCreationIsCurrent(session, request, { sessionId, plan } = {}) {
+export function hybridCreationIsCurrent(session, request, {
+    sessionId, plan, editGeneration,
+} = {}) {
     return !!(session && request && session.creating
         && session.createRequestId === request.id
         && session.createController === request.controller
         && session.createSessionId === request.sessionId
+        && session.createEditGeneration === request.editGeneration
         && session.createPlan === request.plan
         && sessionId === request.sessionId
+        && (request.editGeneration === null
+            || request.editGeneration === Math.trunc(Number(editGeneration)))
         && plan === request.plan
         && !request.controller.signal.aborted);
 }
@@ -175,6 +211,7 @@ export function completeHybridCreation(session, request) {
     session.creating = false;
     session.createController = null;
     session.createSessionId = null;
+    session.createEditGeneration = null;
     session.createPlan = null;
     return true;
 }
@@ -187,6 +224,7 @@ export function cancelHybridCreation(session) {
     session.creating = false;
     session.createController = null;
     session.createSessionId = null;
+    session.createEditGeneration = null;
     session.createPlan = null;
     if (controller && !controller.signal.aborted) controller.abort();
     return wasCreating;
@@ -207,6 +245,7 @@ export function resetHybridBuilderReview(session) {
     session.previewMode = '';
     session.previewController = null;
     session.previewControllerSessionId = null;
+    session.previewControllerPending = null;
     session.previewRecordingGain = 1;
     session.previewRequestId++;
     session.wholeSongLoop = false;

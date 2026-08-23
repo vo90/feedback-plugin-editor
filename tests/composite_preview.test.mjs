@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 
 import {
     COMPOSITE_PREVIEW_TARGET_RMS,
-    compositePreviewAudioPolicyPure,
     compositePreviewEventsPure,
     createCompositePreviewEventCache,
     compositePreviewMixPure,
@@ -158,17 +157,6 @@ test('composite preview exposes four clearly isolated player-facing modes', () =
     ]);
 });
 
-test('composite preview audio modes never mix the recording with a generated guide', () => {
-    assert.deepEqual(compositePreviewAudioPolicyPure('song'), {
-        referenceAudio: 'audible', metronome: false, allowClapFallback: false,
-    });
-    for (const mode of ['primary', 'secondary', 'result']) {
-        assert.deepEqual(compositePreviewAudioPolicyPure(mode), {
-            referenceAudio: 'muted', metronome: false, allowClapFallback: false,
-        });
-    }
-});
-
 test('composite preview explains unavailable recording, empty lanes, and unresolved hybrid', () => {
     const modes = compositePreviewModesPure({
         names: { primary: 'Lead', secondary: 'Rhythm' },
@@ -191,13 +179,15 @@ test('one shared preview volume feeds exactly one of the four isolated paths', (
     assert.equal(compositePreviewVolumeGainPure(999), 1);
     assert.deepEqual(compositePreviewMixPure('song', {
         volume: 80, recordingGain: 0.25, toneTrimGain: 0.5,
-    }), { referenceGain: 0.2, guideGain: 0 });
+    }), { volume: 80, referenceGain: 0.25, guideGain: 0 });
     for (const mode of ['primary', 'secondary', 'result']) {
         assert.deepEqual(compositePreviewMixPure(mode, {
             volume: 80, recordingGain: 0.25, toneTrimGain: 0.5,
-        }), { referenceGain: 0, guideGain: 0.4 });
+        }), { volume: 80, referenceGain: 0, guideGain: 1 });
     }
-    assert.deepEqual(compositePreviewMixPure('unknown'), { referenceGain: 0, guideGain: 0 });
+    assert.deepEqual(compositePreviewMixPure('unknown'), {
+        volume: 75, referenceGain: 0, guideGain: 0,
+    });
 });
 
 function fakeBuffer(values, sampleRate = 1000, channels = 1) {

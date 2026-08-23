@@ -6,7 +6,7 @@
  * unambiguous material, and coalesces only adjacent divergent cells.
  */
 
-import { beatOf, timeOf } from '../beats.js';
+import { beatAtTime, timeAtBeat } from './timing-ports.js';
 import {
     COMPOSITE_BEAT_EPS,
     clearCompositeConflictResolution,
@@ -110,7 +110,7 @@ function sectionLabel(section) {
 function sectionMarkers(sections, beats) {
     return (Array.isArray(sections) ? sections : []).map((section, index) => {
         const beat = Number.isFinite(Number(section && section.beat))
-            ? Number(section.beat) : beatOf(beats, finite(section && section.start_time, NaN));
+            ? Number(section.beat) : beatAtTime(beats, finite(section && section.start_time, NaN));
         return { beat, label: sectionLabel(section), index };
     }).filter(marker => Number.isFinite(marker.beat))
         .sort((left, right) => left.beat - right.beat || left.index - right.index);
@@ -119,7 +119,7 @@ function sectionMarkers(sections, beats) {
 function phraseMarkers(arrangement, beats) {
     return (Array.isArray(arrangement && arrangement.phrases) ? arrangement.phrases : [])
         .map(phrase => Number.isFinite(Number(phrase && phrase.beat))
-            ? Number(phrase.beat) : beatOf(beats, finite(phrase && phrase.start_time, NaN)))
+            ? Number(phrase.beat) : beatAtTime(beats, finite(phrase && phrase.start_time, NaN)))
         .filter(Number.isFinite).sort((left, right) => left - right);
 }
 
@@ -133,7 +133,7 @@ function sharedPhraseMarkers(primary, secondary, beats) {
         let bestDelta = Infinity;
         for (let index = 0; index < right.length; index++) {
             if (used.has(index)) continue;
-            const delta = Math.abs(timeOf(beats, primaryBeat) - timeOf(beats, right[index]));
+            const delta = Math.abs(timeAtBeat(beats, primaryBeat) - timeAtBeat(beats, right[index]));
             if (delta < bestDelta) {
                 bestDelta = delta;
                 bestIndex = index;
@@ -184,7 +184,7 @@ function snapToMeasure(beat, measures, beats) {
     let nearest = null;
     let delta = Infinity;
     for (const marker of measures) {
-        const candidate = Math.abs(timeOf(beats, marker.beat) - timeOf(beats, beat));
+        const candidate = Math.abs(timeAtBeat(beats, marker.beat) - timeAtBeat(beats, beat));
         if (candidate < delta) {
             delta = candidate;
             nearest = marker;
@@ -309,8 +309,8 @@ function guidedOccupancyRecords(cells, lane, beats) {
     let maximumEndTime = -Infinity;
     let maximumAttackReachTime = -Infinity;
     for (const record of result) {
-        record.startTime = timeOf(beats, record.startBeat);
-        record.endTime = timeOf(beats, record.endBeat);
+        record.startTime = timeAtBeat(beats, record.startBeat);
+        record.endTime = timeAtBeat(beats, record.endBeat);
         record.attackTolerance = compositeTimingToleranceSeconds(beats, record.startBeat);
         record.attackReachTime = record.startTime + record.attackTolerance;
         maximumEndTime = Math.max(maximumEndTime, record.endTime);
@@ -510,7 +510,7 @@ function uniqueEntries(entries) {
 
 // Repetition identity describes the choice the reviewer must make, not the
 // complete material that will be emitted for an occurrence. Common entries
-// are fixed regardless of Lead/Rhythm/Custom and deliberately stay out of the
+// are fixed regardless of Base/Fill/Manual mix and deliberately stay out of the
 // signature. They remain in plan.fixedEntries and are validated in the
 // occurrence-specific result after a grouped choice is applied.
 function repeatChoiceEntries(block, lane) {
@@ -559,7 +559,7 @@ function blockRepeatFingerprint(block) {
 }
 
 function localBeatTolerance(beats, beat) {
-    const seconds = Math.abs(timeOf(beats, beat + 0.5) - timeOf(beats, beat - 0.5));
+    const seconds = Math.abs(timeAtBeat(beats, beat + 0.5) - timeAtBeat(beats, beat - 0.5));
     if (!Number.isFinite(seconds) || seconds <= 1e-9) return COMPOSITE_BEAT_EPS;
     return Math.max(COMPOSITE_BEAT_EPS,
         compositeTimingToleranceSeconds(beats, beat) / seconds);

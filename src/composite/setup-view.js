@@ -1,7 +1,7 @@
 /* Pure markup for the Hybrid Track setup screen. */
 
 import { GUIDED_REPEAT_MODE_EVERY, GUIDED_REPEAT_MODE_MATCHING } from './guided-engine.js';
-import { arrKind } from '../instrument.js';
+import { arrangementKind } from './arrangement-ports.js';
 
 function escapeMarkup(value) {
     return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;')
@@ -10,8 +10,22 @@ function escapeMarkup(value) {
 
 function optionMarkup(source) {
     const name = source.arrangement.name || `Track ${source.index + 1}`;
-    const kind = arrKind(source.arrangement) === 'bass' ? 'Bass' : 'Guitar';
+    const kind = arrangementKind(source.arrangement) === 'bass' ? 'Bass' : 'Guitar';
     return `<option value="${source.index}" data-composite-source-kind="${kind.toLowerCase()}">${escapeMarkup(name)} · ${kind}</option>`;
+}
+
+export function hybridTrackNameValidationPure(name, existingNames = []) {
+    const normalized = String(name || '').trim();
+    if (!normalized) {
+        return { ok: false, name: '', message: 'Enter a name for the new Hybrid Track.' };
+    }
+    const wanted = normalized.toLowerCase();
+    const duplicate = (existingNames || []).some(existing =>
+        String(existing || '').trim().toLowerCase() === wanted);
+    if (duplicate) {
+        return { ok: false, name: normalized, message: 'Another track already uses that name.' };
+    }
+    return { ok: true, name: normalized, message: '' };
 }
 
 export function renderHybridSetupView({
@@ -25,7 +39,7 @@ export function renderHybridSetupView({
         + `<label class="block rounded-lg border border-sky-800/60 bg-sky-950/20 p-3 text-sm text-sky-100"><b>Base track — starting arrangement</b><select id="editor-composite-primary" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm">${options}</select></label>`
         + `<button type="button" id="editor-composite-swap-sources" class="editor-composite-swap-sources rounded border border-gray-600 bg-dark-700 px-3 py-2 text-sm text-gray-200 hover:border-sky-400" title="Swap the base and fill tracks" aria-label="Swap base and fill tracks">⇄<span> Swap</span></button>`
         + `<label class="block rounded-lg border border-violet-800/60 bg-violet-950/20 p-3 text-sm text-violet-100"><b>Fill track</b><select id="editor-composite-secondary" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm">${options}</select></label>`
-        + `<label class="block rounded-lg border border-gray-700 bg-dark-900/40 p-3 text-sm text-gray-200"><b>New Hybrid Track name</b><input id="editor-composite-name" maxlength="60" value="${escapeMarkup(name)}" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"></label></div>`
+        + `<label class="block rounded-lg border border-gray-700 bg-dark-900/40 p-3 text-sm text-gray-200"><b>New Hybrid Track name</b><input id="editor-composite-name" maxlength="60" value="${escapeMarkup(name)}" aria-describedby="editor-composite-name-error" class="mt-2 w-full bg-dark-700 border border-gray-600 rounded px-3 py-2 text-sm"><span id="editor-composite-name-error" hidden class="mt-1 block text-xs text-red-300" role="alert"></span></label></div>`
         + `<p id="editor-composite-source-compatibility" class="mt-2 text-xs text-gray-400" role="status" aria-live="polite"></p></section>`
         + `<fieldset><legend class="text-base font-semibold">2. Choose how to build the hybrid</legend><div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">`
         + `<label data-composite-mode-card="gap-fill" class="cursor-pointer rounded-xl border border-accent bg-sky-950/25 p-3 hover:border-sky-400"><span class="flex items-start gap-3"><input type="radio" name="editor-composite-strategy" value="gap-fill" checked class="mt-1 accent-accent"><span><b class="block text-base text-white">Automatic</b><span class="block text-sm text-gray-300 mt-1">Keep the base track and add fill-track notes only where the complete notes and trails fit safely.</span><span class="block text-xs text-emerald-300 mt-1.5">Fastest · no section-by-section choices</span></span></span></label>`

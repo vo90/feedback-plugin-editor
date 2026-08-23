@@ -5,9 +5,11 @@
  * Source arrangements are never mutated.
  */
 
-import { beatOf, timeOf } from '../beats.js';
-import { arrKind } from '../instrument.js';
-import { _stringCountFor } from '../lanes.js';
+import {
+    arrangementKind,
+} from './arrangement-ports.js';
+import { stringCountForArrangement } from './fretboard-ports.js';
+import { beatAtTime, timeAtBeat } from './timing-ports.js';
 
 export const COMPOSITE_BEAT_EPS = 1e-4;
 export const COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS = 0.001;
@@ -61,8 +63,8 @@ function finite(value, fallback = 0) {
 
 export function compositeTimingToleranceSeconds(beats, beat = 0) {
     const center = finite(beat);
-    const before = timeOf(beats, center - 0.5);
-    const after = timeOf(beats, center + 0.5);
+    const before = timeAtBeat(beats, center - 0.5);
+    const after = timeAtBeat(beats, center + 0.5);
     const localBeatSeconds = Math.abs(after - before);
     const proposed = Number.isFinite(localBeatSeconds) && localBeatSeconds > 1e-9
         ? localBeatSeconds * COMPOSITE_TIMING_TOLERANCE_BEAT_FRACTION
@@ -72,8 +74,8 @@ export function compositeTimingToleranceSeconds(beats, beat = 0) {
 }
 
 function timingNear(a, b, beats) {
-    const left = timeOf(beats, a);
-    const right = timeOf(beats, b);
+    const left = timeAtBeat(beats, a);
+    const right = timeAtBeat(beats, b);
     if (!Number.isFinite(left) || !Number.isFinite(right)) return near(a, b);
     return Math.abs(left - right) <= compositeTimingToleranceSeconds(beats, (a + b) / 2) + 1e-9;
 }
@@ -125,7 +127,7 @@ function techniqueSignature(note) {
 
 function noteBeat(note, beats) {
     return Number.isFinite(Number(note && note.beat))
-        ? Number(note.beat) : beatOf(beats, finite(note && note.time));
+        ? Number(note.beat) : beatAtTime(beats, finite(note && note.time));
 }
 
 function noteEndBeat(note, beats, startBeat) {
@@ -133,7 +135,7 @@ function noteEndBeat(note, beats, startBeat) {
     if (Number.isFinite(Number(note && note.beatEnd))) ends.push(Number(note.beatEnd));
     const startTime = finite(note && note.time);
     const sustain = Math.max(0, finite(note && (note.sustain ?? note.sus)));
-    ends.push(beatOf(beats, startTime + sustain));
+    ends.push(beatAtTime(beats, startTime + sustain));
     return Math.max(...ends);
 }
 
@@ -161,12 +163,41 @@ function extendConnectedPlayableSpans(entries) {
 
 function flattenArrangement(arrangement, source, beats) {
     const raw = [];
-    for (const note of arrangement.notes || []) raw.push({ note, metadata: { kind: 'note' } });
+    for (let noteIndex = 0; noteIndex < (arrangement.notes || []).length; noteIndex++) {
+        const note = arrangement.notes[noteIndex];
+        // Editor arrangements normally arrive here already flattened: chord
+        // children live in `notes`, while `_fromChord` / `_chordId` retain the
+        // authored template link. Recover a stable chord-instance key from the
+        // same rounded timestamp reconstructChords() uses on save. A lone child
+        // moved away from its siblings consequently becomes an ordinary note
+        // during materialization instead of keeping a stale chord template.
+        const templateId = Math.trunc(finite(note && note._chordId, -1));
+        const noteTime = Number(note && note.time);
+        const noteBeatValue = Number(note && note.beat);
+        const chordPositionKey = Number.isFinite(noteTime)
+            ? `time:${noteTime.toFixed(4)}`
+            : Number.isFinite(noteBeatValue) ? `beat:${noteBeatValue.toFixed(4)}`
+                : `note:${noteIndex}`;
+        const fromChord = safeWireBool(note && note._fromChord, false);
+        const template = templateId >= 0 ? arrangement.chord_templates?.[templateId] : null;
+        raw.push({ note, metadata: fromChord ? {
+            kind: 'chord-note',
+            chordIndex: -1,
+            chordKey: `${source}:flat-chord:${chordPositionKey}`,
+            chordTime: Number.isFinite(noteTime) ? noteTime : null,
+            chordHighDensity: note && note._highDensity,
+            templateId,
+            templateKey: `${source}:template:${templateId}`,
+            chordTemplate: clone(template),
+        } : { kind: 'note' } });
+    }
     for (let chordIndex = 0; chordIndex < (arrangement.chords || []).length; chordIndex++) {
         const chord = arrangement.chords[chordIndex];
         const templateId = Math.trunc(finite(chord && chord.chord_id, -1));
         const template = templateId >= 0 ? arrangement.chord_templates?.[templateId] : null;
         for (const chordNote of chord.notes || []) {
+            const authoredChordTime = Number(chord && chord.time);
+            const authoredNoteTime = Number(chordNote && chordNote.time);
             raw.push({ note: {
                 ...chordNote,
                 time: chordNote.time ?? chord.time,
@@ -181,6 +212,9 @@ function flattenArrangement(arrangement, source, beats) {
                 kind: 'chord-note',
                 chordIndex,
                 chordKey: `${source}:chord:${chordIndex}`,
+                chordTime: Number.isFinite(authoredChordTime) ? authoredChordTime
+                    : Number.isFinite(authoredNoteTime) ? authoredNoteTime : null,
+                chordHighDensity: chord && (chord.high_density ?? chord.highDensity),
                 templateId,
                 templateKey: `${source}:template:${templateId}`,
                 chordTemplate: clone(template),
@@ -245,8 +279,8 @@ function normalizeTinySourceBoundaries(entries, beats, { preserveConnections = f
             if (preserveConnections && entry.connectedToId) continue;
             if (next.startBeat <= entry.startBeat + COMPOSITE_BEAT_EPS
                 || entry.endBeat <= next.startBeat + 1e-12) continue;
-            const authoredEndTime = timeOf(beats, entry.endBeat);
-            const nextStartTime = timeOf(beats, next.startBeat);
+            const authoredEndTime = timeAtBeat(beats, entry.endBeat);
+            const nextStartTime = timeAtBeat(beats, next.startBeat);
             const overlapSeconds = authoredEndTime - nextStartTime;
             if (!Number.isFinite(overlapSeconds) || overlapSeconds <= 0
                 || overlapSeconds > compositeTimingToleranceSeconds(beats, next.startBeat) + 1e-9) continue;
@@ -268,8 +302,8 @@ function normalizeTinySourceBoundaries(entries, beats, { preserveConnections = f
 function collisionOverlapSeconds(a, b, beats) {
     const earlier = a.startBeat <= b.startBeat ? a : b;
     const later = earlier === a ? b : a;
-    const laterStart = timeOf(beats, later.startBeat);
-    const earlierEnd = timeOf(beats, earlier.effectiveEndBeat);
+    const laterStart = timeAtBeat(beats, later.startBeat);
+    const earlierEnd = timeAtBeat(beats, earlier.effectiveEndBeat);
     return Number.isFinite(laterStart) && Number.isFinite(earlierEnd)
         ? Math.max(0, earlierEnd - laterStart) : 0;
 }
@@ -313,16 +347,16 @@ function normalizedTuning(arrangement, count) {
 
 export function compositeCompatibility(primary, secondary) {
     const errors = [];
-    const primaryKind = arrKind(primary);
-    const secondaryKind = arrKind(secondary);
+    const primaryKind = arrangementKind(primary);
+    const secondaryKind = arrangementKind(secondary);
     const fretted = new Set(['guitar', 'bass']);
     if (!fretted.has(primaryKind) || !fretted.has(secondaryKind)) {
         errors.push('Both sources must be guitar or bass arrangements.');
     } else if (primaryKind !== secondaryKind) {
         errors.push('Guitar and bass arrangements cannot be merged together.');
     }
-    const primaryStrings = _stringCountFor(primary);
-    const secondaryStrings = _stringCountFor(secondary);
+    const primaryStrings = stringCountForArrangement(primary);
+    const secondaryStrings = stringCountForArrangement(secondary);
     if (primaryStrings !== secondaryStrings) {
         errors.push(`String counts differ (${primaryStrings} vs ${secondaryStrings}).`);
     }
@@ -439,7 +473,7 @@ export function prepareCompositeSources({ primary, secondary, beats = [] } = {})
         if (!primaryByPosition.has(key)) primaryByPosition.set(key, []);
         primaryByPosition.get(key).push({
             entry,
-            startTime: timeOf(beats, entry.startBeat),
+            startTime: timeAtBeat(beats, entry.startBeat),
         });
     }
     for (const list of primaryByPosition.values()) {
@@ -451,7 +485,7 @@ export function prepareCompositeSources({ primary, secondary, beats = [] } = {})
     const uniqueSecondaryEntries = [];
     for (const entry of secondaryEntries) {
         const positionEntries = primaryByPosition.get(`${entry.string}:${entry.fret}`) || [];
-        const entryStartTime = timeOf(beats, entry.startBeat);
+        const entryStartTime = timeAtBeat(beats, entry.startBeat);
         const from = Number.isFinite(entryStartTime)
             ? lowerBound(positionEntries,
                 entryStartTime - COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS - 1e-9,
@@ -467,7 +501,7 @@ export function prepareCompositeSources({ primary, secondary, beats = [] } = {})
             const candidate = candidateRecord.entry;
             if (usedPrimaryIds.has(candidate.id) || !exactDuplicate(candidate, entry, beats)) continue;
             const distance = Math.abs(candidateRecord.startTime - entryStartTime)
-                + Math.abs(timeOf(beats, candidate.endBeat) - timeOf(beats, entry.endBeat));
+                + Math.abs(timeAtBeat(beats, candidate.endBeat) - timeAtBeat(beats, entry.endBeat));
             if (!duplicate || distance < duplicateDistance
                 || distance === duplicateDistance && compareEntries(candidate, duplicate) < 0) {
                 duplicate = candidate;
@@ -483,8 +517,8 @@ export function prepareCompositeSources({ primary, secondary, beats = [] } = {})
         duplicates.push({
             secondary: entry,
             primary: duplicate,
-            startDeltaSeconds: Math.abs(timeOf(beats, duplicate.startBeat) - timeOf(beats, entry.startBeat)),
-            endDeltaSeconds: Math.abs(timeOf(beats, duplicate.endBeat) - timeOf(beats, entry.endBeat)),
+            startDeltaSeconds: Math.abs(timeAtBeat(beats, duplicate.startBeat) - timeAtBeat(beats, entry.startBeat)),
+            endDeltaSeconds: Math.abs(timeAtBeat(beats, duplicate.endBeat) - timeAtBeat(beats, entry.endBeat)),
         });
     }
     const timingAdjustments = [...primaryEntries, ...secondaryEntries]
@@ -675,8 +709,8 @@ function resolutionGroupMetadata(index, groupIndex) {
 }
 
 function compositeEntryIntervalRecord(entry, beats) {
-    const startTime = timeOf(beats, entry && entry.startBeat);
-    const endTime = timeOf(beats, entry && entry.effectiveEndBeat);
+    const startTime = timeAtBeat(beats, entry && entry.startBeat);
+    const endTime = timeAtBeat(beats, entry && entry.effectiveEndBeat);
     if (!entry || !Number.isFinite(startTime) || !Number.isFinite(endTime)
         || !Number.isFinite(entry.string)) return null;
     return {
@@ -1214,8 +1248,8 @@ export function compositeResolvedEntries(plan) {
 
 function materializeNote(entry, beats) {
     const note = clone(entry.note) || {};
-    const startTime = timeOf(beats, entry.startBeat);
-    const endTime = timeOf(beats, entry.endBeat);
+    const startTime = timeAtBeat(beats, entry.startBeat);
+    const endTime = timeAtBeat(beats, entry.endBeat);
     note.time = Math.round(startTime * 1e6) / 1e6;
     note.sustain = Math.max(0, Math.round((endTime - startTime) * 1e6) / 1e6);
     note.beat = entry.startBeat;
@@ -1226,7 +1260,258 @@ function materializeNote(entry, beats) {
     note.techniques = clone(note.techniques || {});
     delete note._fromChord;
     delete note._chordId;
+    delete note._highDensity;
     return note;
+}
+
+function safeWireBool(value, fallback = false) {
+    if (typeof value === 'boolean') return value;
+    if (value === null || value === undefined) return fallback;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (['true', '1', 'yes'].includes(normalized)) return true;
+        if (['false', '0', 'no', ''].includes(normalized)) return false;
+    }
+    return fallback;
+}
+
+function normalizedChordFrets(entries, stringCount) {
+    const frets = new Array(stringCount).fill(-1);
+    for (const entry of entries || []) {
+        const string = Math.trunc(finite(entry && entry.string, -1));
+        if (string >= 0 && string < stringCount) frets[string] = Math.trunc(finite(entry.fret, -1));
+    }
+    return frets;
+}
+
+function normalizedTemplateFrets(template, stringCount) {
+    const source = Array.isArray(template && template.frets) ? template.frets : [];
+    const frets = new Array(stringCount).fill(-1);
+    for (let index = 0; index < stringCount && index < source.length; index++) {
+        frets[index] = Number.isFinite(source[index]) ? Math.trunc(source[index]) : -1;
+    }
+    return frets;
+}
+
+function normalizedTemplateFingers(template, stringCount) {
+    const source = Array.isArray(template && template.fingers) ? template.fingers : [];
+    const fingers = new Array(stringCount).fill(-1);
+    for (let index = 0; index < stringCount && index < source.length; index++) {
+        fingers[index] = Number.isFinite(source[index]) ? Math.trunc(source[index]) : -1;
+    }
+    return fingers;
+}
+
+function materializedChordTemplate(authored, frets, stringCount) {
+    const source = authored && typeof authored === 'object' ? authored : {};
+    const template = clone(source) || {};
+    const name = typeof source.name === 'string' ? source.name : '';
+    template.name = name;
+    template.frets = frets.slice(0, stringCount);
+    while (template.frets.length < stringCount) template.frets.push(-1);
+    template.fingers = normalizedTemplateFingers(source, stringCount);
+    template.displayName = typeof source.displayName === 'string' ? source.displayName : name;
+    template.arp = safeWireBool(source.arp, false);
+    template.voicing = typeof source.voicing === 'string' ? source.voicing : '';
+    template.caged = typeof source.caged === 'string' && /^[CAGED]$/.test(source.caged.trim())
+        ? source.caged.trim() : '';
+    template.guideTones = Array.isArray(source.guideTones)
+        ? source.guideTones.filter(value => Number.isInteger(value) && value >= 0 && value <= 11)
+        : [];
+    return template;
+}
+
+function chordSourceEntries(plan, source) {
+    const explicit = plan && plan.sourceEntries && plan.sourceEntries[source];
+    if (Array.isArray(explicit)) return explicit;
+    return flattenArrangement(plan && plan[source] || {}, source, plan && plan.beats || []);
+}
+
+function compositeChordGroups(plan, resolvedEntries, stringCount) {
+    const selectedBySourceId = new Map();
+    for (const entry of resolvedEntries || []) {
+        if (!entry || !entry.id) continue;
+        selectedBySourceId.set(entry.id, entry);
+        for (const duplicateId of entry.duplicateEntryIds || []) {
+            if (!selectedBySourceId.has(duplicateId)) selectedBySourceId.set(duplicateId, entry);
+        }
+    }
+
+    const groups = [];
+    for (const source of ['primary', 'secondary']) {
+        const byKey = new Map();
+        for (const entry of chordSourceEntries(plan, source)) {
+            const metadata = entry && entry.metadata;
+            if (metadata?.kind !== 'chord-note' || !metadata.chordKey) continue;
+            let group = byKey.get(metadata.chordKey);
+            if (!group) {
+                group = {
+                    source,
+                    key: metadata.chordKey,
+                    expectedById: new Map(),
+                    templateCandidates: [],
+                    templateIds: new Set(),
+                    chordTimes: [],
+                    highDensityVotes: [],
+                };
+                byKey.set(metadata.chordKey, group);
+            }
+            group.expectedById.set(entry.id, entry);
+            const templateId = Math.trunc(finite(metadata.templateId, -1));
+            if (templateId >= 0) group.templateIds.add(templateId);
+            if (metadata.chordTemplate && typeof metadata.chordTemplate === 'object') {
+                group.templateCandidates.push({
+                    template: metadata.chordTemplate,
+                    templateId,
+                });
+            }
+            const chordTime = metadata.chordTime === null || metadata.chordTime === undefined
+                ? Number.NaN : Number(metadata.chordTime);
+            if (Number.isFinite(chordTime)) group.chordTimes.push(chordTime);
+            if (metadata.chordHighDensity !== undefined) {
+                group.highDensityVotes.push(safeWireBool(metadata.chordHighDensity, false));
+            }
+        }
+        for (const group of byKey.values()) {
+            group.expectedEntries = [...group.expectedById.values()];
+            group.selectedEntries = [...new Set(group.expectedEntries
+                .map(entry => selectedBySourceId.get(entry.id)).filter(Boolean))];
+            group.complete = group.expectedEntries.length >= 2
+                && group.selectedEntries.length === group.expectedEntries.length;
+            group.frets = normalizedChordFrets(group.selectedEntries, stringCount);
+            const fretKey = group.frets.join(',');
+            const matchingTemplate = group.templateCandidates.find(candidate =>
+                normalizedTemplateFrets(candidate.template, stringCount).join(',') === fretKey);
+            const selectedTemplate = matchingTemplate || group.templateCandidates[0] || null;
+            group.template = selectedTemplate?.template || null;
+            group.templateId = selectedTemplate?.templateId ?? -1;
+            if (group.templateId >= 0) group.templateIds.add(group.templateId);
+            group.chordTime = group.chordTimes[0] ?? Number(group.selectedEntries[0]?.note?.time);
+            const highVotes = group.highDensityVotes.filter(Boolean).length;
+            group.highDensity = group.highDensityVotes.length > 0
+                && highVotes * 2 > group.highDensityVotes.length;
+            groups.push(group);
+        }
+    }
+    return groups;
+}
+
+function compareChordGroups(left, right) {
+    const sourceOrder = (left.source === 'primary' ? 0 : 1)
+        - (right.source === 'primary' ? 0 : 1);
+    if (sourceOrder) return sourceOrder;
+    const leftBeat = Math.min(...left.selectedEntries.map(entry => entry.startBeat));
+    const rightBeat = Math.min(...right.selectedEntries.map(entry => entry.startBeat));
+    return leftBeat - rightBeat || left.key.localeCompare(right.key);
+}
+
+function compositeSaveTimeKey(entry, beats) {
+    const seconds = timeAtBeat(beats || [], finite(entry?.startBeat));
+    const rounded = Math.round(finite(seconds) * 1e6) / 1e6;
+    // Keep this exactly aligned with reconstructChords(), which groups the
+    // editable note surface at four decimal places before saving.
+    return rounded.toFixed(4);
+}
+
+function markMetadataSafeChordGroups(groups, resolvedEntries, beats) {
+    const selectedBySaveTime = new Map();
+    for (const entry of resolvedEntries || []) {
+        const key = compositeSaveTimeKey(entry, beats);
+        if (!selectedBySaveTime.has(key)) selectedBySaveTime.set(key, new Set());
+        selectedBySaveTime.get(key).add(entry.id);
+    }
+    for (const group of groups) {
+        const keys = new Set(group.selectedEntries.map(entry =>
+            compositeSaveTimeKey(entry, beats)));
+        const selectedAtTime = keys.size === 1
+            ? selectedBySaveTime.get([...keys][0]) : null;
+        group.preserveMetadata = group.complete && !!selectedAtTime
+            && selectedAtTime.size === group.selectedEntries.length
+            && group.selectedEntries.every(entry => selectedAtTime.has(entry.id));
+    }
+    return groups;
+}
+
+function materializeCompositeHandshapes(plan, groups) {
+    const handshapes = [];
+    const dedupe = new Set();
+    const epsilon = 1e-4;
+    for (const source of ['primary', 'secondary']) {
+        const arrangement = plan && plan[source] || {};
+        const sourceGroups = groups.filter(group => group.source === source);
+        for (const authored of arrangement.handshapes || []) {
+            if (!authored) continue;
+            const rawTemplateId = authored.chord_id;
+            const templateId = rawTemplateId === null || rawTemplateId === undefined
+                    || typeof rawTemplateId === 'string' && !rawTemplateId.trim()
+                ? Number.NaN : Math.trunc(Number(rawTemplateId));
+            const startTime = Number(authored.start_time);
+            const endTime = Number(authored.end_time);
+            if (!Number.isInteger(templateId) || templateId < 0
+                    || !Number.isFinite(startTime) || !Number.isFinite(endTime)
+                    || endTime < startTime) continue;
+            const associated = sourceGroups.filter(group => group.templateIds.has(templateId)
+                && Number.isFinite(group.chordTime)
+                && group.chordTime >= startTime - epsilon
+                && group.chordTime <= endTime + epsilon);
+            if (!associated.length || associated.some(group => !group.preserveMetadata)) continue;
+            const outputIds = new Set(associated.map(group => group.outputTemplateIndex));
+            if (outputIds.size !== 1 || outputIds.has(undefined)) continue;
+            const outputTemplateIndex = [...outputIds][0];
+            const key = `${outputTemplateIndex}:${startTime}:${endTime}`
+                + `:${safeWireBool(authored.arp, false)}`;
+            if (dedupe.has(key)) continue;
+            dedupe.add(key);
+            handshapes.push({
+                ...clone(authored),
+                chord_id: outputTemplateIndex,
+                start_time: startTime,
+                end_time: endTime,
+                arp: safeWireBool(authored.arp, false),
+            });
+        }
+    }
+    return handshapes.sort((left, right) => left.start_time - right.start_time
+        || left.end_time - right.end_time || left.chord_id - right.chord_id);
+}
+
+function materializeCompositeChordMetadata(plan, resolvedEntries, stringCount) {
+    const groups = markMetadataSafeChordGroups(
+        compositeChordGroups(plan, resolvedEntries, stringCount),
+        resolvedEntries,
+        plan?.beats,
+    );
+    const completeGroups = groups.filter(group => group.preserveMetadata)
+        .sort(compareChordGroups);
+    const templates = [];
+    const templateByFrets = new Map();
+    const completeGroupByEntryId = new Map();
+    const chordEntryIds = new Set();
+    for (const group of groups) {
+        for (const entry of group.selectedEntries) chordEntryIds.add(entry.id);
+    }
+    for (const group of completeGroups) {
+        const fretKey = group.frets.join(',');
+        let templateIndex = templateByFrets.get(fretKey);
+        if (templateIndex === undefined) {
+            templateIndex = templates.length;
+            templateByFrets.set(fretKey, templateIndex);
+            templates.push(materializedChordTemplate(group.template, group.frets, stringCount));
+        }
+        group.outputTemplateIndex = templateIndex;
+        for (const entry of group.selectedEntries) {
+            // The Base source is sorted first, so it deterministically owns
+            // metadata when strict duplicate notes represent both sources.
+            if (!completeGroupByEntryId.has(entry.id)) completeGroupByEntryId.set(entry.id, group);
+        }
+    }
+    return {
+        chordEntryIds,
+        completeGroupByEntryId,
+        templates,
+        handshapes: materializeCompositeHandshapes(plan, groups),
+    };
 }
 
 function prepareCompositeEntries(entries, beats) {
@@ -1258,18 +1543,39 @@ export function materializeCompositeArrangement(plan, name) {
     const primary = plan.primary || {};
     const resultName = String(name || '').trim();
     if (!resultName) throw new Error('The Hybrid Track needs a name.');
+    const chordMetadata = materializeCompositeChordMetadata(
+        plan, resolvedEntries, plan.compatibility.stringCount);
+    const notes = resolvedEntries.map((entry) => {
+        const note = materializeNote(entry, plan.beats);
+        const chordGroup = chordMetadata.completeGroupByEntryId.get(entry.id);
+        if (chordGroup) {
+            note._fromChord = true;
+            note._chordId = chordGroup.outputTemplateIndex;
+            if (chordGroup.highDensity) note._highDensity = true;
+        } else if (chordMetadata.chordEntryIds.has(entry.id)) {
+            // Chord-level harmony cannot truthfully survive a partial group.
+            // Leave the retained members as plain notes here. The Editor's
+            // normal save invariant groups simultaneous notes into a reduced,
+            // metadata-neutral chord, which then round-trips without a private
+            // Hybrid marker or wire-format extension.
+            delete note._fn;
+        }
+        return note;
+    });
     const arrangement = {
         name: resultName,
         type: plan.compatibility.kind === 'bass' ? 'bass' : 'guitar',
         tuning: clone(primary.tuning || new Array(plan.compatibility.stringCount).fill(0)),
         capo: finite(primary.capo),
-        notes: resolvedEntries.map(entry => materializeNote(entry, plan.beats)),
+        notes,
         chords: [],
-        chord_templates: [],
-        anchors: [],
-        anchors_user: [],
-        handshapes: [],
-        phrases: [],
+        chord_templates: chordMetadata.templates,
+        // Base-track global navigation/fretboard metadata remains authoritative.
+        // Fill contributes only selected, locally-provable chord metadata.
+        anchors: clone(Array.isArray(primary.anchors) ? primary.anchors : []),
+        anchors_user: clone(Array.isArray(primary.anchors_user) ? primary.anchors_user : []),
+        handshapes: chordMetadata.handshapes,
+        phrases: clone(Array.isArray(primary.phrases) ? primary.phrases : []),
     };
     if (primary.centOffset !== undefined) arrangement.centOffset = finite(primary.centOffset);
     if (primary._extendedStrings !== undefined) arrangement._extendedStrings = primary._extendedStrings;

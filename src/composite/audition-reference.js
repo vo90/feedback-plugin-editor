@@ -6,9 +6,9 @@
  */
 
 import {
-    _audioRegionPlacementsPure,
-    _regionStartPure,
-} from '../audio.js';
+    audioRegionPlacements,
+    audioRegionStart,
+} from './reference-audio-ports.js';
 
 export const COMPOSITE_REFERENCE_DECLICK_SECONDS = 0.005;
 export const COMPOSITE_REFERENCE_STOP_FADE_SECONDS = 0.004;
@@ -122,12 +122,12 @@ export function compositeReferencePlacementsPure(snapshot, cursorTime, {
     for (const source of snapshot?.sources || []) {
         const bufferDuration = Math.max(0, finite(source?.buffer?.duration));
         if (!source?.buffer || !(bufferDuration > 0) || !(source.gain > 0)) continue;
-        const regions = _audioRegionPlacementsPure(
+        const regions = audioRegionPlacements(
             source.regions, bufferDuration, beatToTime);
         for (const region of regions) {
             if (region.muted) continue;
             const regionStart = audioShift + finite(source.offset) + region.startBeatTime;
-            const placement = _regionStartPure(
+            const placement = audioRegionStart(
                 cursor, regionStart, region.srcIn, region.srcOut);
             if (!placement.play) continue;
             const naturalRemaining = Math.max(0, bufferDuration - placement.offset);

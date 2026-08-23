@@ -1,3 +1,235 @@
+/* ── Feature-owned Editor chrome theme bridge ───────────────────────
+ * The dialog is mounted under body, outside #plugin-editor, so the Editor's
+ * --ed-* custom properties cannot inherit normally. theme-inheritance.js
+ * copies those computed values into these Hybrid-owned tokens. The defaults
+ * are the existing dark palette; missing/classic Editor themes are unchanged.
+ * Tablature tokens are deliberately fixed and never copied from the chrome. */
+#editor-composite-modal {
+    --hybrid-chrome-app: #0f172a;
+    --hybrid-chrome-panel: #1e293b;
+    --hybrid-chrome-field: #0b1220;
+    --hybrid-chrome-btn: #334155;
+    --hybrid-chrome-btn-hover: #475569;
+    --hybrid-chrome-border: #334155;
+    --hybrid-chrome-text-strong: #f8fafc;
+    --hybrid-chrome-text-2: #e2e8f0;
+    --hybrid-chrome-text: #cbd5e1;
+    --hybrid-chrome-text-dim: #94a3b8;
+    --hybrid-chrome-text-faint: #64748b;
+    --hybrid-chrome-accent: #0ea5e9;
+    --hybrid-chrome-accent-hover: #38bdf8;
+    --hybrid-chrome-on-accent: #082f49;
+    /* Semantic chrome is separate from the fixed-dark notation palette. */
+    --hybrid-semantic-info: #bae6fd;
+    --hybrid-semantic-info-strong: #e0f2fe;
+    --hybrid-semantic-info-surface: #082f49;
+    --hybrid-semantic-info-border: #0284c7;
+    --hybrid-semantic-secondary: #ddd6fe;
+    --hybrid-semantic-secondary-strong: #ede9fe;
+    --hybrid-semantic-secondary-surface: #2e1065;
+    --hybrid-semantic-secondary-border: #7c3aed;
+    --hybrid-semantic-success: #a7f3d0;
+    --hybrid-semantic-success-strong: #d1fae5;
+    --hybrid-semantic-success-surface: #064e3b;
+    --hybrid-semantic-success-border: #059669;
+    --hybrid-semantic-warning: #fde68a;
+    --hybrid-semantic-warning-strong: #fef3c7;
+    --hybrid-semantic-warning-surface: #78350f;
+    --hybrid-semantic-warning-soft-surface: rgba(120, 53, 15, .24);
+    --hybrid-semantic-warning-border: #d97706;
+    --hybrid-semantic-danger: #fecaca;
+    --hybrid-semantic-danger-strong: #fee2e2;
+    --hybrid-semantic-danger-surface: #7f1d1d;
+    --hybrid-semantic-danger-border: #dc2626;
+    --hybrid-semantic-action-success: #047857;
+    --hybrid-semantic-action-success-hover: #065f46;
+    --hybrid-semantic-on-action: #ffffff;
+    --hybrid-tablature-surface: #020617;
+    --hybrid-tablature-header: #111827;
+    color: var(--hybrid-chrome-text-strong);
+    color-scheme: dark;
+}
+#editor-composite-modal[data-editor-theme="light"] {
+    --hybrid-semantic-info: #075985;
+    --hybrid-semantic-info-strong: #0c4a6e;
+    --hybrid-semantic-info-surface: #e0f2fe;
+    --hybrid-semantic-info-border: #0284c7;
+    --hybrid-semantic-secondary: #5b21b6;
+    --hybrid-semantic-secondary-strong: #4c1d95;
+    --hybrid-semantic-secondary-surface: #f5f3ff;
+    --hybrid-semantic-secondary-border: #7c3aed;
+    --hybrid-semantic-success: #047857;
+    --hybrid-semantic-success-strong: #065f46;
+    --hybrid-semantic-success-surface: #ecfdf5;
+    --hybrid-semantic-success-border: #059669;
+    --hybrid-semantic-warning: #92400e;
+    --hybrid-semantic-warning-strong: #78350f;
+    --hybrid-semantic-warning-surface: #fffbeb;
+    --hybrid-semantic-warning-soft-surface: #fffbeb;
+    --hybrid-semantic-warning-border: #d97706;
+    --hybrid-semantic-danger: #b91c1c;
+    --hybrid-semantic-danger-strong: #991b1b;
+    --hybrid-semantic-danger-surface: #fef2f2;
+    --hybrid-semantic-danger-border: #dc2626;
+    color-scheme: light;
+}
+#editor-composite-modal[data-editor-theme="medium"] { color-scheme: dark; }
+
+/* Recreate the Editor's v3 utility remaps inside this body-mounted feature.
+ * Partial-opacity wells blend with the selected chrome instead of retaining a
+ * hard-coded dark Tailwind color in light and medium themes. */
+#editor-composite-modal .bg-dark-900 { background-color: var(--hybrid-chrome-app); }
+#editor-composite-modal .bg-dark-900\/40 {
+    background-color: color-mix(in srgb, var(--hybrid-chrome-app) 40%, transparent);
+}
+#editor-composite-modal .bg-dark-900\/50 {
+    background-color: color-mix(in srgb, var(--hybrid-chrome-app) 50%, transparent);
+}
+#editor-composite-modal .bg-dark-900\/70 {
+    background-color: color-mix(in srgb, var(--hybrid-chrome-app) 70%, transparent);
+}
+#editor-composite-modal .bg-dark-800 { background-color: var(--hybrid-chrome-panel); }
+#editor-composite-modal .bg-dark-800\/70 {
+    background-color: color-mix(in srgb, var(--hybrid-chrome-panel) 70%, transparent);
+}
+#editor-composite-modal .bg-dark-700 { background-color: var(--hybrid-chrome-panel); }
+#editor-composite-modal .bg-dark-700\/50 {
+    background-color: color-mix(in srgb, var(--hybrid-chrome-panel) 50%, transparent);
+}
+#editor-composite-modal .bg-dark-600 { background-color: var(--hybrid-chrome-btn); }
+#editor-composite-modal input.bg-dark-700,
+#editor-composite-modal select.bg-dark-700,
+#editor-composite-modal textarea.bg-dark-700 {
+    color: var(--hybrid-chrome-text);
+    background-color: var(--hybrid-chrome-field);
+}
+#editor-composite-modal .hover\:bg-dark-500:hover {
+    background-color: var(--hybrid-chrome-btn-hover);
+}
+#editor-composite-modal .hover\:bg-dark-600:hover {
+    background-color: var(--hybrid-chrome-btn);
+}
+#editor-composite-modal .hover\:bg-dark-600\/50:hover {
+    background-color: color-mix(in srgb, var(--hybrid-chrome-btn) 50%, transparent);
+}
+
+#editor-composite-modal .border-gray-800,
+#editor-composite-modal .border-gray-700,
+#editor-composite-modal .border-gray-600 { border-color: var(--hybrid-chrome-border); }
+#editor-composite-modal .hover\:border-gray-400:hover {
+    border-color: var(--hybrid-chrome-btn-hover);
+}
+#editor-composite-modal .text-white,
+#editor-composite-modal .text-gray-100 { color: var(--hybrid-chrome-text-strong); }
+#editor-composite-modal .text-gray-200 { color: var(--hybrid-chrome-text-2); }
+#editor-composite-modal .text-gray-300 { color: var(--hybrid-chrome-text); }
+#editor-composite-modal .text-gray-400,
+#editor-composite-modal .text-gray-500 { color: var(--hybrid-chrome-text-dim); }
+#editor-composite-modal .hover\:text-white:hover {
+    color: var(--hybrid-chrome-text-strong);
+}
+#editor-composite-modal .hover\:text-gray-200:hover { color: var(--hybrid-chrome-text-2); }
+
+#editor-composite-modal .bg-accent {
+    color: var(--hybrid-chrome-on-accent);
+    background-color: var(--hybrid-chrome-accent);
+}
+#editor-composite-modal .hover\:bg-accent-light:hover {
+    background-color: var(--hybrid-chrome-accent-hover);
+}
+#editor-composite-modal .text-accent { color: var(--hybrid-chrome-accent); }
+#editor-composite-modal .border-accent { border-color: var(--hybrid-chrome-accent); }
+#editor-composite-modal .accent-accent { accent-color: var(--hybrid-chrome-accent); }
+
+/* Setup uses semantic cards and helper text on the inherited chrome. Medium
+ * and light themes cannot reuse Tailwind's pale dark-surface foregrounds. */
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .bg-sky-950\/20,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .bg-sky-950\/25 {
+    background-color: var(--hybrid-semantic-info-surface);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .border-sky-800\/60 {
+    border-color: var(--hybrid-semantic-info-border);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .text-sky-100 {
+    color: var(--hybrid-semantic-info-strong);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .hover\:border-sky-400:hover {
+    border-color: var(--hybrid-semantic-info-border);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .bg-violet-950\/20 {
+    background-color: var(--hybrid-semantic-secondary-surface);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .border-violet-800\/60 {
+    border-color: var(--hybrid-semantic-secondary-border);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .text-violet-100 {
+    color: var(--hybrid-semantic-secondary-strong);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .text-violet-300 {
+    color: var(--hybrid-semantic-secondary);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .hover\:border-violet-400:hover {
+    border-color: var(--hybrid-semantic-secondary-border);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .text-emerald-300 {
+    color: var(--hybrid-semantic-success);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-setup .text-red-300,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-error {
+    color: var(--hybrid-semantic-danger);
+}
+
+/* Result notices sit on themed chrome, outside the fixed-dark map and lanes. */
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) [data-composite-review-notices] .bg-sky-950\/20,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-result > section > .bg-sky-950\/20 {
+    border-color: var(--hybrid-semantic-info-border);
+    background-color: var(--hybrid-semantic-info-surface);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) [data-composite-review-notices] .bg-sky-950\/20.text-sky-100,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-result > section > .bg-sky-950\/20.text-sky-100 {
+    color: var(--hybrid-semantic-info-strong);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) [data-composite-review-notices] .bg-amber-950\/25,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-result > section > .bg-amber-950\/25 {
+    border-color: var(--hybrid-semantic-warning-border);
+    color: var(--hybrid-semantic-warning-strong);
+    background-color: var(--hybrid-semantic-warning-surface);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) [data-composite-review-notices] .bg-emerald-950\/20,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-result > .bg-emerald-950\/20,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-result > section > .bg-emerald-950\/20 {
+    border-color: var(--hybrid-semantic-success-border);
+    background-color: var(--hybrid-semantic-success-surface);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) [data-composite-review-notices] .bg-emerald-950\/20.text-emerald-100,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-result > .bg-emerald-950\/20.text-emerald-100,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-result > section > .bg-emerald-950\/20 .text-emerald-100,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) #editor-composite-result > section > .bg-emerald-950\/20.text-emerald-100 {
+    color: var(--hybrid-semantic-success-strong);
+}
+
+#editor-composite-modal #editor-composite-finish {
+    color: var(--hybrid-semantic-on-action);
+    background-color: var(--hybrid-semantic-action-success);
+}
+#editor-composite-modal #editor-composite-finish:hover {
+    background-color: var(--hybrid-semantic-action-success-hover);
+}
+
+/* Timeline controls inherit the chrome, but the map, ruler, lane headers, and
+ * SVG lanes keep the stable dark notation palette in every Editor theme. */
+#editor-composite-modal #editor-composite-timeline-map,
+#editor-composite-modal #editor-composite-timeline-scroller {
+    background-color: var(--hybrid-tablature-surface);
+    color-scheme: dark;
+}
+#editor-composite-modal [data-composite-timeline-fixed-headers] .bg-gray-900 {
+    background-color: var(--hybrid-tablature-header);
+    color-scheme: dark;
+}
+#editor-composite-modal [data-composite-timeline-header],
+#editor-composite-modal [data-composite-timeline-lane-svg] { color-scheme: dark; }
+
 /* ── Hybrid Track review workspace ────────────────────────────────── */
 #editor-composite-modal .editor-composite-header {
     display: grid;
@@ -6,7 +238,7 @@
     gap: .75rem;
     min-height: 3.35rem;
     padding: .55rem 1rem;
-    border-bottom: 1px solid #374151;
+    border-bottom: 1px solid var(--hybrid-chrome-border);
 }
 #editor-composite-modal .editor-composite-window-actions {
     display: flex;
@@ -21,13 +253,13 @@
     justify-content: center;
     border: 1px solid transparent;
     border-radius: .4rem;
-    color: #9ca3af;
+    color: var(--hybrid-chrome-text-dim);
     line-height: 1;
 }
 #editor-composite-modal .editor-composite-window-button:hover {
-    border-color: #4b5563;
-    background: #1f2937;
-    color: #f9fafb;
+    border-color: var(--hybrid-chrome-btn-hover);
+    background: var(--hybrid-chrome-panel);
+    color: var(--hybrid-chrome-text-strong);
 }
 #editor-composite-modal #editor-composite-dialog.editor-composite-maximized {
     inset: 0 !important;
@@ -50,7 +282,7 @@
     padding: 0;
     border: 0;
     background: transparent;
-    color: #6b7280;
+    color: var(--hybrid-chrome-text-faint);
     font-size: .75rem;
 }
 #editor-composite-modal .editor-composite-stage-indicator span {
@@ -76,7 +308,7 @@
     align-items: center;
     gap: .75rem;
     padding: .5rem 1rem;
-    border-top: 1px solid #374151;
+    border-top: 1px solid var(--hybrid-chrome-border);
 }
 #editor-composite-modal footer > #editor-composite-error {
     min-width: 0;
@@ -108,7 +340,7 @@
     flex-wrap: wrap;
     gap: .45rem 1rem;
     margin: 0 0 .35rem;
-    color: #94a3b8;
+    color: var(--hybrid-chrome-text-dim);
     font-size: .7rem;
 }
 #editor-composite-modal .editor-composite-map-key span {
@@ -126,6 +358,15 @@
 #editor-composite-modal .editor-composite-map-key .editor-composite-map-review { background: #fbbf24; }
 #editor-composite-modal .editor-composite-map-key .editor-composite-map-resolved { background: #34d399; }
 #editor-composite-modal .editor-composite-map-key .editor-composite-map-invalid { background: #f87171; }
+#editor-composite-modal #editor-composite-timeline-map:focus-visible,
+#editor-composite-modal [data-composite-timeline-ruler-svg]:focus-visible,
+#editor-composite-modal [data-composite-lane-resize]:focus-visible {
+    outline: 2px solid #f8fafc;
+    outline-offset: -2px;
+}
+#editor-composite-modal [data-composite-lane-resize]:focus-visible {
+    background: rgba(125, 211, 252, .32);
+}
 #editor-composite-modal [data-composite-entry-id]:focus { outline: none; }
 #editor-composite-modal [data-composite-entry-id]:focus rect {
     stroke: #f8fafc;
@@ -139,9 +380,9 @@
     gap: .45rem .6rem;
     margin: 0 0 .45rem;
     padding: .5rem;
-    border: 1px solid #475569;
+    border: 1px solid var(--hybrid-chrome-border);
     border-radius: .6rem;
-    background: rgba(17, 24, 39, .96);
+    background: var(--hybrid-chrome-app);
 }
 #editor-composite-modal .editor-composite-review-summary {
     flex: 0 1 19rem;
@@ -154,7 +395,9 @@
     align-items: center;
     gap: .3rem .45rem;
 }
-#editor-composite-modal .editor-composite-review-summary b { color: #f8fafc; }
+#editor-composite-modal .editor-composite-review-summary b {
+    color: var(--hybrid-chrome-text-strong);
+}
 #editor-composite-modal .editor-composite-review-mode,
 #editor-composite-modal .editor-composite-review-location,
 #editor-composite-modal .editor-composite-review-left,
@@ -167,40 +410,42 @@
     white-space: nowrap;
 }
 #editor-composite-modal .editor-composite-review-mode {
-    color: #bae6fd;
-    background: #082f49;
+    color: var(--hybrid-semantic-info);
+    background: var(--hybrid-semantic-info-surface);
 }
 #editor-composite-modal .editor-composite-review-location {
     display: block;
     max-width: 11rem;
     overflow: hidden;
-    color: #cbd5e1;
-    background: #1e293b;
+    color: var(--hybrid-chrome-text);
+    background: var(--hybrid-chrome-panel);
     text-overflow: ellipsis;
 }
-#editor-composite-modal .editor-composite-review-left { color: #94a3b8; }
+#editor-composite-modal .editor-composite-review-left {
+    color: var(--hybrid-chrome-text-dim);
+}
 #editor-composite-modal .editor-composite-review-repeat {
-    color: #bae6fd;
-    background: #082f49;
+    color: var(--hybrid-semantic-info);
+    background: var(--hybrid-semantic-info-surface);
 }
 #editor-composite-modal .editor-composite-review-state-unresolved {
-    color: #fef3c7;
-    background: #78350f;
+    color: var(--hybrid-semantic-warning-strong);
+    background: var(--hybrid-semantic-warning-surface);
 }
 #editor-composite-modal .editor-composite-review-state-resolved {
-    color: #d1fae5;
-    background: #064e3b;
+    color: var(--hybrid-semantic-success-strong);
+    background: var(--hybrid-semantic-success-surface);
 }
 #editor-composite-modal .editor-composite-review-state-invalid {
-    color: #fee2e2;
-    background: #7f1d1d;
+    color: var(--hybrid-semantic-danger-strong);
+    background: var(--hybrid-semantic-danger-surface);
 }
 #editor-composite-modal .editor-composite-review-choices {
     flex: 1 1 28rem;
     display: flex;
     min-width: 20rem;
     overflow: hidden;
-    border: 1px solid #475569;
+    border: 1px solid var(--hybrid-chrome-border);
     border-radius: .5rem;
 }
 #editor-composite-modal .editor-composite-review-choice {
@@ -209,19 +454,27 @@
     padding: .48rem .65rem;
     overflow: hidden;
     border: 0;
-    border-right: 1px solid #475569;
-    color: #cbd5e1;
-    background: #1f2937;
+    border-right: 1px solid var(--hybrid-chrome-border);
+    color: var(--hybrid-chrome-text);
+    background: var(--hybrid-chrome-panel);
     font-size: .76rem;
     font-weight: 650;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 #editor-composite-modal .editor-composite-review-choice:last-child { border-right: 0; }
-#editor-composite-modal .editor-composite-review-choice:hover { background: #334155; }
-#editor-composite-modal .editor-composite-review-choice-primary { color: #bae6fd; }
-#editor-composite-modal .editor-composite-review-choice-secondary { color: #ddd6fe; }
-#editor-composite-modal .editor-composite-review-choice-custom { color: #fde68a; }
+#editor-composite-modal .editor-composite-review-choice:hover {
+    background: var(--hybrid-chrome-btn);
+}
+#editor-composite-modal .editor-composite-review-choice-primary {
+    color: var(--hybrid-semantic-info);
+}
+#editor-composite-modal .editor-composite-review-choice-secondary {
+    color: var(--hybrid-semantic-secondary);
+}
+#editor-composite-modal .editor-composite-review-choice-custom {
+    color: var(--hybrid-semantic-warning);
+}
 #editor-composite-modal .editor-composite-review-choice-primary.editor-composite-review-choice-active {
     color: #f8fafc;
     background: #075985;
@@ -240,7 +493,7 @@
 #editor-composite-modal .editor-composite-review-choice:focus-visible,
 #editor-composite-modal .editor-composite-review-actions button:focus-visible,
 #editor-composite-modal .editor-composite-review-actions summary:focus-visible {
-    outline: 2px solid #f8fafc;
+    outline: 2px solid var(--hybrid-chrome-text-strong);
     outline-offset: -2px;
 }
 #editor-composite-modal .editor-composite-manual-status {
@@ -250,14 +503,18 @@
     align-items: center;
     gap: .25rem .65rem;
     padding: .38rem .55rem;
-    border: 1px solid rgba(217, 119, 6, .65);
+    border: 1px solid var(--hybrid-semantic-warning-border);
     border-radius: .45rem;
-    color: #fde68a;
-    background: rgba(120, 53, 15, .24);
+    color: var(--hybrid-semantic-warning);
+    background: var(--hybrid-semantic-warning-soft-surface);
     font-size: .72rem;
 }
-#editor-composite-modal .editor-composite-manual-status span:nth-of-type(2) { color: #cbd5e1; }
-#editor-composite-modal .editor-composite-review-error { color: #fecaca !important; }
+#editor-composite-modal .editor-composite-manual-status span:nth-of-type(2) {
+    color: var(--hybrid-chrome-text);
+}
+#editor-composite-modal .editor-composite-review-error {
+    color: var(--hybrid-semantic-danger) !important;
+}
 #editor-composite-modal .editor-composite-review-actions {
     flex: 0 1 auto;
     display: flex;
@@ -270,18 +527,18 @@
 #editor-composite-modal .editor-composite-review-actions > button,
 #editor-composite-modal .editor-composite-review-actions > details > summary {
     padding: .45rem .65rem;
-    border: 1px solid #4b5563;
+    border: 1px solid var(--hybrid-chrome-border);
     border-radius: .4rem;
-    color: #e5e7eb;
-    background: #1f2937;
+    color: var(--hybrid-chrome-text-2);
+    background: var(--hybrid-chrome-panel);
     font-size: .72rem;
     line-height: 1.2;
     white-space: nowrap;
 }
 #editor-composite-modal .editor-composite-review-actions > button:hover,
 #editor-composite-modal .editor-composite-review-actions > details > summary:hover {
-    border-color: #94a3b8;
-    background: #334155;
+    border-color: var(--hybrid-chrome-btn-hover);
+    background: var(--hybrid-chrome-btn);
 }
 #editor-composite-modal .editor-composite-review-actions button:disabled {
     cursor: not-allowed;
@@ -304,18 +561,27 @@
     top: calc(100% + .4rem);
     right: 0;
     z-index: 90;
-    width: min(42rem, calc(100vw - 5rem));
+    box-sizing: border-box;
+    width: min(42rem, calc(100vw - 1rem));
+    min-width: 0;
+    max-width: calc(100vw - 1rem);
     max-height: min(30rem, 55vh);
     display: flex;
     flex-direction: column;
     gap: .75rem;
-    overflow-y: auto;
+    overflow: auto;
+    overflow-wrap: anywhere;
+    overscroll-behavior: contain;
     padding: .8rem;
-    border: 1px solid #64748b;
+    border: 1px solid var(--hybrid-chrome-border);
     border-radius: .65rem;
-    color: #cbd5e1;
-    background: #0f172a;
+    color: var(--hybrid-chrome-text);
+    background: var(--hybrid-chrome-app);
     box-shadow: 0 18px 40px rgba(0, 0, 0, .55);
+}
+#editor-composite-modal .editor-composite-review-details-panel > * {
+    min-width: 0;
+    max-width: 100%;
 }
 #editor-composite-modal .editor-composite-review-details-open-up .editor-composite-review-details-panel {
     top: auto;
@@ -328,7 +594,55 @@
     gap: .3rem .65rem;
     font-size: .75rem;
 }
-#editor-composite-modal .editor-composite-review-details-heading span { color: #94a3b8; }
+#editor-composite-modal .editor-composite-review-details-heading span {
+    color: var(--hybrid-chrome-text-dim);
+}
+
+/* The details panel is themed chrome, not part of the fixed-dark tablature.
+ * Normalize every semantic utility it can render, including repeat chips,
+ * source labels, technique labels, and the difference table. */
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .bg-sky-950\/20 {
+    background-color: var(--hybrid-semantic-info-surface);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .border-sky-800\/50 {
+    border-color: var(--hybrid-semantic-info-border);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-sky-100 {
+    color: var(--hybrid-semantic-info-strong);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-sky-200\/80,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-sky-200,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-sky-300,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-sky-400 {
+    color: var(--hybrid-semantic-info);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-violet-100 {
+    color: var(--hybrid-semantic-secondary-strong);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-violet-200,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-violet-300,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-violet-400 {
+    color: var(--hybrid-semantic-secondary);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-emerald-200 {
+    color: var(--hybrid-semantic-success);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-amber-100,
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-amber-300 {
+    color: var(--hybrid-semantic-warning);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .text-red-200 {
+    color: var(--hybrid-semantic-danger);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .border-emerald-600 {
+    border-color: var(--hybrid-semantic-success-border);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .border-amber-600 {
+    border-color: var(--hybrid-semantic-warning-border);
+}
+#editor-composite-modal:is([data-editor-theme="medium"], [data-editor-theme="light"]) .editor-composite-review-details-panel .border-red-500 {
+    border-color: var(--hybrid-semantic-danger-border);
+}
 @media (max-width: 72rem) {
     #editor-composite-modal .editor-composite-header {
         grid-template-columns: minmax(0, 1fr) auto;
@@ -366,7 +680,7 @@
     #editor-composite-modal .editor-composite-review-details-panel {
         right: auto;
         left: 0;
-        width: min(34rem, calc(100vw - 3rem));
+        width: min(34rem, calc(100vw - 1rem));
     }
 }
 @media (max-height: 44rem) {

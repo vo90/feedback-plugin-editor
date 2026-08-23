@@ -5,7 +5,7 @@
  * metadata; it never mutates the Editor transport or persistent song state.
  */
 
-import { HYBRID_PREVIEW_TONES } from './preferences.js';
+import { HYBRID_PREVIEW_TONES } from './hybrid-options.js';
 import { CompositeSoundfontLoader } from './audition-soundfont.js';
 import { CompositeGuideScheduler } from './audition-guide-scheduler.js';
 import { CompositeReferenceMixer } from './audition-reference.js';
@@ -194,6 +194,7 @@ export class CompositePreviewController {
         this.frame = null;
         this.generation = 0;
         this.destroyed = false;
+        this.destroyPromise = null;
         this.lastError = null;
         this.warnings = [];
         this.referenceLoopNextWhen = null;
@@ -357,7 +358,45 @@ export class CompositePreviewController {
         this._applyMix(true);
     }
 
+    _releaseContextGraph(context = this.context) {
+        if (!context || context !== this.context) return false;
+        // Every scheduler/mixer instance is bound to this context's nodes. A
+        // closed device cannot be resumed, so retire that whole graph before a
+        // later start creates replacements. The SoundFont loader remains owned
+        // by the controller: it keeps independent weak caches per context.
+        this.guideScheduler?.destroy?.({ contextWillClose: true });
+        this.referenceMixer?.destroy?.();
+        for (const node of [
+            this.referenceGain, this.guideGain, this.masterGain, this.limiter,
+        ]) {
+            try { node?.disconnect?.(); } catch (_) { /* context already closed */ }
+        }
+        if (typeof context.removeEventListener === 'function') {
+            if (this.contextStateListener) {
+                context.removeEventListener('statechange', this.contextStateListener);
+            }
+            if (this.contextSinkListener) {
+                context.removeEventListener('sinkchange', this.contextSinkListener);
+            }
+        }
+        this.contextStateListener = null;
+        this.contextSinkListener = null;
+        this.context = null;
+        this.masterGain = null;
+        this.referenceGain = null;
+        this.guideGain = null;
+        this.limiter = null;
+        this.referenceMixer = null;
+        this.guideScheduler = null;
+        this.referenceLoopNextWhen = null;
+        this.referenceLoopDuration = 0;
+        return true;
+    }
+
     async _ensureContext() {
+        if (this.context?.state === 'closed') {
+            this._releaseContextGraph(this.context);
+        }
         if (this.context) return this.context;
         if (!this.audioContextFactory) {
             throw new Error('Hybrid preview audio is unavailable in this environment');
@@ -701,41 +740,42 @@ export class CompositePreviewController {
         return this._beginAt(at);
     }
 
-    async destroy() {
-        if (this.destroyed) return;
-        this.destroyed = true;
-        this.generation++;
-        this._stopScheduled();
-        this._cancelFrame();
-        this.playing = false;
-        this.loading = false;
-        // This controller owns and closes the context below. Let the guide
-        // scheduler disconnect dense passes without walking every envelope on
-        // the modal-close input path; context.close() retires those nodes.
-        this.guideScheduler?.destroy?.({ contextWillClose: true });
-        this.referenceMixer?.destroy?.();
-        this.soundfont?.destroy?.();
-        for (const node of [
-            this.referenceGain, this.guideGain, this.masterGain, this.limiter,
-        ]) {
-            try { node?.disconnect?.(); } catch (_) { /* context already closed */ }
+    destroy() {
+        if (this.destroyPromise) return this.destroyPromise;
+
+        let resolveDestroy;
+        let rejectDestroy;
+        this.destroyPromise = new Promise((resolve, reject) => {
+            resolveDestroy = resolve;
+            rejectDestroy = reject;
+        });
+
+        try {
+            this.destroyed = true;
+            this.generation++;
+            this._stopScheduled();
+            this._cancelFrame();
+            this.playing = false;
+            this.loading = false;
+            const context = this.context;
+            // This controller owns and closes the context below. Let the guide
+            // scheduler disconnect dense passes without walking every envelope on
+            // the modal-close input path; context.close() retires those nodes.
+            this._releaseContextGraph(context);
+            this.soundfont?.destroy?.();
+
+            const finish = async () => {
+                if (context && context.state !== 'closed'
+                        && typeof context.close === 'function') {
+                    try { await context.close(); } catch (_) { /* browser already closed it */ }
+                }
+                this._emitState();
+            };
+            void finish().then(resolveDestroy, rejectDestroy);
+        } catch (error) {
+            rejectDestroy(error);
         }
-        const context = this.context;
-        if (context && typeof context.removeEventListener === 'function') {
-            if (this.contextStateListener) {
-                context.removeEventListener('statechange', this.contextStateListener);
-            }
-            if (this.contextSinkListener) {
-                context.removeEventListener('sinkchange', this.contextSinkListener);
-            }
-        }
-        this.contextStateListener = null;
-        this.contextSinkListener = null;
-        this.context = null;
-        if (context && context.state !== 'closed' && typeof context.close === 'function') {
-            try { await context.close(); } catch (_) { /* browser already closed it */ }
-        }
-        this._emitState();
+        return this.destroyPromise;
     }
 }
 

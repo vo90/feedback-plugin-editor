@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
     commitCompositeArrangement,
+    compositeEditorSourceGuardIsCurrent,
     compositeEditorArrangementNameTaken,
     compositeEditorContainsArrangement,
     compositeEditorSessionIsCurrent,
@@ -59,12 +60,37 @@ test('Hybrid Editor snapshots expose only the project references analysis needs'
     assert.equal(editor.sections, state.sections);
     assert.equal(editor.sessionId, 'song-a');
     assert.equal(editor.format, 'sloppak');
+    assert.equal(Number.isInteger(editor.editGeneration), true);
     assert.equal(editor.currentIndex, 1);
 
     const analysis = readCompositeAnalysisSnapshot(1, 0, state);
     assert.equal(analysis.primary, rhythm);
     assert.equal(analysis.secondary, lead);
     assert.equal(analysis.arrangements, state.arrangements);
+    assert.equal(compositeEditorSourceGuardIsCurrent(analysis.sourceGuard, state), true);
+    rhythm.notes = [];
+    assert.equal(compositeEditorSourceGuardIsCurrent(analysis.sourceGuard, state), false,
+        'a direct source-array replacement invalidates asynchronous Hybrid work');
+});
+
+test('Hybrid source guards catch selected-track removal and in-place array resizing', () => {
+    const lead = { name: 'Lead', notes: [{ time: 0 }], chords: [] };
+    const rhythm = { name: 'Rhythm', notes: [{ time: 1 }], chords: [] };
+    const state = fakeState({
+        arrangements: [lead, rhythm],
+        beats: [{ time: 0 }, { time: 1 }],
+        sections: [],
+    });
+    const guard = readCompositeAnalysisSnapshot(0, 1, state).sourceGuard;
+
+    state.arrangements.splice(1, 1);
+    assert.equal(compositeEditorSourceGuardIsCurrent(guard, state), false);
+
+    state.arrangements.push(rhythm);
+    assert.equal(compositeEditorSourceGuardIsCurrent(guard, state), true);
+    lead.notes.push({ time: 2 });
+    assert.equal(compositeEditorSourceGuardIsCurrent(guard, state), false,
+        'legacy direct mutations that resize a retained array are also stale');
 });
 
 test('Hybrid Editor identity and name checks stay behind the adapter', () => {

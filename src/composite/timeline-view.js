@@ -6,7 +6,7 @@
  * contents while the wide timeline surface keeps one shared scrollbar.
  */
 
-import { beatOf } from '../beats.js';
+import { beatAtTime } from './timing-ports.js';
 import { compositeTechniqueLabels } from './conflict-view.js';
 import {
     HYBRID_PREVIEW_DEFAULTS,
@@ -16,7 +16,7 @@ import {
     HYBRID_TIMELINE_ZOOM_MAX,
     HYBRID_TIMELINE_ZOOM_MIN,
     HYBRID_TIMELINE_ZOOM_STEP,
-} from './preferences.js';
+} from './hybrid-options.js';
 
 export const COMPOSITE_TIMELINE_GUTTER = 168;
 export const COMPOSITE_TIMELINE_RULER_HEIGHT = 34;
@@ -45,6 +45,14 @@ const ENTRY_TECHNIQUE_METADATA = new WeakMap();
 const OVERVIEW_WIDTH = 1000;
 export const COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT = 512;
 const OVERVIEW_INTERVAL_INDEX_TYPE = 'composite-timeline-overview-interval-index';
+const EMPTY_OVERVIEW_ITEMS = Object.freeze([]);
+// Whole-plan timeline views retain immutable decision/result arrays while the
+// active review section moves. Cache the expensive overview projections by
+// those arrays so navigation does not rebuild 20k interval endpoints or note
+// density bins. A resolution/result revision replaces its array and therefore
+// receives a fresh projection automatically.
+const OVERVIEW_INTERVAL_INDEXES = new WeakMap();
+const OVERVIEW_MAP_MARKUP = new WeakMap();
 
 const OVERVIEW_MARKER_STATES = Object.freeze({
     decision: new Set(['invalid', 'resolved', 'unresolved']),
@@ -195,7 +203,7 @@ export function compositeTimelineNoteGlyphMetricsPure(fret) {
 
 export function compositeTimelineSongRangePure({ beats = [], durationSeconds = 0, entries = [] } = {}) {
     const lastGridBeat = Math.max(0, beats.length - 1);
-    const durationBeat = Math.max(0, beatOf(beats, Math.max(0, finite(durationSeconds))));
+    const durationBeat = Math.max(0, beatAtTime(beats, Math.max(0, finite(durationSeconds))));
     let endBeat = Math.max(1, lastGridBeat, durationBeat);
     for (const entry of entries || []) endBeat = Math.max(endBeat, entryEndBeat(entry));
     return { startBeat: 0, endBeat };
@@ -943,7 +951,13 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
     const authoredTrails = [];
     const tremoloTrails = [];
     const effectiveTrails = [];
-    for (const entry of compositeTimelineEntriesInRangePure(lane.entries, visibleRange)) {
+    for (const storedEntry of compositeTimelineEntriesInRangePure(
+        lane.entries, visibleRange)) {
+        // Guided review keeps full-song lane arrays immutable and shares their
+        // range indexes between decisions. Only the handful of notes in the
+        // active conflict receive presentation annotations.
+        const entry = view.entryAnnotations?.get(`${lane.id}:${storedEntry.id}`)
+            || storedEntry;
         const row = Math.max(0, Math.min(view.stringCount - 1,
             view.stringCount - 1 - Math.trunc(finite(entry.string))));
         const y = top + row * stringGap;
@@ -1297,17 +1311,21 @@ function compositeTimelineOverviewKindIndex(items, kind, excluded) {
 /**
  * Build one hit-test snapshot for the dense overview. The controller can
  * retain this next to the rendered map and perform every pointer lookup in
- * logarithmic time, provided it rebuilds the cache when the view changes.
- * Focused markers are deliberately excluded because they keep their ordinary
- * individual SVG hit targets above the density paths.
+ * logarithmic time. Review focus is a separate overlay and does not change the
+ * immutable decision snapshot, so moving between sections reuses this index.
+ * Resolution changes replace the decision array and build a fresh snapshot.
  */
 export function compositeTimelineOverviewIntervalIndexPure(view = {}) {
-    const review = view.review;
-    return {
+    const decisions = Array.isArray(view.decisions)
+        ? view.decisions : EMPTY_OVERVIEW_ITEMS;
+    const cached = OVERVIEW_INTERVAL_INDEXES.get(decisions);
+    if (cached) return cached;
+    const index = {
         type: OVERVIEW_INTERVAL_INDEX_TYPE,
-        decision: compositeTimelineOverviewKindIndex(view.decisions || [], 'decision',
-            item => Boolean(review) && item.id === review.id),
+        decision: compositeTimelineOverviewKindIndex(decisions, 'decision', () => false),
     };
+    OVERVIEW_INTERVAL_INDEXES.set(decisions, index);
+    return index;
 }
 
 function compositeTimelineOverviewGroupHitPure(kindIndex, group, beat) {
@@ -1445,11 +1463,9 @@ function compositeTimelineOverviewGroupedIntervals(items, toX, {
     y,
     height,
     colors,
-    active = () => false,
 } = {}) {
     const grouped = new Map();
     for (const item of items || []) {
-        if (active(item)) continue;
         const state = Object.hasOwn(colors, item.state) ? item.state : 'other';
         if (!grouped.has(state)) grouped.set(state, []);
         grouped.get(state).push(item);
@@ -1465,21 +1481,56 @@ function compositeTimelineOverviewGroupedIntervals(items, toX, {
         })).join('');
 }
 
-function compositeTimelineOverviewDecisionMarkup(decision, toX, width, active) {
+function compositeTimelineOverviewDecisionMarkup(decision, toX, width) {
     const x1 = Math.max(0, Math.min(width, toX(decision.startBeat)));
     const x2 = Math.max(x1 + 2, Math.min(width, toX(decision.endBeat)));
     const color = decision.state === 'invalid' ? '#f87171'
         : decision.state === 'resolved' ? '#34d399' : '#fbbf24';
-    return `<rect data-composite-map-decision="${decision.index}" x="${x1.toFixed(1)}" y="5" width="${Math.max(2, x2 - x1).toFixed(1)}" height="8" rx="2" fill="${color}" opacity="${active ? 1 : 0.72}"/>`;
+    return `<rect data-composite-map-decision="${decision.index}" x="${x1.toFixed(1)}" y="5" width="${Math.max(2, x2 - x1).toFixed(1)}" height="8" rx="2" fill="${color}" opacity="0.72"/>`;
+}
+
+export function compositeTimelineOverviewAccessibleLabelPure(view = {}) {
+    const decisionCount = Array.isArray(view.decisions) ? view.decisions.length : 0;
+    const groupedDescription = decisionCount > COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT
+        ? `. Dense ${decisionCount} decision markers are visually grouped by position and status; clicking a grouped marker opens the exact section at that position, and the focused marker remains individually selectable`
+        : '';
+    return `Whole-song Hybrid overview${groupedDescription}`;
+}
+
+function compositeTimelineOverviewMapCache(decisions, resultEntries, startBeat, endBeat) {
+    let byResult = OVERVIEW_MAP_MARKUP.get(decisions);
+    if (!byResult) {
+        byResult = new WeakMap();
+        OVERVIEW_MAP_MARKUP.set(decisions, byResult);
+    }
+    let byRange = byResult.get(resultEntries);
+    if (!byRange) {
+        byRange = new Map();
+        byResult.set(resultEntries, byRange);
+    }
+    const rangeKey = `${startBeat}|${endBeat}`;
+    return {
+        get: () => byRange.get(rangeKey),
+        set: value => byRange.set(rangeKey, value),
+    };
 }
 
 export function renderCompositeTimelineMapSvg(view, _viewportRange, _playheadBeat = 0) {
     const width = OVERVIEW_WIDTH;
     const height = 42;
-    const span = Math.max(1, view.context.endBeat - view.context.startBeat);
-    const x = beat => ((finite(beat) - view.context.startBeat) / span) * width;
+    const startBeat = finite(view.context.startBeat);
+    const endBeat = Math.max(startBeat, finite(view.context.endBeat, startBeat));
+    const span = Math.max(1, endBeat - startBeat);
+    const x = beat => ((finite(beat) - startBeat) / span) * width;
     const result = view.lanes.find(lane => lane.id === 'result');
-    const resultEntries = result?.entries || [];
+    const resultEntries = Array.isArray(result?.entries)
+        ? result.entries : EMPTY_OVERVIEW_ITEMS;
+    const decisionItems = Array.isArray(view.decisions)
+        ? view.decisions : EMPTY_OVERVIEW_ITEMS;
+    const cache = compositeTimelineOverviewMapCache(
+        decisionItems, resultEntries, startBeat, endBeat);
+    const cached = cache.get();
+    if (cached !== undefined) return cached;
     const fillAddition = entry => entry.source === 'secondary'
         && !(entry.sources || []).includes('primary');
     const entries = compositeTimelineOverviewDensityMarkup(resultEntries, x, {
@@ -1487,23 +1538,20 @@ export function renderCompositeTimelineMapSvg(view, _viewportRange, _playheadBea
     }) + compositeTimelineOverviewDensityMarkup(resultEntries, x, {
         width, fill: '#c084fc', include: fillAddition,
     });
-    const decisionItems = view.decisions || [];
-    const activeDecision = decision => view.review && view.review.id === decision.id;
     const denseDecisions = decisionItems.length > COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT;
     const decisions = denseDecisions
         ? compositeTimelineOverviewGroupedIntervals(decisionItems, x, {
             kind: 'decision', y: 5, height: 8,
             colors: { invalid: '#f87171', resolved: '#34d399', unresolved: '#fbbf24' },
-            active: activeDecision,
-        }) + decisionItems.filter(activeDecision).map(decision =>
-            compositeTimelineOverviewDecisionMarkup(decision, x, width, true)).join('')
+        })
         : decisionItems.map(decision => compositeTimelineOverviewDecisionMarkup(
-            decision, x, width, activeDecision(decision))).join('');
-    const groupedDescription = denseDecisions
-        ? `. Dense ${decisionItems.length} decision markers are visually grouped by position and status; clicking a grouped marker opens the exact section at that position, and the focused marker remains individually selectable`
-        : '';
-    const accessibleLabel = `Whole-song Hybrid overview${groupedDescription}`;
-    return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" width="100%" height="42" role="img" aria-label="${escapeMarkup(accessibleLabel)}" style="display:block">`
-        + `<title>${escapeMarkup(accessibleLabel)}</title><rect width="${width}" height="${height}" rx="7" fill="#0f172a"/>${entries}${decisions}`
-        + '</svg>';
+            decision, x, width)).join('');
+    // The parent map owns slider semantics and its exported accessible label.
+    // Slider descendants are presentational in accessibility APIs, so make the
+    // nested drawing explicitly decorative instead of advertising an ignored
+    // second role/name.
+    const markup = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" width="100%" height="42" role="presentation" aria-hidden="true" focusable="false" style="display:block">`
+        + `<rect width="${width}" height="${height}" rx="7" fill="#0f172a"/>${entries}${decisions}</svg>`;
+    cache.set(markup);
+    return markup;
 }

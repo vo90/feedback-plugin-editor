@@ -5,6 +5,14 @@
  * musical alignment testable without alphaTab or a browser.
  */
 
+import {
+    compositeBeatBoundaryIndex,
+    compositeConflictContextFromIndex,
+    compositeImmutableEntryIndex,
+    compositeIndexedEntriesInRange,
+    compositePreparedEntryIndex,
+} from './review-model-cache.js';
+
 const EPS = 1e-4;
 const FALLBACK_CONTEXT_BEATS = 4;
 
@@ -90,55 +98,11 @@ function fallbackSourceEntries(plan, source) {
     return uniqueEntries(entries);
 }
 
-function sourceEntries(plan, source) {
-    const explicit = plan && plan.sourceEntries && plan.sourceEntries[source];
-    return uniqueEntries(Array.isArray(explicit) ? explicit : fallbackSourceEntries(plan || {}, source));
-}
-
-function measureBoundaries(beats) {
-    const boundaries = [];
-    for (let index = 0; index < (beats || []).length; index++) {
-        const measure = Number(beats[index] && beats[index].measure);
-        if (Number.isFinite(measure) && measure >= 1) boundaries.push({ beat: index, measure });
-    }
-    return boundaries;
-}
-
 export function compositeConflictContextPure(beats, conflict, fallbackPadding = FALLBACK_CONTEXT_BEATS) {
-    const start = finite(conflict && conflict.startBeat);
-    const end = Math.max(start + EPS, finite(conflict && conflict.endBeat, start + EPS));
-    const boundaries = measureBoundaries(beats);
-    if (boundaries.length < 2) {
-        return {
-            startBeat: Math.max(0, start - fallbackPadding),
-            endBeat: Math.max(end + fallbackPadding, start + 1),
-            measureMarkers: [],
-        };
-    }
-
-    let containingIndex = -1;
-    for (let index = 0; index < boundaries.length; index++) {
-        if (boundaries[index].beat <= start + EPS) containingIndex = index;
-        else break;
-    }
-    const contextStartIndex = Math.max(0, containingIndex - 1);
-    const contextStart = containingIndex >= 0
-        ? boundaries[contextStartIndex].beat : Math.max(0, start - fallbackPadding);
-    let firstAfterEnd = boundaries.findIndex(boundary => boundary.beat > end + EPS);
-    if (firstAfterEnd < 0) firstAfterEnd = boundaries.length;
-    const contextEndBoundary = boundaries[Math.min(boundaries.length - 1, firstAfterEnd + 1)];
-    const lastBarLength = boundaries.length >= 2
-        ? boundaries[boundaries.length - 1].beat - boundaries[boundaries.length - 2].beat
-        : fallbackPadding;
-    const contextEnd = contextEndBoundary
-        ? contextEndBoundary.beat
-        : Math.max(end + fallbackPadding, boundaries.at(-1).beat + Math.max(1, lastBarLength));
-    return {
-        startBeat: contextStart,
-        endBeat: Math.max(contextEnd, contextStart + 1),
-        measureMarkers: boundaries.filter(boundary => boundary.beat >= contextStart - EPS
-            && boundary.beat <= contextEnd + EPS),
-    };
+    return compositeConflictContextFromIndex(compositeBeatBoundaryIndex(beats), conflict, {
+        fallbackPadding,
+        epsilon: EPS,
+    });
 }
 
 function entryEnd(entry) {
@@ -161,6 +125,44 @@ function resolvedResultEntries(plan, currentConflict, currentSelectionIds) {
             .filter(entry => ids.has(entry.id)));
     }
     return uniqueEntries(entries);
+}
+
+function sourceEntryInput(plan, source) {
+    const explicit = plan?.sourceEntries?.[source];
+    return Array.isArray(explicit) ? explicit : fallbackSourceEntries(plan || {}, source);
+}
+
+export function createCompositeConflictViewIndex({
+    plan,
+    resolvedEntries = null,
+} = {}) {
+    if (!plan) return null;
+    const primaryInput = sourceEntryInput(plan, 'primary');
+    const secondaryInput = sourceEntryInput(plan, 'secondary');
+    const preparedResult = Array.isArray(resolvedEntries) ? resolvedEntries : null;
+    return {
+        plan,
+        beats: plan.beats,
+        primaryInput,
+        secondaryInput,
+        resolvedEntries: preparedResult,
+        boundaries: compositeBeatBoundaryIndex(plan.beats),
+        primary: compositeImmutableEntryIndex(primaryInput),
+        secondary: compositeImmutableEntryIndex(secondaryInput),
+        result: preparedResult ? compositePreparedEntryIndex(preparedResult) : null,
+    };
+}
+
+export function compositeConflictViewIndexMatches(index, {
+    plan,
+    resolvedEntries = null,
+} = {}) {
+    if (!index || index.plan !== plan || index.beats !== plan?.beats) return false;
+    const primaryInput = plan?.sourceEntries?.primary;
+    const secondaryInput = plan?.sourceEntries?.secondary;
+    if (Array.isArray(primaryInput) && index.primaryInput !== primaryInput) return false;
+    if (Array.isArray(secondaryInput) && index.secondaryInput !== secondaryInput) return false;
+    return index.resolvedEntries === (Array.isArray(resolvedEntries) ? resolvedEntries : null);
 }
 
 function overlappingPair(conflict) {
@@ -206,7 +208,7 @@ function propertyDifferences(conflict) {
 function conflictExplanation(conflict, names, stringCount) {
     if ((conflict.reasons || []).includes('guided-choice')) {
         if ((conflict.reasons || []).includes('transition')) {
-            return `Nearby notes are included in this decision because a complete trail crosses the handoff. Choose which track should play through it; no trail will be cut off.`;
+            return 'Nearby notes are included in this review section because a complete trail crosses the handoff. Choose which track should play through it; no trail will be cut off.';
         }
         const common = Math.max(0, Math.trunc(finite(conflict.commonCount)));
         const commonText = common
@@ -239,25 +241,37 @@ function laneEntry(entry, conflictIds, selectedIds, selectable, invalid = false)
 
 export function buildCompositeConflictViewModel({
     plan, conflictIndex = 0, primaryName = 'Primary', secondaryName = 'Secondary',
-    customEntryIds = null,
+    customEntryIds = null, modelIndex = null, resolvedEntries = null,
 } = {}) {
     if (!plan || !Array.isArray(plan.conflicts) || !plan.conflicts.length) return null;
     const index = Math.max(0, Math.min(Math.trunc(finite(conflictIndex)), plan.conflicts.length - 1));
     const conflict = plan.conflicts[index];
     const names = { primary: primaryName || 'Primary', secondary: secondaryName || 'Secondary' };
-    const context = compositeConflictContextPure(plan.beats, conflict);
+    const prepared = compositeConflictViewIndexMatches(modelIndex, { plan, resolvedEntries })
+        ? modelIndex : createCompositeConflictViewIndex({ plan, resolvedEntries });
+    const context = compositeConflictContextFromIndex(prepared.boundaries, conflict, {
+        fallbackPadding: FALLBACK_CONTEXT_BEATS,
+        epsilon: EPS,
+    });
     const conflictEntries = [...(conflict.primaryEntries || []), ...(conflict.secondaryEntries || [])];
     const conflictIds = new Set(conflictEntries.map(entry => entry.id));
     const currentSelection = Array.isArray(customEntryIds) ? customEntryIds : conflict.selectedEntryIds;
     const selectedIds = new Set(currentSelection || []);
     const custom = Array.isArray(customEntryIds);
     const invalid = Boolean(conflict.validationError);
-    const primary = entriesInContext(sourceEntries(plan, 'primary'), context)
+    const primary = compositeIndexedEntriesInRange(prepared.primary, context)
         .map(entry => laneEntry(entry, conflictIds, selectedIds, custom));
-    const secondary = entriesInContext(sourceEntries(plan, 'secondary'), context)
+    const secondary = compositeIndexedEntriesInRange(prepared.secondary, context)
         .map(entry => laneEntry(entry, conflictIds, selectedIds, custom));
-    const result = entriesInContext(resolvedResultEntries(plan, conflict,
-        custom ? currentSelection : null), context)
+    // A manual draft temporarily replaces one committed conflict selection;
+    // preserve that uncommon mutation-aware path exactly. Ordinary navigation
+    // reads the already-sorted resolved revision through its range index.
+    const localResult = custom
+        ? entriesInContext(resolvedResultEntries(plan, conflict, currentSelection), context)
+        : prepared.result
+            ? compositeIndexedEntriesInRange(prepared.result, context)
+            : entriesInContext(resolvedResultEntries(plan, conflict, null), context);
+    const result = localResult
         .map(entry => laneEntry(entry, conflictIds, selectedIds, false, invalid));
     const stringCount = Math.max(1, Math.trunc(finite(plan.compatibility && plan.compatibility.stringCount, 6)));
     return {

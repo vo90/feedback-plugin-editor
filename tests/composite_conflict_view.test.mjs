@@ -4,11 +4,16 @@ import test from 'node:test';
 import {
     buildCompositeConflictViewModel,
     buildCompositeReviewToolbarModel,
+    compositeConflictViewIndexMatches,
     compositeConflictContextPure,
     compositeTechniqueLabels,
+    createCompositeConflictViewIndex,
     renderCompositeDifferenceTable,
 } from '../src/composite/conflict-view.js';
-import { resolveCompositeConflict } from '../src/composite/merge-engine.js';
+import {
+    compositeResolvedEntries,
+    resolveCompositeConflict,
+} from '../src/composite/merge-engine.js';
 import { analyzeGuidedComposite } from '../src/composite/guided-engine.js';
 
 const beats = Array.from({ length: 25 }, (_, index) => ({
@@ -74,6 +79,24 @@ test('view model keeps synchronized source context and an honest unresolved resu
     resolveCompositeConflict(plan, plan.conflicts[0].id, 'primary');
     const resolved = buildCompositeConflictViewModel({ plan, primaryName: 'Lead', secondaryName: 'Rhythm' });
     assert.equal(resolved.lanes[2].entries.some(entry => entry.fret === 7 && entry.inConflict), true);
+
+    const resolvedEntries = compositeResolvedEntries(plan);
+    const modelIndex = createCompositeConflictViewIndex({ plan, resolvedEntries });
+    assert.equal(compositeConflictViewIndexMatches(modelIndex, { plan, resolvedEntries }), true);
+    const indexed = buildCompositeConflictViewModel({
+        plan,
+        primaryName: 'Lead',
+        secondaryName: 'Rhythm',
+        resolvedEntries,
+        modelIndex,
+    });
+    assert.deepEqual(indexed, resolved,
+        'indexed source/result ranges preserve the exact conflict presentation');
+    const repeatedIndex = createCompositeConflictViewIndex({ plan, resolvedEntries });
+    assert.strictEqual(repeatedIndex.primary.entries, modelIndex.primary.entries,
+        'the immutable source projection is shared across plan-index revisions');
+    assert.strictEqual(repeatedIndex.boundaries, modelIndex.boundaries,
+        'the immutable beat-boundary index is shared across plan-index revisions');
 });
 
 test('custom source notes are keyboard-selectable and invalid drafts stay visible', () => {

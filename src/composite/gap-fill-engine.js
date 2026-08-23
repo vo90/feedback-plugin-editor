@@ -6,7 +6,7 @@
  * those rules too.
  */
 
-import { timeOf } from '../beats.js';
+import { timeAtBeat } from './timing-ports.js';
 import {
     COMPOSITE_BEAT_EPS,
     compositePlayableGroups,
@@ -75,7 +75,7 @@ function mergeIntervals(entries, padding, coordinate) {
 
 function eligibleWindows(primaryEntries, secondaryEntries, beats, options) {
     const { unit, minimumGap, transitionMargin } = options;
-    const coordinate = unit === 'seconds' ? beat => timeOf(beats, beat) : beat => beat;
+    const coordinate = unit === 'seconds' ? beat => timeAtBeat(beats, beat) : beat => beat;
     const allEntries = [...primaryEntries, ...secondaryEntries];
     const contentStartBeat = Math.min(0, ...allEntries.map(entry => entry.startBeat));
     const contentEndBeat = Math.max(

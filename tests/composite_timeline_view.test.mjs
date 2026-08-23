@@ -26,6 +26,7 @@ import {
     compositeTimelineMapViewportPure,
     compositeTimelineMapBeatPure,
     compositeTimelineNoteGlyphMetricsPure,
+    compositeTimelineOverviewAccessibleLabelPure,
     compositeTimelineOverviewIntervalAtBeatPure,
     compositeTimelineOverviewIntervalIndexPure,
     compositeTimelinePagedCameraPure,
@@ -579,13 +580,15 @@ test('lane and overview markup contain full-song notes without review controls',
     assert.match(lane, />7</);
     assert.doesNotMatch(lane, /data-composite-entry-id|>REVIEW</);
     const map = renderCompositeTimelineMapSvg(model, { startBeat: 2, endBeat: 8 });
-    assert.match(map, /Whole-song Hybrid overview/);
+    assert.equal(compositeTimelineOverviewAccessibleLabelPure(model),
+        'Whole-song Hybrid overview');
+    assert.match(map, /role="presentation" aria-hidden="true" focusable="false"/);
     assert.match(map, /fill="#c084fc"/, 'fill-track additions share the main song map');
     assert.doesNotMatch(map, /editor-composite-map-(viewport|playhead)/,
         'the dense overview SVG stays static while HTML overlays move above it');
 });
 
-test('dense overview groups decisions but keeps a late focused marker interactive', () => {
+test('dense overview is static across focus while the parent retains its accessible label', () => {
     const count = 20_000;
     assert.equal(COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT, 512);
     const decisions = Array.from({ length: count }, (_, index) => ({
@@ -595,31 +598,37 @@ test('dense overview groups decisions but keeps a late focused marker interactiv
         endBeat: index + 0.5,
         state: index % 3 === 0 ? 'resolved' : index % 3 === 1 ? 'unresolved' : 'invalid',
     }));
-    const map = renderCompositeTimelineMapSvg({
+    const view = {
         context: { startBeat: 0, endBeat: count },
         lanes: [{ id: 'result', entries: [] }],
         review: { id: decisions.at(-1).id },
         decisions,
-    });
+    };
+    const map = renderCompositeTimelineMapSvg(view);
 
-    assert.equal((map.match(/data-composite-map-decision="/g) || []).length, 1,
-        'only the focused decision remains an individual SVG hit target');
-    assert.match(map, /data-composite-map-decision="19999"/,
-        'a focused decision beyond the aggregation limit remains selectable');
+    assert.equal((map.match(/data-composite-map-decision="/g) || []).length, 0,
+        'the focused decision belongs to the parent overlay, not the static SVG');
     assert.match(map, /data-composite-map-decision-density=/);
     assert.match(map, /data-composite-map-density-kind="decision"[^>]*pointer-events="fill"/,
         'a delegated handler can distinguish and hit a grouped decision path');
-    assert.match(map, /Dense 20000 decision markers are visually grouped[^<]*clicking a grouped marker opens the exact section/,
-        'the accessible description explains that grouped marks still open exact sections');
+    assert.match(compositeTimelineOverviewAccessibleLabelPure(view),
+        /Dense 20000 decision markers are visually grouped.*clicking a grouped marker opens the exact section/,
+        'the parent can expose the grouped-marker instruction outside its slider subtree');
+    assert.match(map, /role="presentation" aria-hidden="true" focusable="false"/);
+    assert.doesNotMatch(map, /role="img"|aria-label=|<title>/,
+        'the drawing does not publish semantics hidden by its slider parent');
     assert.match(map, /data-composite-map-density-state="(?:resolved|unresolved|invalid)"[^>]*aria-hidden="true"/,
         'decorative grouped paths defer their name to the containing labelled map button');
     assert.ok((map.match(/data-composite-map-decision-density=/g) || []).length <= 3,
         'decision aggregation emits at most one path per visible state');
     assert.ok(map.length < 250_000,
         `twenty thousand intervals should not produce unbounded markup (${map.length} chars)`);
+    assert.equal(renderCompositeTimelineMapSvg({
+        ...view, review: { id: decisions[10].id },
+    }), map, 'moving review focus leaves the static map byte-for-byte unchanged');
 });
 
-test('dense overview hit index resolves overlaps, visual gaps, states, and focus deterministically', () => {
+test('dense overview hit index resolves overlaps, visual gaps, and states deterministically', () => {
     const decisions = [
         { id: 'early', index: 0, startBeat: 1, endBeat: 3, state: 'unresolved' },
         { id: 'top', index: 1, startBeat: 2, endBeat: 4, state: 'unresolved' },
@@ -633,10 +642,10 @@ test('dense overview hit index resolves overlaps, visual gaps, states, and focus
 
     assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2.5, {
         kind: 'decision', state: 'unresolved',
-    })?.id, 'top', 'later ordinary paint order wins an overlap');
-    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 5, {
+    })?.id, 'focused', 'the top-painted focused item remains in the shared density index');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 5.5, {
         kind: 'decision', state: 'unresolved',
-    })?.id, 'right', 'an equal visual-gap distance selects the later painted interval');
+    })?.id, 'focused', 'an equal visual-gap distance selects the later painted interval');
     assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2.5, {
         kind: 'decision', state: 'resolved',
     })?.id, 'resolved', 'the density marker state filters the exact target');
@@ -648,12 +657,12 @@ test('dense overview hit index resolves overlaps, visual gaps, states, and focus
     })?.id, 'other-state', 'the literal visual fallback state remains queryable');
     assert.equal(compositeTimelineOverviewIntervalAtBeatPure(view, 2.5, {
         kind: 'decision', state: 'unresolved',
-    })?.id, 'top', 'a view remains a correct one-off input without retaining an index');
+    })?.id, 'focused', 'a view remains a correct one-off input without retaining an index');
     assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2, { kind: 'unknown' }),
         null, 'unknown marker kinds fail closed');
 });
 
-test('overview interval focus exclusion mirrors rendering for falsy decision ids', () => {
+test('overview interval index is reused across every focused decision id', () => {
     for (const focusedId of [0, '']) {
         const decisions = [
             { id: focusedId, index: 0, startBeat: 1, endBeat: 3, state: 'unresolved' },
@@ -663,9 +672,12 @@ test('overview interval focus exclusion mirrors rendering for falsy decision ids
             review: { id: focusedId },
             decisions,
         });
+        assert.strictEqual(compositeTimelineOverviewIntervalIndexPure({
+            review: { id: 'ordinary' }, decisions,
+        }), index, 'review focus does not rebuild immutable interval endpoints');
         assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2, {
             kind: 'decision', state: 'unresolved',
-        })?.id, 'ordinary', `focused id ${JSON.stringify(focusedId)} stays out of density hits`);
+        })?.id, focusedId, `focused id ${JSON.stringify(focusedId)} remains queryable`);
     }
 });
 
@@ -737,6 +749,20 @@ test('twenty-thousand-marker overview index stays below the renderer long-task r
     // previous 200–380 ms renderer-blocking implementation.
     assert.ok(elapsed < 100,
         `twenty thousand intervals should index below a long-task budget (${elapsed.toFixed(1)} ms)`);
+    assert.strictEqual(compositeTimelineOverviewIntervalIndexPure({
+        review: { id: decisions.at(-1).id }, decisions,
+    }), hitIndex, 'focus-only navigation reuses the 20k snapshot');
+
+    const changedDecisions = decisions.map((decision, index) => index === 0
+        ? { ...decision, state: 'invalid' } : decision);
+    const changedIndex = compositeTimelineOverviewIntervalIndexPure({
+        decisions: changedDecisions,
+    });
+    assert.notStrictEqual(changedIndex, hitIndex,
+        'a replacement decision-state array receives a fresh snapshot');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(changedIndex, 0, {
+        kind: 'decision', state: 'invalid',
+    })?.id, 'decision:0');
 });
 
 test('ordinary overview counts preserve every decision hit target', () => {
@@ -752,8 +778,46 @@ test('ordinary overview counts preserve every decision hit target', () => {
     });
     assert.equal((map.match(/data-composite-map-decision="/g) || []).length, 12);
     assert.doesNotMatch(map, /data-composite-map-decision-density=/);
-    assert.match(map, /aria-label="Whole-song Hybrid overview"/,
-        'normal songs keep the previous concise accessible name');
+    assert.equal(compositeTimelineOverviewAccessibleLabelPure({ decisions }),
+        'Whole-song Hybrid overview',
+        'normal songs keep the previous concise parent label');
+    assert.doesNotMatch(map, /aria-label=/,
+        'the nested presentational SVG does not duplicate its parent name');
+});
+
+test('overview cache invalidates for replacement decision and result arrays', () => {
+    const decisions = [{
+        id: 'decision:0', index: 0, startBeat: 1, endBeat: 2, state: 'unresolved',
+    }];
+    const base = {
+        context: { startBeat: 0, endBeat: 8 },
+        lanes: [{ id: 'result', entries: [] }],
+        review: { id: 'decision:0' },
+        decisions,
+    };
+    const initial = renderCompositeTimelineMapSvg(base);
+    assert.equal(renderCompositeTimelineMapSvg({
+        ...base, review: { id: 'different-focus' },
+    }), initial, 'focus-only views reuse immutable overview markup');
+
+    const changedState = renderCompositeTimelineMapSvg({
+        ...base,
+        decisions: [{ ...decisions[0], state: 'resolved' }],
+    });
+    assert.notEqual(changedState, initial);
+    assert.match(changedState, /fill="#34d399" opacity="0\.72"/,
+        'a replacement decision array paints its new state');
+
+    const changedResult = renderCompositeTimelineMapSvg({
+        ...base,
+        lanes: [{ id: 'result', entries: [{
+            id: 'fill', source: 'secondary', sources: ['secondary'],
+            startBeat: 3, endBeat: 4,
+        }] }],
+    });
+    assert.notEqual(changedResult, initial);
+    assert.match(changedResult, /fill="#c084fc"/,
+        'a replacement result array paints its new note density');
 });
 
 test('overview viewport geometry can update without rebuilding the whole map', () => {
@@ -880,9 +944,11 @@ test('review timeline uses the shared lanes with selectable notes and one focus 
     };
     model.decisions = [{ id: 'decision:1', index: 0, startBeat: 2, endBeat: 4,
         state: 'unresolved' }];
-    model.lanes[0].entries[0] = {
-        ...model.lanes[0].entries[0], selectable: true, selected: true, inConflict: true,
+    const sharedPrimaryEntries = model.lanes[0].entries;
+    const annotated = {
+        ...sharedPrimaryEntries[0], selectable: true, selected: true, inConflict: true,
     };
+    model.entryAnnotations = new Map([[`primary:${annotated.id}`, annotated]]);
     const visible = { startBeat: 0, endBeat: 12 };
     const lane = renderCompositeTimelineLaneContents(model, 'primary', 158, visible, 120);
     const ruler = renderCompositeTimelineRulerContents(model, visible, 120);
@@ -893,6 +959,8 @@ test('review timeline uses the shared lanes with selectable notes and one focus 
     assert.match(lane, /role="checkbox"/);
     assert.match(lane, /aria-label="String 6, fret 3,/);
     assert.match(lane, /stroke="#fbbf24"/);
+    assert.strictEqual(model.lanes[0].entries, sharedPrimaryEntries,
+        'review annotations do not replace the immutable full-song lane array');
     assert.match(ruler, />REVIEW</);
     assert.match(map, /data-composite-map-decision="0"/);
     assert.doesNotMatch(map, /id="editor-composite-map-playhead"/);

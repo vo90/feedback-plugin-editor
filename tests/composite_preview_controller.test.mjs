@@ -312,6 +312,76 @@ test('an audio-device interruption stops the private pass and reports an error',
     assert.equal(fixture.context.listeners.get('sinkchange').size, 0);
 });
 
+test('a later start replaces a closed AudioContext and its context-bound graph', async () => {
+    const contexts = [
+        new FakeAudioContext({ state: 'suspended' }),
+        new FakeAudioContext({ state: 'suspended' }),
+    ];
+    const soundfont = new FakeSoundfont();
+    const guides = [];
+    const references = [];
+    let contextFactoryCalls = 0;
+    const controller = new CompositePreviewController({
+        audioContextFactory: () => contexts[contextFactoryCalls++],
+        soundfontLoader: soundfont,
+        guideSchedulerFactory: options => {
+            const scheduler = new FakeGuideScheduler(options);
+            guides.push(scheduler);
+            return scheduler;
+        },
+        referenceMixerFactory: options => {
+            const mixer = new FakeReferenceMixer(options);
+            references.push(mixer);
+            return mixer;
+        },
+        requestAnimationFrameFn: null,
+        cancelAnimationFrameFn: null,
+        modes: {
+            primary: {
+                kind: 'guide',
+                events: [{ t: 0, midi: 60, sus: 0.2 }],
+                voiceCap: 6,
+            },
+        },
+        mode: 'primary',
+        startTime: 0,
+        endTime: 10,
+    });
+
+    assert.equal(await controller.start(), true);
+    const firstContext = contexts[0];
+    const firstGraph = [
+        controller.referenceGain, controller.guideGain,
+        controller.masterGain, controller.limiter,
+    ];
+    firstContext.currentTime = 0.505;
+    firstContext.state = 'closed';
+    firstContext.emit('statechange');
+    assert.equal(controller.isPlaying(), false);
+
+    assert.equal(await controller.start(), true);
+    assert.equal(contextFactoryCalls, 2);
+    assert.strictEqual(controller.context, contexts[1]);
+    assert.equal(controller.isPlaying(), true);
+    assert.deepEqual(soundfont.prepared.map(item => item.context), contexts);
+    assert.equal(guides.length, 2);
+    assert.equal(references.length, 2);
+    assert.equal(guides[0].destroyed, true);
+    assert.deepEqual(guides[0].destroyOptions, { contextWillClose: true });
+    assert.equal(references[0].destroyed, true);
+    assert.ok(firstGraph.every(node => node.disconnected));
+    assert.equal(firstContext.listeners.get('statechange').size, 0);
+    assert.equal(firstContext.listeners.get('sinkchange').size, 0);
+    assert.equal(soundfont.destroyed, false,
+        'context recovery retains the controller-owned per-context loader');
+
+    const completion = controller.destroy();
+    assert.strictEqual(controller.destroy(), completion);
+    await completion;
+    assert.equal(contexts[1].closed, true);
+    assert.equal(soundfont.destroyed, true);
+});
+
 test('loop time projection keeps the initial tail and every later cycle contiguous', () => {
     const loop = { enabled: true, startTime: 1, endTime: 2 };
     assert.equal(compositePreviewLoopTimePure(1.8, 0.199, loop), 1.999);
@@ -377,17 +447,61 @@ test('selecting a new mode clears a previous preview failure before configuratio
     assert.equal(fixture.states.at(-1).error, null);
 });
 
+test('concurrent destroy callers share the pending AudioContext close', async () => {
+    const fixture = controllerFixture();
+    await fixture.controller.start();
+    let closeCalls = 0;
+    let releaseClose;
+    fixture.context.close = () => {
+        closeCalls++;
+        return new Promise(resolve => {
+            releaseClose = () => {
+                fixture.context.state = 'closed';
+                fixture.context.closed = true;
+                resolve();
+            };
+        });
+    };
+
+    const first = fixture.controller.destroy();
+    const concurrent = fixture.controller.destroy();
+    assert.strictEqual(concurrent, first,
+        'every caller must observe the same pending teardown barrier');
+    assert.equal(closeCalls, 1);
+
+    let settled = false;
+    void first.then(() => { settled = true; });
+    await flush();
+    assert.equal(settled, false, 'destroy must remain pending until AudioContext.close settles');
+
+    releaseClose();
+    await concurrent;
+    assert.equal(settled, true);
+    assert.equal(fixture.context.closed, true);
+});
+
 test('destroy cancels feature-owned engines and closes only its private context', async () => {
     const fixture = controllerFixture();
     await fixture.controller.start();
     const guide = fixture.guide();
     const reference = fixture.reference();
-    await fixture.controller.destroy();
+    const close = fixture.context.close.bind(fixture.context);
+    let closeCalls = 0;
+    fixture.context.close = async () => {
+        closeCalls++;
+        await close();
+    };
+    const completion = fixture.controller.destroy();
+    await completion;
     assert.equal(fixture.context.closed, true);
+    assert.equal(closeCalls, 1);
     assert.equal(fixture.soundfont.destroyed, true);
     assert.equal(guide.destroyed, true);
     assert.deepEqual(guide.destroyOptions, { contextWillClose: true });
     assert.equal(reference.destroyed, true);
     assert.equal(fixture.controller.isPlaying(), false);
     assert.equal(await fixture.controller.start(), false);
+    assert.strictEqual(fixture.controller.destroy(), completion,
+        'a completed destroy call keeps returning the original completion');
+    assert.equal(closeCalls, 1, 'repeated destroy must not close the context twice');
 });

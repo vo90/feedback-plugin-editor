@@ -89,6 +89,72 @@ test('Hybrid audition reaches Editor audio and loop state only through its adapt
         'the one explicit Editor-loop handoff stays visible at the boundary');
 });
 
+test('Hybrid music helpers enter through narrow feature-owned ports', () => {
+    const ports = new Map([
+        ['src/composite/timing-ports.js', ['beatAtTime', 'timeAtBeat']],
+        ['src/composite/arrangement-ports.js', [
+            'arrangementKind', 'isFrettedArrangementKind',
+        ]],
+        ['src/composite/fretboard-ports.js', [
+            'openMidiForArrangement', 'soundingPitchForFret',
+            'stringCountForArrangement',
+        ]],
+        ['src/composite/reference-audio-ports.js', [
+            'audioRegionPlacements', 'audioRegionStart',
+        ]],
+    ]);
+    for (const [file, aliases] of ports) {
+        const port = read(file);
+        assert.doesNotMatch(port, /from ['"]\.\.\/(?:state|host|loop|history)\.js['"]/,
+            `${file} must not acquire Editor state or transport policy`);
+        for (const alias of aliases) {
+            assert.match(port, new RegExp(`\\bas ${alias}\\b`),
+                `${file} must expose the feature-facing ${alias} name`);
+        }
+        assert.doesNotMatch(port, /\bas\s+_[A-Za-z]/,
+            `private core helper names must not leak through ${file}`);
+    }
+
+    const directCoreImport = /from ['"]\.\.\/(?:beats|instrument|lanes|audio)\.js['"]/;
+    const boundaryFiles = new Set([
+        'src/composite/editor-adapter.js',
+        ...ports.keys(),
+    ]);
+    for (const file of repositoryFiles('src/composite').filter(name =>
+        name.endsWith('.js') && !boundaryFiles.has(name))) {
+        assert.doesNotMatch(read(file), directCoreImport,
+            `${file} must import music helpers through a narrow feature port`);
+    }
+
+    assert.doesNotMatch(read('src/composite/timing-ports.js'), /audio\.js/,
+        'timing-only planners must not load the stateful Editor audio graph');
+});
+
+test('Hybrid DOM helpers enter through one feature-owned UI port', () => {
+    const port = read('src/composite/ui-ports.js');
+    for (const alias of [
+        'escapeEditorMarkup',
+        'promptEditorChoice',
+        'installEditorModalKeyboard',
+    ]) {
+        assert.match(port, new RegExp(`\\bas ${alias}\\b`),
+            `ui-ports.js must expose the feature-facing ${alias} name`);
+    }
+    assert.doesNotMatch(port, /\bas\s+_[A-Za-z]/,
+        'private core UI helper names must not leak through the feature boundary');
+
+    const directUiImport = /from ['"]\.\.\/ui\.js['"]/;
+    const boundaryFiles = new Set([
+        'src/composite/editor-adapter.js',
+        'src/composite/ui-ports.js',
+    ]);
+    for (const file of repositoryFiles('src/composite').filter(name =>
+        name.endsWith('.js') && !boundaryFiles.has(name))) {
+        assert.doesNotMatch(read(file), directUiImport,
+            `${file} must import DOM helpers through ui-ports.js`);
+    }
+});
+
 test('only the two deliberate normal-Editor hooks mention the Hybrid feature', () => {
     const normalSources = repositoryFiles('src').filter(file =>
         file.endsWith('.js') && !file.startsWith('src/composite/'));

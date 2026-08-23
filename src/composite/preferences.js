@@ -2,6 +2,23 @@
 
 import { normalizeCompositeGapFillOptions } from './gap-fill-engine.js';
 import { GUIDED_REPEAT_MODE_EVERY, GUIDED_REPEAT_MODE_MATCHING } from './guided-engine.js';
+import {
+    HYBRID_PREVIEW_DEFAULTS,
+    HYBRID_PREVIEW_TONES,
+    HYBRID_TIMELINE_DISPLAY_NOTES,
+    HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+    HYBRID_TIMELINE_FOLLOW_CENTERED,
+    HYBRID_TIMELINE_FOLLOW_OFF,
+    HYBRID_TIMELINE_FOLLOW_PAGED,
+    HYBRID_TIMELINE_LANE_MAX,
+    HYBRID_TIMELINE_LANE_MIN,
+    HYBRID_TIMELINE_ZOOM_CONTROL_MIN,
+    HYBRID_TIMELINE_ZOOM_MAX,
+} from './hybrid-options.js';
+
+// Compatibility facade for existing resolver and test imports. New playback
+// and timeline consumers should import the dependency-free leaf directly.
+export * from './hybrid-options.js';
 
 const GAP_FILL_KEY = 'editorCompositeGapFill';
 const GUIDED_KEY = 'editorCompositeGuided';
@@ -9,28 +26,6 @@ const PREVIEW_KEY = 'editorCompositePreview';
 const DIALOG_SIZE_KEY = 'editorCompositeDialogSize';
 const TIMELINE_PREF_VERSION_KEY = 'editorCompositeTimelineVersion';
 const TIMELINE_PREF_VERSION = 4;
-
-// Display-only Overview may need well below one pixel per beat for unusually
-// long charts. Persisted/readable Notes zoom still has its separate 5 px floor.
-export const HYBRID_TIMELINE_ZOOM_MIN = 0.01;
-export const HYBRID_TIMELINE_ZOOM_MAX = 480;
-export const HYBRID_TIMELINE_ZOOM_CONTROL_MIN = 5;
-export const HYBRID_TIMELINE_ZOOM_STEP = 5;
-export const HYBRID_TIMELINE_LANE_MIN = 128;
-export const HYBRID_TIMELINE_LANE_MAX = 320;
-export const HYBRID_TIMELINE_DISPLAY_NOTES = 'notes';
-export const HYBRID_TIMELINE_DISPLAY_OVERVIEW = 'overview';
-export const HYBRID_TIMELINE_FOLLOW_CENTERED = 'centered';
-export const HYBRID_TIMELINE_FOLLOW_PAGED = 'paged';
-export const HYBRID_TIMELINE_FOLLOW_OFF = 'off';
-export const HYBRID_PREVIEW_DEFAULTS = Object.freeze({
-    tone: 'clean',
-    volume: 75,
-    timelineZoom: 120,
-    timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
-    laneHeights: Object.freeze({ primary: 158, secondary: 158, result: 158 }),
-    timelineFollowMode: HYBRID_TIMELINE_FOLLOW_CENTERED,
-});
 
 export function hybridDialogSizePure(raw) {
     let parsed = raw;
@@ -61,23 +56,6 @@ export function saveHybridDialogSize(size) {
     try { localStorage.setItem(DIALOG_SIZE_KEY, JSON.stringify(normalized)); } catch (_) { /* blocked storage */ }
     return normalized;
 }
-
-// These are Hybrid-builder audition presets, deliberately separate from the
-// Editor's general per-instrument guide voice.  The trims level-match the
-// active sample material in the vendored FluidR3 programs: programs 29 and 30
-// are naturally about 3.25 dB and 4.62 dB louder than program 27 respectively.
-// Keeping the correction with the preset means Lead / Rhythm / Hybrid all use
-// exactly the same gain staging when the user changes tone.
-export const HYBRID_PREVIEW_TONES = Object.freeze([
-    Object.freeze({ id: 'clean', label: 'Clean', gm: 27, trimGain: 1 }),
-    Object.freeze({ id: 'edge', label: 'Edge', gm: 29, trimGain: 10 ** (-3.25 / 20) }),
-    Object.freeze({ id: 'distortion', label: 'Distortion', gm: 30, trimGain: 10 ** (-4.62 / 20) }),
-]);
-
-export const HYBRID_GAP_FILL_CONTROL_CONFIG = Object.freeze({
-    beats: Object.freeze({ minimumMax: 16, minimumStep: 0.25, marginMax: 8, marginStep: 0.125 }),
-    seconds: Object.freeze({ minimumMax: 30, minimumStep: 0.05, marginMax: 10, marginStep: 0.025 }),
-});
 
 function valuesForUnit(unit, value) {
     const normalized = normalizeCompositeGapFillOptions({ unit, ...(value || {}) });
