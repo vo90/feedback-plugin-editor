@@ -35,11 +35,22 @@ Only these files, matching the route's whitelist (`_safe_wafont_name` in
 ## Currently vendored
 
 All from surikov/webaudiofont + webaudiofontdata (MIT), FluidR3_GM by Frank
-Wen (MIT) — fetched 2026-07-14 from `surikov.github.io`:
+Wen (MIT), fetched from `surikov.github.io` (the original defaults and kit on
+2026-07-14; the Hybrid Edge/Distortion additions on 2026-08-21):
 
 - `WebAudioFontPlayer.js` (~122 KB) — the WebAudioFont player.
 - `0000_FluidR3_GM_sf2_file.js` (~1.2 MB) — Grand piano, the keys default.
 - `0270_FluidR3_GM_sf2_file.js` (~250 KB) — Clean electric, the guitar default.
+- `0290_FluidR3_GM_sf2_file.js` (~830 KB) — Overdriven guitar, the Hybrid
+  preview's Edge tone. Source:
+  `https://surikov.github.io/webaudiofontdata/sound/0290_FluidR3_GM_sf2_file.js`;
+  SHA-256 of the vendored bytes:
+  `31e4313d80838b4430255e021061d5f5a236322db50245ce63585bb4f5da03a6`.
+- `0300_FluidR3_GM_sf2_file.js` (~763 KB) — Distortion guitar, the Hybrid
+  preview's Distortion tone. Source:
+  `https://surikov.github.io/webaudiofontdata/sound/0300_FluidR3_GM_sf2_file.js`;
+  SHA-256 of the vendored bytes:
+  `6cb34e1813daafde46e305b1751642c7b22faa614aa60e3cad13c92b15f67562`.
 - `0330_FluidR3_GM_sf2_file.js` (~440 KB) — Fingered, the bass default.
 
 - `128{36,37,38,41,42,44,45,46,47,49,50,51,52,53,55,56,57}_0_FluidR3_GM_sf2_file.js`
@@ -47,7 +58,8 @@ Wen (MIT) — fetched 2026-07-14 from `surikov.github.io`:
   chartable drum piece (kick, snares, hats, toms, cymbals, cowbell — the
   `DRUM_PIECE_GM_NOTE` table in `src/gm-guide.js`).
 
-These are the per-kind DEFAULT presets plus the drum kit (~2.9 MB total —
-the release-size call): a chart sounds out of the box with zero network.
-The non-default curated melodic choices still stream from the org/CDN rungs
+These are the per-kind DEFAULT presets, the three locally reliable Hybrid
+guitar tones, plus the drum kit (~4.5 MB total — the release-size call): a
+chart and every Hybrid audition tone sound out of the box with zero network.
+Other non-default curated melodic choices still stream from the org/CDN rungs
 on first use.
