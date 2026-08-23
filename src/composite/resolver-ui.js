@@ -175,6 +175,7 @@ const hybridPreviewPreferenceWriter = createHybridPreferenceWriter(
 let timelineViewportFrame = 0;
 let timelinePlayheadFrame = 0;
 let timelineZoomFrame = 0;
+let timelineZoomCommitTimer = 0;
 let timelinePendingZoom = null;
 let timelineStandbyCancel = null;
 let timelineStandbySwapFrame = 0;
@@ -2139,12 +2140,14 @@ function stopCompositeTimelineUi() {
     if (timelineViewportFrame) cancelAnimationFrame(timelineViewportFrame);
     if (timelinePlayheadFrame) cancelAnimationFrame(timelinePlayheadFrame);
     if (timelineZoomFrame) cancelAnimationFrame(timelineZoomFrame);
+    if (timelineZoomCommitTimer) clearTimeout(timelineZoomCommitTimer);
     if (timelineBindFrame) cancelAnimationFrame(timelineBindFrame);
     if (timelineReviewRefreshFrame) cancelAnimationFrame(timelineReviewRefreshFrame);
     for (const cleanup of timelineViewportDom?.cleanup || []) cleanup();
     timelineViewportFrame = 0;
     timelinePlayheadFrame = 0;
     timelineZoomFrame = 0;
+    timelineZoomCommitTimer = 0;
     timelineBindFrame = 0;
     timelineReviewRefreshFrame = 0;
     timelinePendingZoom = null;
@@ -2213,6 +2216,10 @@ function refreshCompositeTimelineViewport(force = false) {
         guardPx,
         force,
     });
+    // Continuous zoom owns a compositor-only preview until its quiet-period
+    // commit. ResizeObserver/scroll callbacks must not accidentally start an
+    // exact SVG rebuild on the input path.
+    if (dom.zoomPreviewPending && !force) return;
     if (!rebuildMarkup) return;
     content.style.width = `${width}px`;
     if (!force && dom.cameraSlots?.length > 1) {
@@ -2371,7 +2378,7 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
     const queueStep = () => {
         const now = globalThis.performance?.now?.() || Date.now();
         const timeout = freshnessDeadlineAt
-            ? Math.max(16, freshnessDeadlineAt - now) : 0;
+            ? Math.max(S.playing ? 100 : 16, freshnessDeadlineAt - now) : 0;
         cancelPendingIdle = scheduleCompositeTimelineIdle(deadline => {
             cancelPendingIdle = null;
             if (cancelled || generation !== timelineRenderGeneration
@@ -2485,15 +2492,26 @@ function applyCompositeTimelineCamera(dom = timelineViewportDom, rawVisualScroll
     const visualScroll = clampCompositeTimelineScroll(dom, rawVisualScroll);
     const cameraOffset = compositeTimelineCameraOffsetPure(
         dom.nativeScrollLeft, visualScroll);
-    const layerTransform = `translate3d(${cameraOffset}px,0,0)`;
-    if (dom.camera) dom.camera.style.transform = layerTransform;
+    const renderedZoom = Number(dom.renderedZoom);
+    const preferredZoom = Number(hybridPreviewPreferences.timelineZoom);
+    const zoomScale = renderedZoom > 0 && preferredZoom > 0
+        ? preferredZoom / renderedZoom : 1;
+    const scaleTransform = Math.abs(zoomScale - 1) >= 1e-4
+        ? ` scaleX(${zoomScale})` : '';
+    const layerTransform = `translate3d(${cameraOffset}px,0,0)${scaleTransform}`;
+    if (dom.camera) {
+        const songOriginX = compositeTimelineXForBeatPure(
+            dom.view.context.startBeat, dom.view.context, renderedZoom || preferredZoom);
+        dom.camera.style.transformOrigin = `${songOriginX - (dom.renderOriginX || 0)}px 0`;
+        dom.camera.style.transform = layerTransform;
+    }
     const playheadX = rawPlayheadX == null ? Number.NaN : Number(rawPlayheadX);
     if (Number.isFinite(playheadX)) dom.playheadX = playheadX;
     if (dom.playhead && dom.playheadX != null && Number.isFinite(Number(dom.playheadX))) {
         dom.playhead.style.transform = `translate3d(${Number(dom.playheadX) + cameraOffset}px,0,0)`;
     }
     dom.visualScrollLeft = visualScroll;
-    if (dom.cameraSlots?.[dom.activeCameraIndex]?.ready) {
+    if (!dom.zoomPreviewPending && dom.cameraSlots?.[dom.activeCameraIndex]?.ready) {
         scheduleCompositeTimelineRenderAhead(dom, visualScroll);
     }
     return visualScroll;
@@ -2552,6 +2570,37 @@ function seekCompositeTimelineAtTime(rawTime, {
     return time;
 }
 
+function commitCompositeTimelineZoom(dom, immediate = false) {
+    if (timelineZoomCommitTimer) clearTimeout(timelineZoomCommitTimer);
+    const delay = immediate ? 0 : 100;
+    timelineZoomCommitTimer = setTimeout(() => {
+        timelineZoomCommitTimer = 0;
+        if (timelineViewportDom !== dom || !dom?.view) return;
+        const finish = () => {
+            if (timelineViewportDom !== dom) return;
+            dom.zoomPreviewPending = false;
+            refreshCompositeTimelineZoomControls(dom);
+            applyCompositeTimelineCamera(dom, compositeTimelineVisualScrollLeft(dom));
+            updateCompositeTimelineMapViewport(dom, dom.view, dom.scroller,
+                compositeTimelineVisualScrollLeft(dom), dom.viewportWidth);
+        };
+        const finishReviewRefresh = dom.reviewRefreshOptions?.onCommitted;
+        const finishAll = () => {
+            finishReviewRefresh?.();
+            finish();
+        };
+        if ((dom.cameraSlots?.length || 0) > 1) {
+            scheduleCompositeTimelineStandby(dom, compositeTimelineVisualScrollLeft(dom), {
+                freshnessDeadlineAt: (globalThis.performance?.now?.() || Date.now()) + 240,
+                onCommitted: finishAll,
+            });
+        } else {
+            refreshCompositeTimelineViewport(true);
+            finishAll();
+        }
+    }, delay);
+}
+
 function applyCompositeTimelineZoom(nextZoom, anchorX = null, forceStart = false,
     flushPreference = false) {
     const view = currentTimelineView();
@@ -2593,13 +2642,26 @@ function applyCompositeTimelineZoom(nextZoom, anchorX = null, forceStart = false
     if (dom) {
         dom.contentWidth = nextContentWidth;
         dom.maxScroll = Math.max(0, nextContentWidth - dom.viewportWidth);
+        dom.zoomPreviewPending = true;
+        cancelCompositeTimelineStandbyWork(dom);
     }
-    if (dom) setCompositeTimelineNativeCamera(dom, Math.max(0, next.scrollLeft), false);
+    const previewBeat = followsLivePlayback
+        ? beatOf(hybridSession.plan.beats, editorPlaybackVisualTime())
+        : compositeTimelineDisplayBeatAtTime(view, hybridSession.timelineSeekTime);
+    if (dom) {
+        dom.playheadX = compositeTimelineXForBeatPure(
+            previewBeat, view.context, next.zoom);
+        setCompositeTimelineNativeCamera(dom, Math.max(0, next.scrollLeft), false);
+        refreshCompositeTimelineZoomControls(dom);
+        updateCompositeTimelineMapViewport(dom, view, scroller,
+            compositeTimelineVisualScrollLeft(dom), dom.viewportWidth);
+        commitCompositeTimelineZoom(dom, flushPreference);
+    }
     else {
         timelineProgrammaticScrollTarget = Math.max(0, next.scrollLeft);
         scroller.scrollLeft = Math.max(0, next.scrollLeft);
+        refreshCompositeTimelineViewport(true);
     }
-    refreshCompositeTimelineViewport(true);
 }
 
 function pendingCompositeTimelineZoom() {
@@ -2607,7 +2669,8 @@ function pendingCompositeTimelineZoom() {
 }
 
 // Slider and wheel input can fire much faster than the display. Keep the most
-// recent request and rebuild the three aligned lanes at most once per frame.
+// recent request, preview it with compositor geometry once per display frame,
+// and render exact note/ruler SVG only after the gesture goes quiet.
 function scheduleCompositeTimelineZoom(zoom, anchorX = null, forceStart = false,
     flushPreference = false) {
     timelinePendingZoom = { zoom, anchorX, forceStart, flushPreference };
@@ -2723,7 +2786,6 @@ function centerCurrentReviewInTimeline(view, scroller) {
         timelineViewportDom, nextScroll, false);
     else hybridSession.timelineScrollLeft = nextScroll;
     hybridSession.timelineFocusReview = false;
-    refreshCompositeTimelineViewport();
 }
 
 function refreshCompositeTimelineFollowButton() {

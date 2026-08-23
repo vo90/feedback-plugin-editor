@@ -165,7 +165,8 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
     assert.doesNotMatch(activePlaybackBody, /\.scrollLeft\s*=/,
         'the animation frame never writes native scroll state');
     assert.match(resolver, /data-composite-timeline-camera/);
-    assert.match(resolver, /if \(dom\.camera\) dom\.camera\.style\.transform = layerTransform/,
+    assert.match(resolver,
+        /if \(dom\.camera\) \{[\s\S]*dom\.camera\.style\.transform = layerTransform/,
         'the ruler and all lanes share one moving compositor layer');
     assert.doesNotMatch(resolver, /rulerSvg\.style\.transform|lane\.svg\.style\.transform/,
         'large SVG surfaces are not animated independently');
@@ -397,6 +398,25 @@ test('continuous Hybrid preview preferences update live and persist off the inpu
     assert.match(resolver.slice(zoomStart, zoomEnd),
         /setHybridPreviewPreferences\([\s\S]*deferred:\s*true[\s\S]*flushPreference[\s\S]*flushHybridPreviewPreferences\(\)/,
         'zoom changes update layout live and discrete/change events flush after the coalesced frame');
+    const zoomBody = resolver.slice(zoomStart, zoomEnd);
+    const applyStart = zoomBody.indexOf('function applyCompositeTimelineZoom');
+    const scheduleStart = zoomBody.indexOf('function scheduleCompositeTimelineZoom');
+    const applyBody = zoomBody.slice(applyStart, scheduleStart);
+    const liveDomStart = applyBody.lastIndexOf('if (dom) {');
+    const liveDomEnd = applyBody.indexOf('\n    else', liveDomStart);
+    assert.doesNotMatch(applyBody.slice(liveDomStart, liveDomEnd),
+        /refreshCompositeTimelineViewport\(true\)/,
+        'continuous zoom does not synchronously rebuild ruler or lane SVG');
+    assert.match(resolver, /const scaleTransform[\s\S]*scaleX\(\$\{zoomScale\}\)/,
+        'visual zoom uses the existing camera instead of regenerating note markup');
+    assert.match(resolver,
+        /const delay = immediate \? 0 : 100[\s\S]*scheduleCompositeTimelineStandby/,
+        'the existing camera previews every frame and one exact standby render follows quiet input');
+    const centerStart = resolver.indexOf('function centerCurrentReviewInTimeline');
+    const centerEnd = resolver.indexOf('\nfunction refreshCompositeTimelineFollowButton', centerStart);
+    assert.doesNotMatch(resolver.slice(centerStart, centerEnd),
+        /refreshCompositeTimelineViewport/,
+        'initial review centering is camera-only; its bind frame performs the sole exact render');
     const closeStart = resolver.indexOf('function closeCompositeModalImmediately');
     const closeEnd = resolver.indexOf('export async function editorHideCompositeArrangementModal', closeStart);
     assert.match(resolver.slice(closeStart, closeEnd),
