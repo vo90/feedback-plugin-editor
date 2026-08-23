@@ -9,7 +9,7 @@ const PREVIEW_KEY = 'editorCompositePreview';
 const EXPERIMENTAL_KEY = 'editorCompositeExperimental';
 const DIALOG_SIZE_KEY = 'editorCompositeDialogSize';
 const TIMELINE_PREF_VERSION_KEY = 'editorCompositeTimelineVersion';
-const TIMELINE_PREF_VERSION = 2;
+const TIMELINE_PREF_VERSION = 3;
 // Increment whenever the opt-in engine changes its musical decision rules.
 // A prior opt-in must never silently authorize materially different choices.
 export const HYBRID_EXPERIMENTAL_PREF_VERSION = 2;
@@ -28,10 +28,13 @@ export const HYBRID_TIMELINE_ZOOM_CONTROL_MIN = 5;
 export const HYBRID_TIMELINE_ZOOM_STEP = 5;
 export const HYBRID_TIMELINE_LANE_MIN = 128;
 export const HYBRID_TIMELINE_LANE_MAX = 320;
+export const HYBRID_TIMELINE_DISPLAY_NOTES = 'notes';
+export const HYBRID_TIMELINE_DISPLAY_OVERVIEW = 'overview';
 export const HYBRID_PREVIEW_DEFAULTS = Object.freeze({
     tone: 'clean',
     volume: 75,
     timelineZoom: 120,
+    timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
     laneHeights: Object.freeze({ primary: 158, secondary: 158, result: 158 }),
     followPlayhead: true,
 });
@@ -187,9 +190,12 @@ export function hybridPreviewPreferencesPure(raw) {
         : HYBRID_PREVIEW_DEFAULTS.volume;
     const rawZoom = Number(parsed.timelineZoom);
     const timelineZoom = Number.isFinite(rawZoom)
-        ? Math.max(HYBRID_TIMELINE_ZOOM_MIN,
+        ? Math.max(HYBRID_TIMELINE_ZOOM_CONTROL_MIN,
             Math.min(HYBRID_TIMELINE_ZOOM_MAX, Math.round(rawZoom)))
         : HYBRID_PREVIEW_DEFAULTS.timelineZoom;
+    const timelineDisplayMode = parsed.timelineDisplayMode
+            === HYBRID_TIMELINE_DISPLAY_OVERVIEW
+        ? HYBRID_TIMELINE_DISPLAY_OVERVIEW : HYBRID_TIMELINE_DISPLAY_NOTES;
     const rawHeights = parsed.laneHeights && typeof parsed.laneHeights === 'object'
         ? parsed.laneHeights : {};
     const laneHeights = {};
@@ -202,7 +208,14 @@ export function hybridPreviewPreferencesPure(raw) {
     }
     const followPlayhead = parsed.followPlayhead === undefined
         ? HYBRID_PREVIEW_DEFAULTS.followPlayhead : parsed.followPlayhead !== false;
-    return { tone, volume, timelineZoom, laneHeights, followPlayhead };
+    return {
+        tone,
+        volume,
+        timelineZoom,
+        timelineDisplayMode,
+        laneHeights,
+        followPlayhead,
+    };
 }
 
 export function loadHybridPreviewPreferences() {
@@ -273,8 +286,21 @@ export function hybridPreviewPreferencesMigrationPure(raw, version = 0) {
         try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
     }
     if (!parsed || typeof parsed !== 'object') parsed = {};
+    if (Number(version) >= 2) {
+        const previousZoom = Number(parsed.timelineZoom);
+        const legacyOverview = Number.isFinite(previousZoom)
+            && previousZoom < HYBRID_TIMELINE_ZOOM_CONTROL_MIN;
+        return hybridPreviewPreferencesPure({
+            ...parsed,
+            timelineZoom: legacyOverview
+                ? HYBRID_PREVIEW_DEFAULTS.timelineZoom : parsed.timelineZoom,
+            timelineDisplayMode: legacyOverview
+                ? HYBRID_TIMELINE_DISPLAY_OVERVIEW : HYBRID_TIMELINE_DISPLAY_NOTES,
+        });
+    }
     return hybridPreviewPreferencesPure({
         ...parsed,
         timelineZoom: HYBRID_PREVIEW_DEFAULTS.timelineZoom,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
     });
 }

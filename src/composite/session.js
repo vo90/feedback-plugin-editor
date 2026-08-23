@@ -30,6 +30,7 @@ export function createHybridBuilderSession() {
         wholeSongLoop: false,
         timelineSeekTime: 0,
         timelineScrollLeft: 0,
+        timelineNotesScrollLeft: 0,
         timelineFocusReview: false,
         timelineFocusPassage: false,
         inspectedPassageId: '',
@@ -203,6 +204,7 @@ export function resetHybridBuilderReview(session) {
     session.wholeSongLoop = false;
     session.timelineSeekTime = 0;
     session.timelineScrollLeft = 0;
+    session.timelineNotesScrollLeft = 0;
     session.timelineFocusReview = false;
     session.timelineFocusPassage = false;
     session.inspectedPassageId = '';

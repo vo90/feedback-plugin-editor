@@ -24,6 +24,8 @@ import {
 } from '../src/composite/resolver-ui.js';
 import {
     HYBRID_PREVIEW_TONES,
+    HYBRID_TIMELINE_DISPLAY_NOTES,
+    HYBRID_TIMELINE_DISPLAY_OVERVIEW,
     HYBRID_TIMELINE_ZOOM_MAX,
     hybridDialogSizePure,
     hybridPreviewPreferencesMigrationPure,
@@ -160,6 +162,7 @@ test('experimental Automatic is versioned, opt-in, and Balanced by default', () 
 test('Hybrid audition preferences remember a safe shared tone and volume', () => {
     const defaults = {
         tone: 'clean', volume: 75, timelineZoom: 120,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
         laneHeights: { primary: 158, secondary: 158, result: 158 },
         followPlayhead: true,
     };
@@ -174,6 +177,17 @@ test('Hybrid audition preferences remember a safe shared tone and volume', () =>
     assert.deepEqual(_compositePreviewPreferencesPure({ tone: 'distortion', volume: null }), {
         ...defaults, tone: 'distortion', volume: 75,
     });
+    assert.deepEqual(_compositePreviewPreferencesPure({
+        timelineZoom: 1,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+    }), {
+        ...defaults,
+        timelineZoom: 5,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+    }, 'the computed Overview fit never leaks below the persisted note-zoom floor');
+    assert.deepEqual(_compositePreviewPreferencesPure({
+        timelineDisplayMode: 'unknown',
+    }), defaults, 'unknown display modes fall back to Notes');
     assert.deepEqual(_compositePreviewPreferencesPure({
         timelineZoom: 999,
         laneHeights: { primary: 1, secondary: 200, result: 999 },
@@ -194,11 +208,34 @@ test('Hybrid timeline zoom defaults migrate once without losing other audition s
         followPlayhead: false,
     }, 1), {
         tone: 'edge', volume: 81, timelineZoom: 120,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
         laneHeights: { primary: 180, secondary: 190, result: 200 },
         followPlayhead: false,
     });
-    assert.equal(hybridPreviewPreferencesMigrationPure({ timelineZoom: 240 }, 2)
-        .timelineZoom, 240, 'current-version choices stay remembered');
+    assert.deepEqual(hybridPreviewPreferencesMigrationPure({ timelineZoom: 240 }, 2), {
+        tone: 'clean', volume: 75, timelineZoom: 240,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
+        laneHeights: { primary: 158, secondary: 158, result: 158 },
+        followPlayhead: true,
+    }, 'version-two note zoom choices stay remembered');
+    assert.deepEqual(hybridPreviewPreferencesMigrationPure({ timelineZoom: 4 }, 2), {
+        tone: 'clean', volume: 75, timelineZoom: 120,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+        laneHeights: { primary: 158, secondary: 158, result: 158 },
+        followPlayhead: true,
+    }, 'a pre-mode fit zoom becomes an explicit Overview without replacing note zoom');
+    assert.equal(hybridPreviewPreferencesMigrationPure({ timelineZoom: 5 }, 2)
+        .timelineDisplayMode, HYBRID_TIMELINE_DISPLAY_NOTES,
+    'the old manual zoom floor remains a Notes view');
+    assert.deepEqual(hybridPreviewPreferencesMigrationPure({
+        timelineZoom: 180,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+    }, 3), {
+        tone: 'clean', volume: 75, timelineZoom: 180,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+        laneHeights: { primary: 158, secondary: 158, result: 158 },
+        followPlayhead: true,
+    }, 'current explicit mode and note zoom both remain persisted');
 });
 
 test('the guided review CTA becomes a full-song preview action after the final choice', () => {
