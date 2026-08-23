@@ -8,6 +8,29 @@ import {
     compositeGuideGroupsInWindowPure,
     compositeGuideScheduleWindowPure,
 } from '../src/composite/audition-guide-scheduler.js';
+import { FakeAudioContext } from './composite_audition_fakes.mjs';
+
+function timeoutHarness() {
+    let nextId = 1;
+    const jobs = [];
+    return {
+        jobs,
+        cleared: [],
+        set(callback, delay) {
+            const job = { id: nextId++, callback, delay, fired: false };
+            jobs.push(job);
+            return job.id;
+        },
+        clear(id) {
+            this.cleared.push(id);
+        },
+        fire(job) {
+            if (job.fired) return;
+            job.fired = true;
+            job.callback();
+        },
+    };
+}
 
 test('guide event windows include the exact cursor and scale a chord at constant power', () => {
     const events = compositeGuideEventsPure([
@@ -94,5 +117,194 @@ test('a late guide tick recovers only the bounded recent window', () => {
     assert.equal(scheduled[0].when, 1, 'a recovered late voice starts immediately');
     const window = compositeGuideScheduleWindowPure(1, 0.3);
     assert.deepEqual(window, { from: 0.96, to: 1.3 });
+    scheduler.destroy();
+});
+
+test('dense guide stop retires 1000 voices in O(1) and cleans only its old pass', () => {
+    const context = new FakeAudioContext();
+    const timeouts = timeoutHarness();
+    const voices = [];
+    const events = [];
+    for (let bucket = 0; bucket < 250; bucket++) {
+        for (let pitch = 0; pitch < 4; pitch++) {
+            events.push({ t: bucket / 1000, midi: 60 + pitch, sus: 1 });
+        }
+    }
+    const scheduler = new CompositeGuideScheduler({
+        context,
+        target: context.destination,
+        nowChart: () => 0,
+        chartToContext: chartTime => chartTime,
+        setIntervalFn: () => 91,
+        clearIntervalFn: () => {},
+        setTimeoutFn: (callback, delay) => timeouts.set(callback, delay),
+        clearTimeoutFn: id => timeouts.clear(id),
+        voice: options => {
+            const item = {
+                generation: options.generation,
+                target: options.target,
+                until: options.when + 1,
+                cancelled: 0,
+                cancel() { this.cancelled++; },
+            };
+            voices.push(item);
+            return item;
+        },
+    });
+    scheduler.configure({ events, voiceCap: 6 });
+    scheduler.start(0, { endTime: 1 });
+    assert.equal(voices.length, 1000);
+    const firstPassTarget = voices[0].target;
+    assert.ok(voices.every(voice => voice.target === firstPassTarget));
+
+    scheduler.configure({ events: [{ t: 0, midi: 72, sus: 1 }] });
+    assert.equal(voices.reduce((sum, voice) => sum + voice.cancelled, 0), 0,
+        'a mode switch does not walk or cancel any individual voice synchronously');
+    assert.equal(timeouts.jobs.length, 1);
+    assert.equal(timeouts.jobs[0].delay, 8);
+    assert.equal(firstPassTarget.gain.events.at(-1).type, 'ramp');
+    assert.equal(firstPassTarget.gain.events.at(-1).value, 0);
+    assert.equal(firstPassTarget.gain.events.at(-1).time, 0.004);
+
+    scheduler.start(0, { endTime: 1 });
+    const nextVoice = voices.at(-1);
+    const nextPassTarget = nextVoice.target;
+    assert.notStrictEqual(nextPassTarget, firstPassTarget,
+        'every playback generation gets a separate pass gain');
+    timeouts.fire(timeouts.jobs[0]);
+    assert.equal(voices.slice(0, 1000).every(voice => voice.cancelled === 1), true);
+    assert.equal(nextVoice.cancelled, 0,
+        'an old deferred cleanup cannot cancel the new generation');
+    assert.equal(firstPassTarget.disconnected, true);
+    assert.equal(nextPassTarget.disconnected, false);
+
+    scheduler.stop();
+    assert.equal(nextVoice.cancelled, 0,
+        'explicit Stop also leaves envelope cancellation to deferred cleanup');
+    assert.equal(timeouts.jobs.length, 2);
+    scheduler.start(0, { endTime: 1 });
+    const thirdVoice = voices.at(-1);
+    timeouts.fire(timeouts.jobs[1]);
+    assert.equal(nextVoice.cancelled, 1);
+    assert.equal(thirdVoice.cancelled, 0,
+        'a Stop cleanup is likewise isolated from the restarted pass');
+    scheduler.destroy();
+});
+
+test('guide destroy flushes every deferred pass cleanup and disarms its timers', () => {
+    const context = new FakeAudioContext();
+    const timeouts = timeoutHarness();
+    const voices = [];
+    const scheduler = new CompositeGuideScheduler({
+        context,
+        setIntervalFn: () => 92,
+        clearIntervalFn: () => {},
+        setTimeoutFn: (callback, delay) => timeouts.set(callback, delay),
+        clearTimeoutFn: id => timeouts.clear(id),
+        nowChart: () => 0,
+        chartToContext: chartTime => chartTime,
+        voice: options => {
+            const item = {
+                target: options.target,
+                until: 1,
+                cancelled: 0,
+                cancel() { this.cancelled++; },
+            };
+            voices.push(item);
+            return item;
+        },
+    });
+    scheduler.configure({ events: [{ t: 0, midi: 60, sus: 1 }] });
+    scheduler.start(0, { endTime: 1 });
+    scheduler.stop();
+    scheduler.configure({ events: [{ t: 0, midi: 62, sus: 1 }] });
+    scheduler.start(0, { endTime: 1 });
+    assert.equal(timeouts.jobs.length, 1);
+
+    scheduler.destroy();
+    assert.equal(timeouts.jobs.length, 2,
+        'destroy first retires the currently audible pass');
+    assert.deepEqual(timeouts.cleared.sort((a, b) => a - b), [1, 2]);
+    assert.deepEqual(voices.map(voice => voice.cancelled), [1, 1]);
+    assert.equal(context.gains.every(node => node.disconnected), true);
+    for (const job of timeouts.jobs) timeouts.fire(job);
+    assert.deepEqual(voices.map(voice => voice.cancelled), [1, 1],
+        'a cleared callback is also idempotent if a host invokes it late');
+});
+
+test('guide destroy drops dense passes in O(1) when its owning context will close', () => {
+    const context = new FakeAudioContext();
+    const timeouts = timeoutHarness();
+    const voices = [];
+    const events = [];
+    for (let bucket = 0; bucket < 250; bucket++) {
+        for (let pitch = 0; pitch < 4; pitch++) {
+            events.push({ t: bucket / 1000, midi: 60 + pitch, sus: 1 });
+        }
+    }
+    const scheduler = new CompositeGuideScheduler({
+        context,
+        setIntervalFn: () => 94,
+        clearIntervalFn: () => {},
+        setTimeoutFn: (callback, delay) => timeouts.set(callback, delay),
+        clearTimeoutFn: id => timeouts.clear(id),
+        nowChart: () => 0,
+        chartToContext: chartTime => chartTime,
+        voice: options => {
+            const item = {
+                target: options.target,
+                until: 1,
+                cancelled: 0,
+                cancel() { this.cancelled++; },
+            };
+            voices.push(item);
+            return item;
+        },
+    });
+    scheduler.configure({ events, voiceCap: 6 });
+    scheduler.start(0, { endTime: 1 });
+    assert.equal(voices.length, 1000);
+    const retiredPassGain = voices[0].target;
+    scheduler.stop();
+    assert.equal(timeouts.jobs.length, 1);
+    scheduler.start(0, { endTime: 1 });
+    assert.equal(voices.length, 2000);
+    const activePassGain = voices.at(-1).target;
+
+    scheduler.destroy({ contextWillClose: true });
+    assert.equal(voices.every(voice => voice.cancelled === 0), true,
+        'context shutdown does not synchronously walk active or retired envelopes');
+    assert.equal(retiredPassGain.disconnected, true);
+    assert.equal(activePassGain.disconnected, true,
+        'each entire dense pass is made inaudible with one disconnection');
+    assert.equal(timeouts.cleared.length, 1);
+    assert.equal(scheduler.retiredCleanups.size, 0);
+    assert.equal(scheduler.voices.length, 0);
+    timeouts.fire(timeouts.jobs[0]);
+    assert.equal(voices.every(voice => voice.cancelled === 0), true,
+        'the discarded timer cannot later traverse released voices');
+});
+
+test('guide stop cancels synchronously when deferred cleanup is unavailable', () => {
+    const context = new FakeAudioContext();
+    let cancelled = 0;
+    const scheduler = new CompositeGuideScheduler({
+        context,
+        setIntervalFn: () => 93,
+        clearIntervalFn: () => {},
+        setTimeoutFn: null,
+        nowChart: () => 0,
+        chartToContext: chartTime => chartTime,
+        voice: options => ({
+            target: options.target,
+            until: 1,
+            cancel() { cancelled++; },
+        }),
+    });
+    scheduler.configure({ events: [{ t: 0, midi: 60, sus: 1 }] });
+    scheduler.start(0, { endTime: 1 });
+    scheduler.stop();
+    assert.equal(cancelled, 1);
+    assert.equal(context.gains[0].disconnected, true);
     scheduler.destroy();
 });

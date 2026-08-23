@@ -28,6 +28,60 @@ const COMPOSITE_PREVIEW_ANALYSIS_WINDOW_SECONDS = 0.05;
 const COMPOSITE_PREVIEW_MAX_ANALYSIS_SAMPLES = 250000;
 const COMPOSITE_PREVIEW_MAX_SUMMARY_BINS = 4000;
 
+// Waveform summaries are immutable snapshots in the Editor. Reading every
+// min/max bin once gives us an exact safety peak even when the RMS query below
+// uses a bounded stride. Cache the result by snapshot identity so subsequent
+// Play/seek gestures do not repeat that linear scan.
+const compositeRecordingSummaryPeakCache = new WeakMap();
+
+export function compositeRecordingSummaryPeakPure(peaks) {
+    if (!peaks || (typeof peaks !== 'object' && typeof peaks !== 'function')) return 0;
+    const minimumBins = peaks.min;
+    const maximumBins = peaks.max;
+    const minimumLength = Math.max(0, Math.trunc(finite(minimumBins?.length)));
+    const maximumLength = Math.max(0, Math.trunc(finite(maximumBins?.length)));
+    const declaredBins = Math.max(0, Math.trunc(finite(peaks.bins)));
+    const binCount = declaredBins || Math.max(minimumLength, maximumLength);
+    const declaredPeak = Number(peaks.peak);
+    const hasDeclaredPeak = Number.isFinite(declaredPeak) && declaredPeak >= 0;
+    const cached = compositeRecordingSummaryPeakCache.get(peaks);
+    if (cached && cached.minimumBins === minimumBins
+            && cached.maximumBins === maximumBins
+            && cached.minimumLength === minimumLength
+            && cached.maximumLength === maximumLength
+            && cached.binCount === binCount
+            && cached.declaredPeak === (hasDeclaredPeak ? declaredPeak : null)) {
+        return cached.peak;
+    }
+
+    let peak = hasDeclaredPeak ? declaredPeak : 0;
+    const minimumCount = Math.min(binCount, minimumLength);
+    const maximumCount = Math.min(binCount, maximumLength);
+    for (let bin = 0; bin < minimumCount; bin++) {
+        peak = Math.max(peak, Math.abs(finite(minimumBins[bin])));
+    }
+    for (let bin = 0; bin < maximumCount; bin++) {
+        peak = Math.max(peak, Math.abs(finite(maximumBins[bin])));
+    }
+    compositeRecordingSummaryPeakCache.set(peaks, {
+        minimumBins,
+        maximumBins,
+        minimumLength,
+        maximumLength,
+        binCount,
+        declaredPeak: hasDeclaredPeak ? declaredPeak : null,
+        peak,
+    });
+    return peak;
+}
+
+// Resolver/UI code may call this while a review view is settling so the exact
+// safety scan never lands on a later Play/Space input. It intentionally returns
+// the value too, which keeps prewarming optional and straightforward to test.
+export function prewarmCompositeRecordingSummaryPeak(peaks) {
+    return compositeRecordingSummaryPeakPure(peaks);
+}
+
 function recordingLevelFromMeasurements(rms, peak, activeSamples, options = {}) {
     if (!activeSamples || !(rms > 0)) {
         return { gain: 1, rms: 0, peak: Math.max(0, finite(peak)), silent: true };
@@ -143,8 +197,6 @@ export function compositeRecordingPreviewLevelFromPeaksPure(
     peaks, durationSeconds, startTime, endTime, options = {},
 ) {
     const rmsBins = peaks?.rms;
-    const minimumBins = peaks?.min;
-    const maximumBins = peaks?.max;
     const declaredBins = Math.max(0, Math.trunc(finite(peaks?.bins)));
     const binCount = Math.min(declaredBins || Number(rmsBins?.length) || 0,
         Number(rmsBins?.length) || 0);
@@ -170,12 +222,10 @@ export function compositeRecordingPreviewLevelFromPeaksPure(
         Math.round(COMPOSITE_PREVIEW_ANALYSIS_WINDOW_SECONDS / binSeconds));
     let activeSquares = 0;
     let activeSamples = 0;
-    // New waveform summaries carry the whole recording's exact channel peak,
-    // computed for free while their bins are built. It is conservative for a
-    // short review section and lets this input-critical query sample only RMS.
-    const summaryPeak = Number(peaks?.peak);
-    const hasSummaryPeak = Number.isFinite(summaryPeak) && summaryPeak >= 0;
-    let peak = hasSummaryPeak ? summaryPeak : 0;
+    // Peak limiting must be exact even though RMS work remains bounded. A
+    // narrow transient can live between two sampled RMS bins; the cached
+    // summary scan prevents that transient from being amplified past ceiling.
+    const peak = compositeRecordingSummaryPeakPure(peaks);
     for (let windowStart = from; windowStart < to; windowStart += windowBins) {
         const windowEnd = Math.min(to, windowStart + windowBins);
         let squares = 0;
@@ -184,11 +234,6 @@ export function compositeRecordingPreviewLevelFromPeaksPure(
             const value = Math.max(0, finite(rmsBins[bin]));
             squares += value * value;
             samples++;
-            if (!hasSummaryPeak) {
-                const low = Math.abs(finite(minimumBins?.[bin]));
-                const high = Math.abs(finite(maximumBins?.[bin]));
-                peak = Math.max(peak, low, high);
-            }
         }
         if (!samples) continue;
         const windowRms = Math.sqrt(squares / samples);

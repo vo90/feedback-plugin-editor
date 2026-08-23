@@ -37,6 +37,7 @@ class FakeGuideScheduler {
         this.starts = [];
         this.stops = 0;
         this.destroyed = false;
+        this.destroyOptions = null;
     }
 
     configure(options) {
@@ -51,8 +52,9 @@ class FakeGuideScheduler {
         this.stops++;
     }
 
-    destroy() {
+    destroy(options) {
         this.destroyed = true;
+        this.destroyOptions = options;
     }
 }
 
@@ -219,7 +221,7 @@ test('controller loops and reaches EOF through its own frame clock', async () =>
     assert.equal(controller.currentTime(), 5, 'EOF leaves the marker at the song end');
 });
 
-test('mode generation prevents a stale tone preparation from starting playback', async () => {
+test('mode generation replaces stale loading audio with the newly selected mode', async () => {
     let release;
     const deferred = new Promise(resolve => { release = resolve; });
     const soundfont = new FakeSoundfont();
@@ -235,9 +237,46 @@ test('mode generation prevents a stale tone preparation from starting playback',
     await fixture.controller.setMode('song');
     release();
     assert.equal(await starting, false);
-    assert.equal(fixture.controller.isPlaying(), false);
+    assert.equal(fixture.controller.isPlaying(), true);
     assert.equal(fixture.controller.state().mode, 'song');
     assert.equal(fixture.guide().starts.length, 0);
+    assert.equal(fixture.reference().schedules.length, 1);
+});
+
+test('tone and seek changes during loading restart the pending guide at the latest cursor', async () => {
+    const releases = [];
+    const soundfont = new FakeSoundfont();
+    soundfont.prepare = function prepare(context, program) {
+        this.prepared.push({ context, program });
+        return new Promise(resolve => releases.push(resolve));
+    };
+    const fixture = controllerFixture({ soundfontLoader: soundfont });
+    const starting = fixture.controller.start();
+    await flush();
+    const changingTone = fixture.controller.setTone('distortion');
+    await flush();
+    const seeking = fixture.controller.seek(3);
+    await flush();
+    assert.deepEqual(soundfont.prepared.map(item => item.program), [27, 30, 30]);
+
+    releases[0]({});
+    releases[1]({});
+    assert.equal(await starting, false);
+    assert.equal(await changingTone, false);
+    releases[2]({});
+    assert.equal(await seeking, true);
+    assert.equal(fixture.controller.isPlaying(), true);
+    assert.equal(fixture.controller.currentTime(), 3);
+    assert.equal(fixture.guide().configurations.at(-1).program, 30);
+    assert.equal(fixture.guide().starts.at(-1).time, 3);
+});
+
+test('selecting a new mode clears a previous preview failure before configuration emits', async () => {
+    const fixture = controllerFixture();
+    fixture.controller.lastError = new Error('old decode failed');
+    assert.equal(await fixture.controller.setMode('song'), true);
+    assert.equal(fixture.controller.state().error, null);
+    assert.equal(fixture.states.at(-1).error, null);
 });
 
 test('destroy cancels feature-owned engines and closes only its private context', async () => {
@@ -249,6 +288,7 @@ test('destroy cancels feature-owned engines and closes only its private context'
     assert.equal(fixture.context.closed, true);
     assert.equal(fixture.soundfont.destroyed, true);
     assert.equal(guide.destroyed, true);
+    assert.deepEqual(guide.destroyOptions, { contextWillClose: true });
     assert.equal(reference.destroyed, true);
     assert.equal(fixture.controller.isPlaying(), false);
     assert.equal(await fixture.controller.start(), false);

@@ -12,6 +12,8 @@ import {
     compositePreviewVolumeGainPure,
     compositeRecordingPreviewLevelPure,
     compositeRecordingPreviewLevelFromPeaksPure,
+    compositeRecordingSummaryPeakPure,
+    prewarmCompositeRecordingSummaryPeak,
 } from '../src/composite/preview.js';
 import {
     COMPOSITE_BEAT_EPS,
@@ -283,23 +285,86 @@ test('waveform summary level matching preserves the PCM gate and gain result', (
     assert.ok(Math.abs(silent.peak - 0.001) < 1e-8);
 });
 
-test('waveform summary level matching bounds work for very long recordings', () => {
-    const bins = 1_000_000;
+test('waveform summary peak limiting catches a narrow transient between sampled RMS bins', () => {
+    const bins = 5000;
+    const rms = new Float32Array(bins).fill(0.02);
+    const minimum = new Float32Array(bins);
+    const maximum = new Float32Array(bins);
+    maximum[4998] = 0.9; // maximumSamples=1000 samples 0, 5, 10... and misses this bin.
+    const level = compositeRecordingPreviewLevelFromPeaksPure({
+        bins, rms, min: minimum, max: maximum,
+    }, 5, 0, 5, {
+        maximumSamples: 1000,
+        targetRms: 0.5,
+        peakCeiling: 0.25,
+        minimumGain: 0,
+        maximumGain: 10,
+    });
+    assert.ok(Math.abs(level.rms - 0.02) < 1e-6,
+        'RMS remains the bounded-stride estimate');
+    assert.ok(Math.abs(level.peak - 0.9) < 1e-6,
+        'the exact min/max scan sees the unsampled transient');
+    assert.ok(Math.abs(level.gain - 0.25 / 0.9) < 1e-6,
+        'the missed transient still enforces the requested peak ceiling');
+});
+
+test('waveform summary exact peak prewarm caches by snapshot and invalidates replacements', () => {
     let reads = 0;
-    const values = new Proxy({ length: bins }, {
+    const observed = values => new Proxy(values, {
+        get(target, property) {
+            if (String(Number(property)) === property) reads++;
+            return target[property];
+        },
+    });
+    const peaks = {
+        bins: 4,
+        min: observed({ length: 4, 0: -0.1, 1: -0.2, 2: 0, 3: -0.3 }),
+        max: observed({ length: 4, 0: 0.1, 1: 0.4, 2: 0.2, 3: 0.1 }),
+    };
+    assert.equal(prewarmCompositeRecordingSummaryPeak(peaks), 0.4);
+    const firstReads = reads;
+    assert.equal(firstReads, 8, 'prewarm reads every min/max bin exactly once');
+    assert.equal(compositeRecordingSummaryPeakPure(peaks), 0.4);
+    assert.equal(reads, firstReads, 'the same immutable summary reuses its WeakMap entry');
+
+    peaks.max = observed({ length: 4, 0: 0.1, 1: 0.4, 2: 0.8, 3: 0.1 });
+    assert.equal(compositeRecordingSummaryPeakPure(peaks), 0.8);
+    assert.equal(reads, firstReads + 8,
+        'replacing either extrema array invalidates and refreshes the exact peak');
+});
+
+test('waveform summary keeps long-recording RMS work bounded and exact peak work cached', () => {
+    const bins = 1_000_000;
+    let rmsReads = 0;
+    let extremaReads = 0;
+    const observed = counter => new Proxy({ length: bins }, {
         get(target, property) {
             if (property === 'length') return target.length;
             if (String(Number(property)) === property) {
-                reads++;
+                counter();
                 return 0.2;
             }
             return target[property];
         },
     });
-    const level = compositeRecordingPreviewLevelFromPeaksPure({
-        bins, rms: values, min: values, max: values,
-    }, 3600, 0, 3600, { maximumSamples: 1000 });
+    const peaks = {
+        bins,
+        rms: observed(() => rmsReads++),
+        min: observed(() => extremaReads++),
+        max: observed(() => extremaReads++),
+    };
+    const level = compositeRecordingPreviewLevelFromPeaksPure(
+        peaks, 3600, 0, 3600, { maximumSamples: 1000 });
     assert.equal(level.silent, false);
-    assert.ok(reads <= 3100,
-        `RMS/min/max summaries should read about three values per sampled bin, read ${reads}`);
+    assert.ok(rmsReads <= 1100,
+        `RMS should read only about one value per sampled bin, read ${rmsReads}`);
+    assert.equal(extremaReads, bins * 2,
+        'peak safety scans every min/max bin once');
+    const extremaAfterFirstQuery = extremaReads;
+    compositeRecordingPreviewLevelFromPeaksPure(
+        peaks, 3600, 1200, 2400, { maximumSamples: 1000 });
+    assert.equal(extremaReads, extremaAfterFirstQuery,
+        'later region queries reuse the exact snapshot peak');
+    assert.ok(rmsReads <= 2200,
+        `two RMS queries should remain bounded, read ${rmsReads}`);
 });

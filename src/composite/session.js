@@ -25,7 +25,8 @@ export function createHybridBuilderSession() {
         previewPlaying: false,
         previewLoading: false,
         previewRequestId: 0,
-        previewRestore: null,
+        previewController: null,
+        previewControllerSessionId: null,
         previewRecordingGain: 1,
         wholeSongLoop: false,
         timelineSeekTime: 0,
@@ -199,6 +200,10 @@ export function resetHybridBuilderReview(session) {
     session.hasReviewWork = false;
     session.conflictIndex = 0;
     session.previewLoading = false;
+    session.previewPlaying = false;
+    session.previewMode = '';
+    session.previewController = null;
+    session.previewControllerSessionId = null;
     session.previewRecordingGain = 1;
     session.previewRequestId++;
     session.wholeSongLoop = false;

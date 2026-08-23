@@ -444,14 +444,18 @@ export class CompositePreviewController {
         if (typeof mode !== 'string' || !mode || this.destroyed) return false;
         if (definition !== undefined) this.defineMode(mode, definition);
         if (!this.modes.has(mode)) return false;
-        const wasPlaying = this.playing;
+        const wasActive = this.playing || this.loading;
         const at = this.currentTime();
         this._haltAt(at);
+        // A newly selected audition is a fresh request. Do not let a previous
+        // load/decode failure leak through the configuration state emitted
+        // before this mode's own start attempt begins.
+        this.lastError = null;
         this.mode = mode;
         this.cursor = this._clampTime(at);
         this._emitTime(this.cursor);
         this._emitState();
-        return wasPlaying ? this._beginAt(this.cursor) : true;
+        return wasActive ? this._beginAt(this.cursor) : true;
     }
 
     async start(mode = this.mode) {
@@ -477,12 +481,12 @@ export class CompositePreviewController {
 
     async seek(time) {
         if (this.destroyed) return false;
-        const wasPlaying = this.playing;
+        const wasActive = this.playing || this.loading;
         const target = this._clampTime(time);
         this._haltAt(target);
         this._emitTime(this.cursor);
         this._emitState();
-        return wasPlaying ? this._beginAt(target) : true;
+        return wasActive ? this._beginAt(target) : true;
     }
 
     async restart() {
@@ -495,8 +499,8 @@ export class CompositePreviewController {
         const object = raw && typeof raw === 'object' ? raw : null;
         const enabled = object ? object.enabled !== false : !!raw;
         const range = this._effectiveRange();
-        const wasPlaying = this.playing;
-        const at = wasPlaying ? this.currentTime() : this.cursor;
+        const wasActive = this.playing || this.loading;
+        const at = wasActive ? this.currentTime() : this.cursor;
         const start = this._clampTime(
             object?.startTime ?? startTime ?? this.loop.startTime ?? range.startTime);
         const end = this._clampTime(
@@ -513,7 +517,7 @@ export class CompositePreviewController {
         // active when a pass starts. Re-seat a live pass when Loop changes so
         // disabling it cannot leave the remainder of the song silent, and
         // enabling it cannot leave already-queued voices beyond the new edge.
-        if (wasPlaying && changed) {
+        if (wasActive && changed) {
             this._haltAt(at);
             void this._beginAt(at);
         }
@@ -556,7 +560,8 @@ export class CompositePreviewController {
         const changed = next.gm !== this.tone.gm || next.trimGain !== this.tone.trimGain;
         this.tone = next;
         this._applyMix(false);
-        if (!changed || !this.playing || this._definition()?.kind !== 'guide') {
+        const active = this.playing || this.loading;
+        if (!changed || !active || this._definition()?.kind !== 'guide') {
             this._emitState();
             return true;
         }
@@ -573,7 +578,10 @@ export class CompositePreviewController {
         this._cancelFrame();
         this.playing = false;
         this.loading = false;
-        this.guideScheduler?.destroy?.();
+        // This controller owns and closes the context below. Let the guide
+        // scheduler disconnect dense passes without walking every envelope on
+        // the modal-close input path; context.close() retires those nodes.
+        this.guideScheduler?.destroy?.({ contextWillClose: true });
         this.referenceMixer?.destroy?.();
         this.soundfont?.destroy?.();
         for (const node of [

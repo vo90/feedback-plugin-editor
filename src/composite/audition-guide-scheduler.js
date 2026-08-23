@@ -7,6 +7,8 @@
 export const COMPOSITE_GUIDE_LOOKAHEAD_SECONDS = 0.3;
 export const COMPOSITE_GUIDE_LATE_RECOVERY_SECONDS = 0.04;
 export const COMPOSITE_GUIDE_TICK_MS = 25;
+export const COMPOSITE_GUIDE_STOP_FADE_SECONDS = 0.004;
+export const COMPOSITE_GUIDE_CLEANUP_DELAY_MS = 8;
 
 function finite(value, fallback = 0) {
     const number = Number(value);
@@ -100,9 +102,13 @@ export class CompositeGuideScheduler {
         chartToContext,
         setIntervalFn = globalThis.setInterval?.bind(globalThis),
         clearIntervalFn = globalThis.clearInterval?.bind(globalThis),
+        setTimeoutFn = globalThis.setTimeout?.bind(globalThis),
+        clearTimeoutFn = globalThis.clearTimeout?.bind(globalThis),
         tickMs = COMPOSITE_GUIDE_TICK_MS,
         lookahead = COMPOSITE_GUIDE_LOOKAHEAD_SECONDS,
         lateRecovery = COMPOSITE_GUIDE_LATE_RECOVERY_SECONDS,
+        stopFadeSeconds = COMPOSITE_GUIDE_STOP_FADE_SECONDS,
+        cleanupDelayMs = COMPOSITE_GUIDE_CLEANUP_DELAY_MS,
     } = {}) {
         if (!context) throw new Error('Hybrid guide scheduler requires an AudioContext');
         if (typeof voice !== 'function') {
@@ -116,11 +122,17 @@ export class CompositeGuideScheduler {
             ? chartToContext : chartTime => context.currentTime + chartTime;
         this.setIntervalFn = setIntervalFn;
         this.clearIntervalFn = clearIntervalFn;
+        this.setTimeoutFn = setTimeoutFn;
+        this.clearTimeoutFn = clearTimeoutFn;
         this.tickMs = Math.max(5, Math.trunc(finite(tickMs, COMPOSITE_GUIDE_TICK_MS)));
         this.lookahead = Math.max(0.01, finite(
             lookahead, COMPOSITE_GUIDE_LOOKAHEAD_SECONDS));
         this.lateRecovery = Math.max(0, finite(
             lateRecovery, COMPOSITE_GUIDE_LATE_RECOVERY_SECONDS));
+        this.stopFadeSeconds = Math.max(0, Math.min(0.02,
+            finite(stopFadeSeconds, COMPOSITE_GUIDE_STOP_FADE_SECONDS)));
+        this.cleanupDelayMs = Math.max(0, Math.trunc(finite(
+            cleanupDelayMs, COMPOSITE_GUIDE_CLEANUP_DELAY_MS)));
         this.events = [];
         this.program = 27;
         this.voiceCap = 6;
@@ -130,6 +142,8 @@ export class CompositeGuideScheduler {
         this.includeCursor = false;
         this.lastBucketKey = null;
         this.voices = [];
+        this.activePass = null;
+        this.retiredCleanups = new Set();
         this.timer = null;
         this.running = false;
         this.destroyed = false;
@@ -138,7 +152,10 @@ export class CompositeGuideScheduler {
 
     configure({ events, program = 27, voiceCap = 6, baseGain = 0.5 } = {}) {
         if (this.destroyed) return false;
-        this.cancelVoices();
+        // A mode change must be as cheap as Stop even with a dense lookahead.
+        // The prior pass is silenced now and its individual envelopes retire
+        // outside the input event, provided Web Audio can isolate the pass.
+        this.stop();
         this.events = compositeGuideEventsPure(events);
         this.program = Number(program);
         this.voiceCap = Math.max(1, Math.min(12, Math.trunc(Number(voiceCap) || 6)));
@@ -158,6 +175,8 @@ export class CompositeGuideScheduler {
         this.includeCursor = true;
         this.lastBucketKey = null;
         this.generation++;
+        this.activePass = this._createPass(this.generation);
+        this.voices = this.activePass.voices;
         if (typeof this.setIntervalFn === 'function') {
             this.timer = this.setIntervalFn(() => this.tick(), this.tickMs);
         }
@@ -169,6 +188,8 @@ export class CompositeGuideScheduler {
 
     tick() {
         if (!this.running || this.destroyed) return 0;
+        const pass = this.activePass;
+        if (!pass) return 0;
         const contextNow = finite(this.context.currentTime);
         this.voices = this.voices.filter(item => {
             if (!Number.isFinite(Number(item?.until)) || Number(item.until) > contextNow) {
@@ -176,6 +197,7 @@ export class CompositeGuideScheduler {
             }
             return false;
         });
+        pass.voices = this.voices;
         const now = Math.max(0, finite(this.nowChart()));
         const window = compositeGuideScheduleWindowPure(now, this.scheduledUntil, {
             includeCursor: this.includeCursor,
@@ -201,7 +223,7 @@ export class CompositeGuideScheduler {
             for (const event of group.voices) {
                 const scheduledVoice = this.voice({
                     context: this.context,
-                    target: this.target,
+                    target: pass.target,
                     program: this.program,
                     when,
                     midi: event.midi,
@@ -221,8 +243,133 @@ export class CompositeGuideScheduler {
     }
 
     cancelVoices() {
-        for (const voice of this.voices) cancelVoice(voice);
+        const pass = this.activePass || {
+            node: null,
+            target: this.target,
+            voices: this.voices,
+        };
+        this.activePass = null;
         this.voices = [];
+        this._silencePass(pass);
+        this._cleanupPass(pass);
+    }
+
+    _createPass(generation) {
+        let node = null;
+        try {
+            if (typeof this.context?.createGain === 'function') {
+                node = this.context.createGain();
+                node.connect(this.target);
+            }
+        } catch (_) {
+            try { node?.disconnect?.(); } catch (_) { /* incomplete gain node */ }
+            node = null;
+        }
+        return {
+            generation,
+            node,
+            target: node || this.target,
+            voices: [],
+        };
+    }
+
+    _silencePass(pass) {
+        const node = pass?.node;
+        if (!node) return false;
+        const parameter = node.gain;
+        const now = Math.max(0, finite(this.context?.currentTime));
+        if (parameter) {
+            try {
+                const current = Math.max(0, finite(parameter.value, 1));
+                parameter.cancelScheduledValues?.(now);
+                if (typeof parameter.setValueAtTime === 'function') {
+                    parameter.setValueAtTime(current, now);
+                } else {
+                    parameter.value = current;
+                }
+                if (this.stopFadeSeconds > 0
+                        && typeof parameter.linearRampToValueAtTime === 'function') {
+                    parameter.linearRampToValueAtTime(0, now + this.stopFadeSeconds);
+                } else if (typeof parameter.setValueAtTime === 'function') {
+                    parameter.setValueAtTime(0, now);
+                } else {
+                    parameter.value = 0;
+                }
+                return true;
+            } catch (_) { /* disconnect below is the atomic fallback */ }
+        }
+        if (typeof node.disconnect !== 'function') return false;
+        try {
+            node.disconnect();
+            pass.disconnected = true;
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    _cleanupPass(pass) {
+        for (const voice of pass?.voices || []) cancelVoice(voice);
+        if (!pass?.disconnected) {
+            try { pass?.node?.disconnect?.(); } catch (_) { /* already disconnected */ }
+        }
+        if (pass) pass.voices = [];
+    }
+
+    _deferPassCleanup(pass) {
+        const isolated = this._silencePass(pass);
+        if (!isolated || typeof this.setTimeoutFn !== 'function') {
+            this._cleanupPass(pass);
+            return false;
+        }
+        const job = { id: null, run: null, discard: null };
+        job.run = () => {
+            if (!this.retiredCleanups.delete(job)) return;
+            this._cleanupPass(pass);
+        };
+        job.discard = () => {
+            if (!this.retiredCleanups.delete(job)) return;
+            try { pass?.node?.disconnect?.(); } catch (_) { /* already disconnected */ }
+            // The owning AudioContext is closing, so its scheduled source
+            // nodes need no per-envelope cancellation. Dropping this retained
+            // array releases the only scheduler-side references in O(1).
+            if (pass) pass.voices = [];
+        };
+        this.retiredCleanups.add(job);
+        try {
+            job.id = this.setTimeoutFn(job.run, this.cleanupDelayMs);
+            return true;
+        } catch (_) {
+            this.retiredCleanups.delete(job);
+            this._cleanupPass(pass);
+            return false;
+        }
+    }
+
+    _retireActivePass() {
+        const pass = this.activePass;
+        this.activePass = null;
+        this.voices = [];
+        if (!pass) return false;
+        return this._deferPassCleanup(pass);
+    }
+
+    _flushRetiredCleanups() {
+        for (const job of [...this.retiredCleanups]) {
+            if (job.id !== null && typeof this.clearTimeoutFn === 'function') {
+                try { this.clearTimeoutFn(job.id); } catch (_) { /* timer already fired */ }
+            }
+            job.run();
+        }
+    }
+
+    _discardRetiredCleanups() {
+        for (const job of [...this.retiredCleanups]) {
+            if (job.id !== null && typeof this.clearTimeoutFn === 'function') {
+                try { this.clearTimeoutFn(job.id); } catch (_) { /* timer already fired */ }
+            }
+            job.discard();
+        }
     }
 
     stop() {
@@ -233,13 +380,33 @@ export class CompositeGuideScheduler {
         this.running = false;
         this.includeCursor = false;
         this.generation++;
-        this.cancelVoices();
+        this._retireActivePass();
     }
 
-    destroy() {
+    destroy({ contextWillClose = false } = {}) {
         if (this.destroyed) return;
-        this.stop();
+        if (contextWillClose) {
+            if (this.timer !== null && typeof this.clearIntervalFn === 'function') {
+                this.clearIntervalFn(this.timer);
+            }
+            this.timer = null;
+            this.running = false;
+            this.includeCursor = false;
+            this.generation++;
+            const pass = this.activePass;
+            this.activePass = null;
+            this.voices = [];
+            if (pass) {
+                this._silencePass(pass);
+                try { pass.node?.disconnect?.(); } catch (_) { /* context is closing */ }
+                pass.voices = [];
+            }
+        } else {
+            this.stop();
+        }
         this.destroyed = true;
+        if (contextWillClose) this._discardRetiredCleanups();
+        else this._flushRetiredCleanups();
         this.events = [];
         this.target = null;
     }

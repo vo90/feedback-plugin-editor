@@ -168,13 +168,16 @@ test('Hybrid review navigation and guide playback reuse indexed revision caches'
     const previewEnd = resolver.indexOf('\nfunction keepCompositeContextLoop', previewStart);
     const previewBody = resolver.slice(previewStart, previewEnd);
     assert.match(previewBody,
-        /compositePreviewEventsForMode\(mode\)[\s\S]*preSanitized:\s*mode !== 'song'/,
-        'the gesture path skips duplicate conversion, filtering, and sorting');
+        /events:\s*\(\) => compositePreviewEventsForMode\(guideMode\)[\s\S]*voiceCap:\s*hybridSession\.plan\.compatibility\.stringCount/,
+        'the private scheduler consumes cached, preconverted guide events directly');
     const prewarmStart = resolver.indexOf('function scheduleCompositePreviewEventPrewarm');
     const prewarmEnd = resolver.indexOf('\nfunction setCompositeContextLoop', prewarmStart);
     assert.match(resolver.slice(prewarmStart, prewarmEnd),
         /prewarmCompositeConflictResolutionIndex\(plan\)[\s\S]*compositePreviewEventsForMode/,
         'idle time prepares both first-choice validation and all guide-event caches');
+    assert.match(resolver.slice(prewarmStart, prewarmEnd),
+        /prewarmCompositeRecordingSummaryPeak\(peaks\)[\s\S]*recordingPreviewGainFor\(view, audio\)/,
+        'idle time also prepares exact recording peak and current-region level matching');
     assert.doesNotMatch(resolver.slice(prewarmStart, prewarmEnd),
         /resolutionRevision\s*!==/,
         'an early review choice cannot permanently cancel source-event prewarming');
@@ -223,8 +226,8 @@ test('Hybrid release telemetry covers transport latency, display cadence, and in
     const previewStart = resolver.indexOf('async function startCompositePreview');
     const previewEnd = resolver.indexOf('\nfunction keepCompositeContextLoop', previewStart);
     assert.match(resolver.slice(previewStart, previewEnd),
-        /previewRequestStartedAt = hybridPerfStart\(\)[\s\S]*currentPreviewView\(\)[\s\S]*startPlayback\(\)[\s\S]*hybridPerfEnd\('ui\.preview\.requestMs'/,
-        'successful Play requests include model lookup through the running transport state');
+        /previewRequestStartedAt = hybridPerfStart\(\)[\s\S]*currentPreviewView\(\)[\s\S]*controller\.start\(mode\)[\s\S]*hybridPerfEnd\('ui\.preview\.requestMs'/,
+        'successful Play requests include model lookup through the private transport state');
     const playheadStart = resolver.indexOf('function updateCompositeTimelinePlayhead');
     const playheadEnd = resolver.indexOf('function startCompositeTimelinePlayhead', playheadStart);
     assert.match(resolver.slice(playheadStart, playheadEnd),
@@ -256,10 +259,10 @@ test('Original-song Hybrid playback reuses waveform levels instead of scanning P
     const end = resolver.indexOf('function updateActiveHybridPreviewMix', start);
     const body = resolver.slice(start, end);
     assert.match(body,
-        /S\.waveformPeaks[\s\S]*compositeRecordingPreviewLevelFromPeaksPure/,
+        /audio\.waveformPeaks[\s\S]*compositeRecordingPreviewLevelFromPeaksPure/,
         'the decoded waveform summary is the normal constant-time playback path');
     assert.match(body,
-        /:\s*compositeRecordingPreviewLevelPure\(S\.audioBuffer/,
+        /:\s*compositeRecordingPreviewLevelPure\(buffer/,
         'a host without waveform data retains the exact PCM correctness fallback');
 });
 
@@ -307,13 +310,13 @@ test('Hybrid playhead is visible and exact before, during, and after playback', 
         'the compositor cache starts with a finite visible marker instead of null/zero');
     assert.doesNotMatch(resolver, /playheadX:\s*null/);
     assert.match(resolver,
-        /const playbackSettled = hybridSession\.previewPlaying && !S\.playing;[\s\S]*timelineSeekTime = Math\.max\(0, Number\(S\.cursorTime\)\)/,
-        'natural completion adopts the exact stopped transport position');
+        /const playbackSettled = hybridSession\.previewPlaying && !controllerPlaying[\s\S]*controller\.presentationTime\(\)/,
+        'natural completion adopts the exact private transport endpoint');
     assert.match(resolver,
         /follow:\s*\(activelyPlaying \|\| playbackSettled\)[\s\S]*hybridPreviewPreferences\.followPlayhead/,
         'natural completion also returns the followed camera and overview box to that position');
     const stopStart = resolver.indexOf('function endCompositePreviewPlayback');
-    const stopEnd = resolver.indexOf('function restoreCompositePreviewSession', stopStart);
+    const stopEnd = resolver.indexOf('function disposeCompositePreviewSession', stopStart);
     assert.match(resolver.slice(stopStart, stopEnd), /refreshCompositeTimelinePlayheadNow\(\)/,
         'explicit Stop leaves both timeline markers at the captured position');
 });
@@ -387,7 +390,7 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
         'ordinary soft preparation remains an untimed idle task');
     assert.match(resolver, /Boolean\(deadline\?\.didTimeout\)/,
         'urgent camera work progresses when its deadline expires');
-    assert.match(resolver, /S\.playing[\s\S]*now \+ 240/,
+    assert.match(resolver, /compositePreviewControllerPlaying\(\)[\s\S]*now \+ 240/,
         'playback gives finite-strip preparation a bounded deadline');
     assert.match(resolver, /requestAnimationFrame\(\(\) =>\s*refreshCompositeTimelineViewport\(false\)\)/,
         'the animation timestamp can never be mistaken for a forced synchronous rebuild');
@@ -574,15 +577,18 @@ test('continuous Hybrid preview preferences update live and persist off the inpu
         'close and teardown persist the latest continuous value before cleanup');
 });
 
-test('Hybrid preview policy is cleared when its modal loses ownership of the Editor session', () => {
+test('Hybrid preview owns and destroys its private transport at the feature boundary', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
-    const audio = fs.readFileSync(new URL('../src/audio.js', import.meta.url), 'utf8');
-    assert.match(resolver, /restorePreview\) \{[\s\S]*restoreCompositePreviewSession\(\)[\s\S]*\} else \{[\s\S]*editorClearGuidePreview\(\)/,
-        'a song switch drops Hybrid audio policy without seeking the new session');
-    const teardownStart = audio.indexOf('export function teardownAudio');
-    const teardownBody = audio.slice(teardownStart, audio.indexOf('\n}', teardownStart) + 2);
-    assert.match(teardownBody, /S\.playing = false;[\s\S]*editorClearGuidePreview\(\)/,
-        'full Editor teardown cannot leak focused preview ownership into the next screen');
+    const imports = resolver.slice(0, resolver.indexOf('export const HYBRID_DIALOG_STYLE'));
+    assert.match(resolver,
+        /function disposeCompositePreviewSession[\s\S]*controller\.destroy\(\)/,
+        'close, teardown, and song switches destroy the feature-owned controller');
+    assert.match(resolver,
+        /function closeCompositeModalImmediately[\s\S]*disposeCompositePreviewSession\(\)/,
+        'modal teardown cannot leak its private AudioContext into the next Editor session');
+    assert.doesNotMatch(imports,
+        /from '\.\.\/audio\.js'|from '\.\.\/loop\.js'|from '\.\.\/state\.js'/,
+        'ordinary Hybrid preview does not own Editor audio, loop, or state policy');
 });
 
 test('Hybrid Follow is an explicit two-state preference and zoom keeps live playback centered', () => {
@@ -598,7 +604,7 @@ test('Hybrid Follow is an explicit two-state preference and zoom keeps live play
     const zoomEnd = resolver.indexOf('function updateCompositeTimelineMapFrame', zoomStart);
     const zoomBody = resolver.slice(zoomStart, zoomEnd);
     assert.match(zoomBody, /followsLivePlayback/);
-    assert.match(zoomBody, /editorPlaybackVisualTime\(\)/,
+    assert.match(zoomBody, /compositePreviewVisualTime\(\)/,
         'live zoom anchors against the audio clock, not the previous scrollbar position');
     assert.match(zoomBody, /compositeTimelineCenteredScrollPure/);
     assert.match(zoomBody, /timelinePendingZoom/);
@@ -659,13 +665,14 @@ test('Hybrid setup remembers explicit review-every-occurrence preference', () =>
     assert.doesNotMatch(html, /value="matching-repetitions" selected/);
 });
 
-test('Hybrid builder session reset clears review state without losing preview restoration', () => {
+test('Hybrid builder session reset clears review and private-preview ownership', () => {
     const session = createHybridBuilderSession();
     session.plan = { ok: true };
     session.stage = 'final-preview';
     session.conflictIndex = 4;
     session.customDrafts.set('guided:1', ['primary:1']);
-    session.previewRestore = { cursorTime: 12 };
+    session.previewController = { destroy() {} };
+    session.previewControllerSessionId = 'song-a';
     session.previewLoading = true;
     session.previewRecordingGain = 0.25;
     session.wholeSongLoop = true;
@@ -701,7 +708,8 @@ test('Hybrid builder session reset clears review state without losing preview re
     assert.equal(session.setupDirtyMessage, '');
     assert.equal(session.analyzing, false);
     assert.equal(session.previewRequestId, requestId + 1);
-    assert.deepEqual(session.previewRestore, { cursorTime: 12 });
+    assert.equal(session.previewController, null);
+    assert.equal(session.previewControllerSessionId, null);
 });
 
 test('only meaningful Guided choices require a discard-review confirmation', () => {

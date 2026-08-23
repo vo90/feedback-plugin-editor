@@ -7,10 +7,12 @@ import {
     compositeEditorContainsArrangement,
     compositeEditorSessionIsCurrent,
     CreateCompositeArrangementCmd,
+    keepCompositeEditorLoop,
     readCompositeAnalysisSnapshot,
     readCompositeEditorSnapshot,
-    seekCompositeEditorTime,
+    readCompositePreviewAudioSnapshot,
     setCompositeEditorStatus,
+    stopCompositeEditorPlayback,
 } from '../src/composite/editor-adapter.js';
 
 function fakeState(overrides = {}) {
@@ -76,13 +78,75 @@ test('Hybrid Editor identity and name checks stay behind the adapter', () => {
     assert.equal(compositeEditorArrangementNameTaken('Hybrid Guitar 2', state), false);
 });
 
-test('Hybrid status and seek bridges delegate without exposing their Editor owners', () => {
+test('Hybrid status bridge delegates without exposing its Editor owner', () => {
     const statuses = [];
-    const seeks = [];
     setCompositeEditorStatus('Ready', message => statuses.push(message));
-    seekCompositeEditorTime(12.5, { editorSeekToTime: time => seeks.push(time) });
     assert.deepEqual(statuses, ['Ready']);
-    assert.deepEqual(seeks, [12.5]);
+});
+
+test('Hybrid audio snapshot exposes plain reference metadata and reuses only the active buffer', () => {
+    const activeBuffer = { duration: 12 };
+    const state = fakeState({
+        beats: [{ time: 0 }, { time: 1 }],
+        duration: 10,
+        audioShift: 0.5,
+        activeAudioSourceId: 'rhythm',
+        activeAudioSourceOffset: 0.25,
+        audioUrl: '/rhythm.ogg',
+        audioBuffer: activeBuffer,
+        waveformPeaks: { rms: [0.1] },
+        masterAudioUrl: '/master.ogg',
+        masterAudioDuration: 11,
+        stems: [{ id: 'rhythm', url: '/rhythm.ogg', offset: 0.25 }],
+        trackSession: {
+            tracks: [{ type: 'audio', sourceId: 'rhythm', regions: [] }],
+            removedSourceIds: [],
+        },
+    });
+    const snapshot = readCompositePreviewAudioSnapshot(state, {
+        partStripState: key => key === 'audio:rhythm'
+            ? { audible: true, vol: 0.6, solo: true }
+            : { audible: true, vol: 0.8, solo: false },
+    });
+
+    assert.equal(snapshot.available, true);
+    assert.equal(snapshot.activeBuffer, activeBuffer);
+    assert.equal(snapshot.duration, 12.75);
+    assert.equal(snapshot.reference.sources.length, 2);
+    assert.equal(snapshot.reference.sources[0].id, 'master');
+    assert.equal(snapshot.reference.sources[0].buffer, null);
+    assert.equal(snapshot.reference.sources[1].buffer, activeBuffer);
+    assert.deepEqual(snapshot.reference.sources[1].mix, {
+        gain: 0.6, audible: true, solo: true,
+    });
+    assert.equal(snapshot.reference.beatToTime(1), 1);
+});
+
+test('Hybrid transport bridge only stops active Editor playback', () => {
+    const calls = [];
+    assert.equal(stopCompositeEditorPlayback({ playing: false }, () => calls.push('stop')), false);
+    assert.equal(stopCompositeEditorPlayback({ playing: true }, () => calls.push('stop')), true);
+    assert.deepEqual(calls, ['stop']);
+});
+
+test('Keep Editor loop is the explicit loop mutation bridge', () => {
+    const calls = [];
+    const state = { loopEnabled: false };
+    const region = { startTime: 2, endTime: 4, mode: 'bar' };
+    const kept = keepCompositeEditorLoop(region, {
+        state,
+        editor: { editorSeekToTime: time => calls.push(['seek', time]) },
+        setRegion: value => calls.push(['region', value]),
+        setEnabled: enabled => {
+            state.loopEnabled = enabled;
+            calls.push(['enabled', enabled]);
+        },
+    });
+    assert.equal(kept, true);
+    assert.deepEqual(calls, [
+        ['region', region], ['seek', 2], ['enabled', true],
+    ]);
+    assert.notEqual(calls[0][1], region, 'the Editor receives its own region object');
 });
 
 test('Hybrid arrangement command inserts before drums, clears selection, and rolls back', () => {

@@ -7,30 +7,21 @@
 
 import { arrKind, _isFrettedKind } from '../instrument.js';
 import { beatOf, timeOf } from '../beats.js';
-import {
-    editorClearGuidePreview,
-    editorPlaybackVisualTime,
-    editorPrepareGuidePreview,
-    editorSetGuidePreview,
-    editorUpdateGuidePreviewMix,
-    editorWarmGuidePreview,
-    startPlayback,
-    stopPlayback,
-} from '../audio.js';
-import { _setBarSel, _setLoopRegionEnabled } from '../loop.js';
-import { S } from '../state.js';
 import { _editorEscHtml, _editorPromptChoice, _installModalKeyboard } from '../ui.js';
 import {
     commitCompositeArrangement,
     compositeEditorArrangementNameTaken,
     compositeEditorContainsArrangement,
     compositeEditorSessionIsCurrent,
+    keepCompositeEditorLoop,
     readCompositeAnalysisSnapshot,
     readCompositeEditorSnapshot,
-    seekCompositeEditorTime,
+    readCompositePreviewAudioSnapshot,
     setCompositeEditorStatus,
+    stopCompositeEditorPlayback,
 } from './editor-adapter.js';
 export { CreateCompositeArrangementCmd } from './editor-adapter.js';
+import { createCompositePreviewController } from './preview-controller.js';
 import {
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     clearCompositeConflictResolution,
@@ -86,13 +77,12 @@ import {
     renderCompositeDifferenceTable,
 } from './conflict-view.js';
 import {
-    compositePreviewAudioPolicyPure,
     createCompositePreviewEventCache,
-    compositePreviewMixPure,
     compositePreviewModesPure,
     compositePreviewRegionPure,
     compositeRecordingPreviewLevelPure,
     compositeRecordingPreviewLevelFromPeaksPure,
+    prewarmCompositeRecordingSummaryPeak,
 } from './preview.js';
 import {
     beginHybridAnalysis,
@@ -635,54 +625,93 @@ function selectedHybridPreviewTone() {
 }
 
 function hybridPreviewMixFor(mode) {
-    return compositePreviewMixPure(mode, {
+    const guideOnly = mode === 'primary' || mode === 'secondary' || mode === 'result';
+    return {
         volume: hybridPreviewPreferences.volume,
-        toneTrimGain: selectedHybridPreviewTone().trimGain,
-        recordingGain: hybridSession.previewRecordingGain,
-    });
+        referenceGain: mode === 'song' ? hybridSession.previewRecordingGain : 0,
+        guideGain: guideOnly ? 1 : 0,
+    };
 }
 
 let recordingPreviewLevelCache = null;
-function recordingPreviewGainFor(view) {
-    if (!S.audioBuffer || !view || !hybridSession.plan) return 1;
+function compositePreviewAudioAvailable() {
+    return readCompositePreviewAudioSnapshot().available;
+}
+
+function compositePreviewTimelineDuration() {
+    return readCompositePreviewAudioSnapshot().duration;
+}
+
+function recordingPreviewGainFor(view, audio = readCompositePreviewAudioSnapshot()) {
+    const buffer = audio.activeBuffer;
+    if (!buffer || !view || !hybridSession.plan) return 1;
     const region = compositePreviewRegionPure(
         view.playbackContext || view.context, hybridSession.plan.beats);
-    const shift = (Number(S.audioShift) || 0) + (Number(S.activeAudioSourceOffset) || 0);
+    const shift = (Number(audio.audioShift) || 0)
+        + (Number(audio.activeSourceOffset) || 0);
     const startTime = region.startTime - shift;
     const endTime = region.endTime - shift;
     const cached = recordingPreviewLevelCache;
-    if (cached && cached.buffer === S.audioBuffer
+    if (cached && cached.buffer === buffer
             && cached.startTime === startTime && cached.endTime === endTime) return cached.gain;
     // Audio decoding already produced a compact RMS/peak waveform summary.
     // Prefer it here so the Play/Space gesture never has to scan hundreds of
     // thousands of raw samples before Original Song playback can start.
-    const level = S.waveformPeaks
+    const level = audio.waveformPeaks
         ? compositeRecordingPreviewLevelFromPeaksPure(
-            S.waveformPeaks, S.audioBuffer.duration, startTime, endTime)
-        : compositeRecordingPreviewLevelPure(S.audioBuffer, startTime, endTime);
+            audio.waveformPeaks, buffer.duration, startTime, endTime)
+        : compositeRecordingPreviewLevelPure(buffer, startTime, endTime);
     const gain = level.gain;
-    recordingPreviewLevelCache = { buffer: S.audioBuffer, startTime, endTime, gain };
+    recordingPreviewLevelCache = { buffer, startTime, endTime, gain };
     return gain;
 }
 
 function updateActiveHybridPreviewMix() {
-    if (!hybridSession.previewMode) return false;
-    return editorUpdateGuidePreviewMix(hybridPreviewMixFor(hybridSession.previewMode));
+    const controller = hybridSession.previewController;
+    if (!hybridSession.previewMode || !controller) return false;
+    controller.setMix(hybridPreviewMixFor(hybridSession.previewMode));
+    return true;
 }
 
-function cloneLoopRegion(region) {
-    return region ? { ...region } : null;
+function compositePreviewControllerPlaying() {
+    return !!hybridSession.previewController?.isPlaying?.();
 }
 
-function rememberCompositePreviewSession() {
-    if (hybridSession.previewRestore) return;
+function compositePreviewVisualTime() {
+    const time = hybridSession.previewController?.presentationTime?.();
+    return Number.isFinite(Number(time))
+        ? Math.max(0, Number(time)) : hybridSession.timelineSeekTime;
+}
+
+function ensureCompositePreviewController() {
     const { sessionId } = readCompositeEditorSnapshot();
-    hybridSession.previewRestore = {
-        sessionId,
-        barSel: cloneLoopRegion(S.barSel),
-        loopEnabled: !!S.loopEnabled,
-        cursorTime: Number(S.cursorTime) || 0,
-    };
+    if (hybridSession.previewController
+            && hybridSession.previewControllerSessionId === sessionId) {
+        return hybridSession.previewController;
+    }
+    const previous = hybridSession.previewController;
+    hybridSession.previewController = null;
+    hybridSession.previewControllerSessionId = null;
+    if (previous) void previous.destroy();
+    let controller = null;
+    controller = createCompositePreviewController({
+        tone: selectedHybridPreviewTone(),
+        volume: hybridPreviewPreferences.volume,
+        onStateChange: state => {
+            if (hybridSession.previewController !== controller) return;
+            hybridSession.previewLoading = !!state.loading;
+            if (state.playing) hybridSession.previewPlaying = true;
+            if (state.error) {
+                hybridSession.previewPlaying = false;
+                hybridSession.previewMode = '';
+                setCompositePreviewHelp(state.error.message || 'Playback could not start.');
+            }
+            updateCompositePreviewButtons();
+        },
+    });
+    hybridSession.previewController = controller;
+    hybridSession.previewControllerSessionId = sessionId;
+    return controller;
 }
 
 function updateCompositePreviewButtons() {
@@ -709,16 +738,17 @@ function setCompositePreviewHelp(message) {
 function endCompositePreviewPlayback() {
     const hadPreview = hybridSession.previewPlaying || hybridSession.previewLoading
         || !!hybridSession.previewMode;
+    const controller = hybridSession.previewController;
+    const previewTime = controller?.presentationTime?.();
     if ((hybridSession.stage === 'final-preview' || hybridSession.stage === 'review')
-            && Number.isFinite(Number(S.cursorTime))) {
-        hybridSession.timelineSeekTime = Math.max(0, Number(S.cursorTime));
+            && Number.isFinite(Number(previewTime))) {
+        hybridSession.timelineSeekTime = Math.max(0, Number(previewTime));
     }
     hybridSession.previewRequestId++;
-    if (hybridSession.previewPlaying && S.playing) stopPlayback();
+    controller?.stop?.();
     // Settle any fractional compositor camera into the real scrollbar before
     // playback stops, so manual scrolling resumes from the exact visible view.
     syncCompositeTimelineNativeCamera(timelineViewportDom);
-    editorClearGuidePreview();
     hybridSession.previewPlaying = false;
     hybridSession.previewLoading = false;
     hybridSession.previewMode = '';
@@ -743,24 +773,12 @@ function toggleCompositePreview(mode) {
     startCompositePreview(mode);
 }
 
-function restoreCompositePreviewSession() {
-    if (hybridSession.previewRestore?.sessionId
-            && !compositeEditorSessionIsCurrent(hybridSession.previewRestore.sessionId)) {
-        hybridSession.previewRequestId++;
-        hybridSession.previewRestore = null;
-        hybridSession.previewPlaying = false;
-        hybridSession.previewLoading = false;
-        hybridSession.previewMode = '';
-        hybridSession.previewRecordingGain = 1;
-        return;
-    }
+function disposeCompositePreviewSession() {
     endCompositePreviewPlayback();
-    if (!hybridSession.previewRestore) return;
-    const restore = hybridSession.previewRestore;
-    hybridSession.previewRestore = null;
-    _setBarSel(restore.barSel);
-    _setLoopRegionEnabled(restore.loopEnabled);
-    seekCompositeEditorTime(restore.cursorTime);
+    const controller = hybridSession.previewController;
+    hybridSession.previewController = null;
+    hybridSession.previewControllerSessionId = null;
+    if (controller) void controller.destroy();
 }
 
 function clearTransientState() {
@@ -769,6 +787,7 @@ function clearTransientState() {
     stopCompositeModalDocumentKeyboard();
     stopHybridDialogSizePersistence();
     stopCompositeTimelineUi();
+    disposeCompositePreviewSession();
     resetHybridBuilderReview(hybridSession);
 }
 
@@ -909,7 +928,7 @@ function renderPreviewControls(view, wholeSong = false) {
     const buttonClass = 'px-2.5 py-1.5 rounded border border-gray-600 bg-dark-700 hover:border-gray-400 text-xs disabled:opacity-40 disabled:cursor-not-allowed';
     const colors = { song: '', primary: ' text-sky-200', secondary: ' text-violet-200', result: ' text-emerald-200' };
     const modes = compositePreviewModesPure(view, {
-        audioAvailable: !!S.audioBuffer,
+        audioAvailable: compositePreviewAudioAvailable(),
         resultReady,
     });
     const shortcut = { song: '1', primary: '2', secondary: '3', result: '4' };
@@ -975,10 +994,7 @@ function wholePlanPreviewView() {
     if (!hybridSession.plan) return null;
     const names = selectedSourceNames();
     const result = resolvedCompositeEntriesForPlan(hybridSession.plan);
-    const audioShift = (Number(S.audioShift) || 0) + (Number(S.activeAudioSourceOffset) || 0);
-    const recordingEnd = S.audioBuffer ? Math.max(0, Number(S.audioBuffer.duration) + audioShift) : 0;
-    const durationSeconds = Math.max(0, Number(S.duration) || 0,
-        Number(S.masterAudioDuration) || 0, recordingEnd);
+    const durationSeconds = compositePreviewTimelineDuration();
     const view = buildCompositeTimelineViewModel({
         plan: hybridSession.plan,
         primaryName: names.primary,
@@ -1020,10 +1036,7 @@ function reviewPlanTimelineView() {
         resultById.set(entry.id, entry);
     }
     const names = selectedSourceNames();
-    const audioShift = (Number(S.audioShift) || 0) + (Number(S.activeAudioSourceOffset) || 0);
-    const recordingEnd = S.audioBuffer ? Math.max(0, Number(S.audioBuffer.duration) + audioShift) : 0;
-    const durationSeconds = Math.max(0, Number(S.duration) || 0,
-        Number(S.masterAudioDuration) || 0, recordingEnd);
+    const durationSeconds = compositePreviewTimelineDuration();
     const group = hybridSession.plan.conflicts[hybridSession.conflictIndex];
     const review = {
         id: group.id,
@@ -1108,7 +1121,17 @@ function compositePreviewEventsForMode(mode) {
 
 function scheduleCompositePreviewEventPrewarm(plan = hybridSession.plan) {
     if (!plan) return;
+    const audio = readCompositePreviewAudioSnapshot();
+    const peaks = audio.waveformPeaks;
     const tasks = [
+        ...(peaks ? [() => prewarmCompositeRecordingSummaryPeak(peaks)] : []),
+        ...(audio.activeBuffer ? [() => {
+            const current = readCompositePreviewAudioSnapshot();
+            if (current.activeBuffer !== audio.activeBuffer
+                    || current.waveformPeaks !== audio.waveformPeaks) return;
+            const view = currentPreviewView();
+            if (view) recordingPreviewGainFor(view, audio);
+        }] : []),
         ...(plan.conflicts?.length
             ? [() => prewarmCompositeConflictResolutionIndex(plan)] : []),
         ...['primary', 'secondary', 'result'].map(mode =>
@@ -1128,19 +1151,22 @@ function scheduleCompositePreviewEventPrewarm(plan = hybridSession.plan) {
     queue();
 }
 
-function setCompositeContextLoop(view, requestedStartTime = null) {
+function setCompositeContextLoop(controller, view, requestedStartTime = null) {
     const region = compositePreviewRegionPure(
         view.playbackContext || view.context, hybridSession.plan.beats);
-    _setBarSel(region);
     const wholeSong = !!view.wholeSong;
-    _setLoopRegionEnabled(wholeSong ? hybridSession.wholeSongLoop : true);
+    controller.setRange(region.startTime, region.endTime);
+    controller.setLoop({
+        enabled: wholeSong ? hybridSession.wholeSongLoop : true,
+        startTime: region.startTime,
+        endTime: region.endTime,
+    });
     const requested = Number(requestedStartTime);
     const startTime = Number.isFinite(requested)
         ? Math.max(region.startTime, Math.min(region.endTime - 0.01, requested))
         : region.startTime;
-    seekCompositeEditorTime(startTime);
     hybridSession.timelineSeekTime = startTime;
-    return region;
+    return { region, startTime };
 }
 
 async function startCompositePreview(mode) {
@@ -1153,11 +1179,14 @@ async function startCompositePreview(mode) {
     const previewRequestStartedAt = hybridPerfStart();
     const view = currentPreviewView();
     if (!view) return;
-    const requestedStartTime = (hybridSession.previewPlaying || hybridSession.previewMode)
-        ? Number(S.cursorTime) : hybridSession.timelineSeekTime;
-    const resultReady = !!view.conflict?.resolution;
+    const audio = readCompositePreviewAudioSnapshot();
+    const controller = ensureCompositePreviewController();
+    let requestedStartTime = (hybridSession.previewPlaying || hybridSession.previewMode)
+        ? compositePreviewVisualTime() : hybridSession.timelineSeekTime;
+    const resultReady = !!view.wholeSong || !!view.conflict?.resolution
+        || hybridSession.stage === 'final-preview';
     const modeModel = compositePreviewModesPure(view, {
-        audioAvailable: !!S.audioBuffer,
+        audioAvailable: audio.available,
         resultReady,
     }).find(candidate => candidate.id === mode);
     if (!modeModel || !modeModel.available) {
@@ -1166,58 +1195,65 @@ async function startCompositePreview(mode) {
         setCompositeEditorStatus(`Hybrid preview: ${reason}`);
         return;
     }
-    const arrangement = mode === 'secondary'
-        ? hybridSession.plan.secondary
-        : hybridSession.plan.primary;
     const tone = selectedHybridPreviewTone();
     // A new choice replaces the sound already playing immediately; do not let
     // the previous Original/guide mode continue underneath a loading message.
-    if (hybridSession.previewPlaying && S.playing) stopPlayback();
-    if (hybridSession.previewPlaying || hybridSession.previewMode) editorClearGuidePreview();
+    const wasPreviewPlaying = controller.isPlaying();
+    controller.stop();
+    stopCompositeEditorPlayback();
     const requestId = ++hybridSession.previewRequestId;
     hybridSession.previewMode = mode;
     hybridSession.previewLastMode = mode;
     hybridSession.previewPlaying = false;
-    hybridSession.previewLoading = mode !== 'song';
+    hybridSession.previewLoading = true;
     updateCompositePreviewButtons();
-    if (mode !== 'song') {
-        setCompositePreviewHelp(`Loading ${modeModel.label} · ${tone.label}…`);
-        setCompositeEditorStatus(
-            `Hybrid preview: loading the ${tone.label} tone for ${modeModel.label}.`);
-        let ready = false;
-        try { ready = await editorPrepareGuidePreview(arrKind(arrangement), { gm: tone.gm }); }
-        catch (_) { ready = false; }
-        if (requestId !== hybridSession.previewRequestId || !hybridSession.plan) return;
-        hybridSession.previewLoading = false;
-        if (!ready) {
-            hybridSession.previewMode = '';
-            updateCompositePreviewButtons();
-            const message = `The ${tone.label} guide tone could not be loaded. The Original song preview is still available.`;
-            setCompositePreviewHelp(message);
-            setCompositeEditorStatus(`Hybrid preview: ${message}`);
-            return;
-        }
+    setCompositePreviewHelp(mode === 'song'
+        ? `Loading ${modeModel.label}…`
+        : `Loading ${modeModel.label} · ${tone.label}…`);
+    setCompositeEditorStatus(mode === 'song'
+        ? `Hybrid preview: loading ${modeModel.label}.`
+        : `Hybrid preview: loading the ${tone.label} tone for ${modeModel.label}.`);
+    const region = compositePreviewRegionPure(
+        view.playbackContext || view.context, hybridSession.plan.beats);
+    if (!wasPreviewPlaying && Number(requestedStartTime) >= region.endTime - 0.01) {
+        requestedStartTime = region.startTime;
     }
-    if (requestId !== hybridSession.previewRequestId) return;
-    rememberCompositePreviewSession();
-    if (S.playing) stopPlayback();
-    editorClearGuidePreview();
-    const events = mode === 'song' ? [] : compositePreviewEventsForMode(mode);
-    hybridSession.previewRecordingGain = mode === 'song' ? recordingPreviewGainFor(view) : 1;
-    editorSetGuidePreview(events, arrKind(arrangement), {
-        ...compositePreviewAudioPolicyPure(mode),
-        ...hybridPreviewMixFor(mode),
-        gm: tone.gm,
-        voiceCap: hybridSession.plan.compatibility.stringCount,
-        preSanitized: mode !== 'song',
+    controller.defineMode('song', {
+        kind: 'reference',
+        snapshot: audio.reference,
+        startTime: region.startTime,
+        endTime: region.endTime,
     });
-    setCompositeContextLoop(view, requestedStartTime);
-    startPlayback();
-    hybridSession.previewPlaying = !!S.playing;
+    for (const guideMode of ['primary', 'secondary', 'result']) {
+        controller.defineMode(guideMode, {
+            kind: 'guide',
+            events: () => compositePreviewEventsForMode(guideMode),
+            voiceCap: hybridSession.plan.compatibility.stringCount,
+            startTime: region.startTime,
+            endTime: region.endTime,
+        });
+    }
+    await controller.setMode(mode);
+    await controller.setTone(tone);
+    hybridSession.previewRecordingGain = mode === 'song'
+        ? recordingPreviewGainFor(view, audio) : 1;
+    controller.setMix(hybridPreviewMixFor(mode));
+    const context = setCompositeContextLoop(controller, view, requestedStartTime);
+    await controller.seek(context.startTime);
+    if (requestId !== hybridSession.previewRequestId || !hybridSession.plan
+            || hybridSession.previewController !== controller) return;
+    const started = await controller.start(mode);
+    if (requestId !== hybridSession.previewRequestId
+            || hybridSession.previewController !== controller) return;
+    hybridSession.previewLoading = false;
+    hybridSession.previewPlaying = !!started && controller.isPlaying();
     updateCompositePreviewButtons();
     if (!hybridSession.previewPlaying) {
-        restoreCompositePreviewSession();
-        const message = 'Playback could not start.';
+        const controllerError = controller.state().error;
+        hybridSession.previewMode = '';
+        const message = controllerError?.message || (mode === 'song'
+            ? 'The original recording could not be loaded.'
+            : `The ${tone.label} guide tone could not be loaded.`);
         setCompositePreviewHelp(message);
         setCompositeEditorStatus(`Hybrid preview: ${message}`);
         return;
@@ -1236,12 +1272,10 @@ async function startCompositePreview(mode) {
 function keepCompositeContextLoop() {
     const view = currentPreviewView();
     if (!view) return;
-    rememberCompositePreviewSession();
     endCompositePreviewPlayback();
-    setCompositeContextLoop(view);
-    // This button is an explicit handoff: do not restore the user's previous
-    // loop when the resolver closes.
-    hybridSession.previewRestore = null;
+    const region = compositePreviewRegionPure(
+        view.playbackContext || view.context, hybridSession.plan.beats);
+    keepCompositeEditorLoop(region);
     const button = byId('editor-composite-keep-loop');
     if (button) button.textContent = 'Editor loop set ✓';
     setCompositeEditorStatus(
@@ -1255,7 +1289,6 @@ function restartCompositePreview() {
         view.playbackContext || view.context, hybridSession.plan.beats);
     const activeMode = hybridSession.previewMode;
     if (activeMode) endCompositePreviewPlayback();
-    rememberCompositePreviewSession();
     seekCompositeTimelineAtTime(region.startTime, {
         center: true,
     });
@@ -1390,6 +1423,7 @@ function enterCompositeFinalPreview() {
     hybridSession.timelineFocusReview = false;
     hybridSession.timelineFocusPassage = false;
     renderResult();
+    scheduleCompositePreviewEventPrewarm(hybridSession.plan);
     const workspace = byId('editor-composite-result-workspace');
     if (workspace) workspace.scrollTop = 0;
     return true;
@@ -1423,7 +1457,6 @@ function inspectExperimentalPassage(passageId) {
     hybridSession.timelineFocusPassage = true;
     hybridSession.timelineSeekTime = Math.max(0, timeOf(hybridSession.plan.beats,
         Math.max(0, passage.startBeat - 0.5)));
-    seekCompositeEditorTime(hybridSession.timelineSeekTime);
     invalidateCompositeTimelineView();
     renderResult();
     return true;
@@ -1694,7 +1727,17 @@ function bindResultEvents() {
             button.classList.toggle('ring-sky-400', hybridSession.wholeSongLoop);
         }
         if (hybridSession.stage === 'final-preview' && hybridSession.previewMode) {
-            _setLoopRegionEnabled(hybridSession.wholeSongLoop);
+            const controller = hybridSession.previewController;
+            const view = currentPreviewView();
+            if (controller && view) {
+                const region = compositePreviewRegionPure(
+                    view.playbackContext || view.context, hybridSession.plan.beats);
+                controller.setLoop({
+                    enabled: hybridSession.wholeSongLoop,
+                    startTime: region.startTime,
+                    endTime: region.endTime,
+                });
+            }
         }
         setCompositePreviewHelp(hybridSession.wholeSongLoop
             ? 'Whole-song loop is on. Playback repeats until you press Stop.'
@@ -1707,7 +1750,8 @@ function bindResultEvents() {
         });
         const activeMode = hybridSession.previewMode;
         if (activeMode && activeMode !== 'song') {
-            startCompositePreview(activeMode);
+            void hybridSession.previewController?.setTone?.(selectedHybridPreviewTone());
+            updateActiveHybridPreviewMix();
         } else {
             const tone = selectedHybridPreviewTone();
             setCompositePreviewHelp(`Guide tone set to ${tone.label}. It is used for Lead, Rhythm, and Hybrid previews.`);
@@ -2329,14 +2373,15 @@ function settleCompositeTimelineZoomPreference({ switchToNotes = true } = {}) {
         const currentScroll = compositeTimelineVisualScrollLeft(dom);
         const anchor = Number.isFinite(Number(unsettledZoom.anchorX))
             ? Number(unsettledZoom.anchorX) : scroller.clientWidth / 2;
-        const followsLivePlayback = hybridSession.previewPlaying && S.playing
+        const followsLivePlayback = hybridSession.previewPlaying
+            && compositePreviewControllerPlaying()
             && hybridPreviewPreferences.followPlayhead && hybridSession.plan;
         const next = unsettledZoom.forceStart
             ? { scrollLeft: 0 }
             : followsLivePlayback
                 ? {
                     scrollLeft: compositeTimelineCenteredScrollPure({
-                        beat: beatOf(hybridSession.plan.beats, editorPlaybackVisualTime()),
+                        beat: beatOf(hybridSession.plan.beats, compositePreviewVisualTime()),
                         context: view.context,
                         zoom: normalizedZoom,
                         viewportWidth: scroller.clientWidth,
@@ -2443,8 +2488,8 @@ function refreshCompositeTimelineViewport(force = false) {
     dom.viewportWidth = viewportWidth;
     dom.contentWidth = width;
     dom.maxScroll = Math.max(0, width - viewportWidth);
-    const playheadTime = hybridSession.previewPlaying && S.playing
-        ? editorPlaybackVisualTime() : hybridSession.timelineSeekTime;
+    const playheadTime = hybridSession.previewPlaying && compositePreviewControllerPlaying()
+        ? compositePreviewVisualTime() : hybridSession.timelineSeekTime;
     dom.playheadX = compositeTimelineXForBeatPure(
         compositeTimelineDisplayBeatAtTime(view, playheadTime), view.context, zoom);
     const visualScroll = compositeTimelineVisualScrollLeft(dom);
@@ -2726,7 +2771,7 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
         options.freshnessDeadlineAt ?? retainedOptions.freshnessDeadlineAt) || 0);
     // An active transport and exact zoom both need bounded progress. The
     // ordinary soft path remains idle-only while ample painted runway exists.
-    const freshnessDeadlineAt = requestedDeadline || (S.playing
+    const freshnessDeadlineAt = requestedDeadline || (compositePreviewControllerPlaying()
         || urgency === 'urgent' || urgency === 'critical' ? now + 240 : 0);
     if (freshnessDeadlineAt) hybridPerfCount('timeline.camera.urgentPreparation');
     const onCommitted = options.onCommitted || retainedOptions.onCommitted || null;
@@ -2973,7 +3018,9 @@ function seekCompositeTimelineAtTime(rawTime, {
     const scroller = dom?.scroller
         || byId('editor-composite-timeline-scroller');
     hybridSession.timelineSeekTime = time;
-    seekCompositeEditorTime(time);
+    if (hybridSession.previewController) {
+        void hybridSession.previewController.seek(time);
+    }
     if (center && view && scroller && hybridSession.plan) {
         const beat = beatOf(hybridSession.plan.beats, time);
         const nextScroll = clampTimelineScroll(scroller,
@@ -3015,7 +3062,8 @@ function commitCompositeTimelineZoom(dom, requestId) {
     const currentScroll = compositeTimelineVisualScrollLeft(dom);
     const anchor = Number.isFinite(Number(request.anchorX))
         ? Number(request.anchorX) : scroller.clientWidth / 2;
-    const followsLivePlayback = hybridSession.previewPlaying && S.playing
+    const followsLivePlayback = hybridSession.previewPlaying
+        && compositePreviewControllerPlaying()
         && hybridPreviewPreferences.followPlayhead && hybridSession.plan;
     const next = request.forceStart
         ? { zoom: normalizedZoom, scrollLeft: 0 }
@@ -3023,7 +3071,7 @@ function commitCompositeTimelineZoom(dom, requestId) {
             ? {
                 zoom: normalizedZoom,
                 scrollLeft: compositeTimelineCenteredScrollPure({
-                    beat: beatOf(hybridSession.plan.beats, editorPlaybackVisualTime()),
+                    beat: beatOf(hybridSession.plan.beats, compositePreviewVisualTime()),
                     context: view.context,
                     zoom: normalizedZoom,
                     viewportWidth: scroller.clientWidth,
@@ -3049,7 +3097,7 @@ function commitCompositeTimelineZoom(dom, requestId) {
     dom.maxScroll = Math.max(0, nextContentWidth - dom.viewportWidth);
     const nextScroll = clampCompositeTimelineScroll(dom, next.scrollLeft);
     const previewBeat = followsLivePlayback
-        ? beatOf(hybridSession.plan.beats, editorPlaybackVisualTime())
+        ? beatOf(hybridSession.plan.beats, compositePreviewVisualTime())
         : compositeTimelineDisplayBeatAtTime(view, hybridSession.timelineSeekTime);
     dom.playheadX = compositeTimelineXForBeatPure(previewBeat, view.context, next.zoom);
 
@@ -3094,10 +3142,10 @@ function commitCompositeTimelineDisplayMode(dom, nextMode, {
     dom.content.style.width = `${width}px`;
     dom.contentWidth = width;
     dom.maxScroll = Math.max(0, width - dom.viewportWidth);
-    const liveFollow = hybridSession.previewPlaying && S.playing
+    const liveFollow = hybridSession.previewPlaying && compositePreviewControllerPlaying()
         && hybridPreviewPreferences.followPlayhead && hybridSession.plan;
     const beat = compositeTimelineDisplayBeatAtTime(dom.view, liveFollow
-        ? editorPlaybackVisualTime() : hybridSession.timelineSeekTime);
+        ? compositePreviewVisualTime() : hybridSession.timelineSeekTime);
     const wantedScroll = normalizedMode === HYBRID_TIMELINE_DISPLAY_OVERVIEW
         ? 0
         : liveFollow
@@ -3234,18 +3282,22 @@ function updateCompositeTimelinePlayhead(frameTime = 0) {
     const scroller = dom?.scroller;
     const playhead = dom?.playhead;
     if (!view || !scroller || !playhead) return;
-    const activelyPlaying = hybridSession.previewPlaying && S.playing;
-    const playbackSettled = hybridSession.previewPlaying && !S.playing;
+    const controller = hybridSession.previewController;
+    const controllerPlaying = !!controller?.isPlaying?.();
+    const activelyPlaying = hybridSession.previewPlaying && controllerPlaying;
+    const playbackSettled = hybridSession.previewPlaying && !controllerPlaying
+        && !hybridSession.previewLoading;
     if (activelyPlaying && Number(frameTime) > 0) {
         hybridPerfFrame('timeline.playhead', frameTime);
     }
-    if (playbackSettled && Number.isFinite(Number(S.cursorTime))) {
-        // Natural completion resets the Editor transport to zero. Adopt that
-        // exact stopped position before the Hybrid animation loop ends.
-        hybridSession.timelineSeekTime = Math.max(0, Number(S.cursorTime));
+    if (playbackSettled && Number.isFinite(Number(controller?.presentationTime?.()))) {
+        // The private transport holds its exact range endpoint at natural
+        // completion, so the marker and overview stay on the last heard spot.
+        hybridSession.timelineSeekTime = Math.max(
+            0, Number(controller.presentationTime()));
     }
     const time = activelyPlaying
-        ? editorPlaybackVisualTime() : hybridSession.timelineSeekTime;
+        ? compositePreviewVisualTime() : hybridSession.timelineSeekTime;
     const beat = compositeTimelineDisplayBeatAtTime(view, time);
     const frame = compositeTimelineCameraFramePure({
         beat,
@@ -3253,9 +3305,8 @@ function updateCompositeTimelinePlayhead(frameTime = 0) {
         zoom: compositeTimelineEffectiveZoom(view, dom.viewportWidth),
         viewportWidth: dom.viewportWidth,
         visualScrollLeft: compositeTimelineVisualScrollLeft(dom),
-        // A naturally completed preview adopts the Editor's stopped cursor
-        // (normally zero). Give that one settling frame the same Follow
-        // behavior so a long-song camera and overview box return with it.
+        // Give natural completion one settling Follow frame so the overview
+        // and long-song camera land on the private transport endpoint.
         follow: (activelyPlaying || playbackSettled)
             && hybridPreviewPreferences.followPlayhead,
     });
@@ -3297,7 +3348,6 @@ function prepareCurrentReviewFocus(seek = false) {
     hybridSession.timelineFocusReview = true;
     if (seek) {
         const time = Math.max(0, timeOf(hybridSession.plan.beats, view.context.startBeat));
-        rememberCompositePreviewSession();
         seekCompositeTimelineAtTime(time);
     }
 }
@@ -3457,7 +3507,6 @@ function bindCompositeTimelineEvents() {
             compositeTimelineBeatForXPure(contentX, liveView.context,
                 compositeTimelineEffectiveZoom(liveView, boundDom.viewportWidth))));
         const time = Math.max(0, timeOf(hybridSession.plan.beats, beat));
-        rememberCompositePreviewSession();
         seekCompositeTimelineAtTime(time);
     };
     for (const slot of cameraSlots) {
@@ -3574,9 +3623,9 @@ function bindCompositeTimelineEvents() {
         const densityPassageId = densityKind === 'passage' && densityItem?.id != null
             ? String(densityItem.id) : '';
         const resumeMode = hybridSession.previewMode;
-        const resumePlaying = hybridSession.previewPlaying && S.playing;
+        const resumePlaying = hybridSession.previewPlaying
+            && compositePreviewControllerPlaying();
         const gestureStartTime = hybridSession.timelineSeekTime;
-        rememberCompositePreviewSession();
         // Pause at most once for the whole gesture. Pointer moves below only
         // update compositor transforms; one authoritative Editor seek happens
         // when the pointer is released.
@@ -3998,7 +4047,7 @@ function restoreCompositeReviewUi(toolbar, snapshot) {
 
 function refreshCompositePreviewAvailability(view) {
     const modes = new Map(compositePreviewModesPure(view, {
-        audioAvailable: !!S.audioBuffer,
+        audioAvailable: compositePreviewAudioAvailable(),
         resultReady: !!view.conflict?.resolution,
     }).map(mode => [mode.id, mode]));
     const shortcuts = { song: '1', primary: '2', secondary: '3', result: '4' };
@@ -4265,7 +4314,7 @@ async function confirmCompositeRebuild() {
 async function analyzeFromDialog() {
     if (hybridSession.analyzing) return;
     if (!(await confirmCompositeRebuild())) return;
-    restoreCompositePreviewSession();
+    disposeCompositePreviewSession();
     const config = compositeAnalysisConfigFromDialog();
     const { primaryIndex, secondaryIndex, strategy } = config;
     const experimentalEnabled = config.experimentalEnabled === true;
@@ -4325,7 +4374,7 @@ async function analyzeFromDialog() {
         const ownedLifecycle = completeHybridAnalysis(hybridSession, request);
         if (!ownedLifecycle || byId('editor-composite-modal') !== modal) return;
         if (!compositeEditorSessionIsCurrent(request.sessionId)) {
-            closeCompositeModalImmediately(modal, { restorePreview: false });
+            closeCompositeModalImmediately(modal);
         } else {
             setCompositeAnalysisUi(false);
         }
@@ -4359,7 +4408,7 @@ async function analyzeFromDialog() {
         if (!current || !ownedLifecycle || byId('editor-composite-modal') !== modal) {
             if (ownedLifecycle && byId('editor-composite-modal') === modal
                     && !compositeEditorSessionIsCurrent(request.sessionId)) {
-                closeCompositeModalImmediately(modal, { restorePreview: false });
+                closeCompositeModalImmediately(modal);
             }
             return;
         }
@@ -4403,7 +4452,6 @@ async function analyzeFromDialog() {
     hybridSession.timelineFocusPassage = false;
     hybridSession.inspectedPassageId = '';
     if (hybridSession.stage === 'review') prepareCurrentReviewFocus(true);
-    editorWarmGuidePreview(arrKind(plan.primary), { gm: selectedHybridPreviewTone().gm });
     setCompositeReviewMode(true);
     renderResult();
     scheduleCompositePreviewEventPrewarm(plan);
@@ -4442,7 +4490,7 @@ async function finishMerge() {
         completeHybridCreation(hybridSession, request);
         if (!ownedLifecycle || byId('editor-composite-modal') !== modal) return;
         if (!compositeEditorSessionIsCurrent(request.sessionId)) {
-            closeCompositeModalImmediately(modal, { restorePreview: false });
+            closeCompositeModalImmediately(modal);
         } else {
             setCompositeCreationUi(false);
             if (error) {
@@ -4496,7 +4544,7 @@ async function finishMerge() {
             completeHybridCreation(hybridSession, request);
             if (ownedLifecycle && currentModal === modal
                     && !compositeEditorSessionIsCurrent(request.sessionId)) {
-                closeCompositeModalImmediately(modal, { restorePreview: false });
+                closeCompositeModalImmediately(modal);
             } else if (ownedLifecycle && currentModal === modal) {
                 setCompositeCreationUi(false);
                 if (error) error.textContent = 'The Hybrid preview changed while the track was being prepared. Review it and try creating the track again.';
@@ -4529,7 +4577,7 @@ async function finishMerge() {
             completeHybridCreation(hybridSession, request);
             if (ownedLifecycle && byId('editor-composite-modal') === modal
                     && !compositeEditorSessionIsCurrent(request.sessionId)) {
-                closeCompositeModalImmediately(modal, { restorePreview: false });
+                closeCompositeModalImmediately(modal);
             }
             return;
         }
@@ -4557,28 +4605,13 @@ function setCompositeCreationUi(creating) {
     if (cancel) cancel.textContent = creating ? 'Cancel creation' : 'Cancel';
 }
 
-function closeCompositeModalImmediately(modal = byId('editor-composite-modal'), {
-    restorePreview = true,
-} = {}) {
+function closeCompositeModalImmediately(modal = byId('editor-composite-modal')) {
     // Commit the last slider/zoom/resize value before DOM teardown cancels its
     // event stream. This also clears every pending persistence timer.
     flushHybridPreviewPreferences();
     cancelHybridAnalysis(hybridSession);
     cancelHybridCreation(hybridSession);
-    if (restorePreview) {
-        restoreCompositePreviewSession();
-    } else {
-        // The Editor has already moved to another song. Clear only this
-        // builder's bookkeeping; seeking/stopping here could mutate the new
-        // song with the old song's preview state.
-        editorClearGuidePreview();
-        hybridSession.previewRequestId++;
-        hybridSession.previewRestore = null;
-        hybridSession.previewPlaying = false;
-        hybridSession.previewLoading = false;
-        hybridSession.previewMode = '';
-        hybridSession.previewRecordingGain = 1;
-    }
+    disposeCompositePreviewSession();
     modal?.remove();
     clearTransientState();
 }
@@ -4654,7 +4687,7 @@ function handleCompositeModalShortcut(event) {
     if (action.kind === 'stop-preview') {
         event.preventDefault();
         event.stopImmediatePropagation();
-        restoreCompositePreviewSession();
+        endCompositePreviewPlayback();
         setCompositeEditorStatus(
             'Hybrid preview stopped. Press Escape again to close the builder.');
         return;
