@@ -21,6 +21,8 @@ import {
     compositeTimelineLocalToGlobalXPure,
     compositeTimelineMapViewportPure,
     compositeTimelineMapBeatPure,
+    compositeTimelineOverviewIntervalAtBeatPure,
+    compositeTimelineOverviewIntervalIndexPure,
     compositeTimelineRenderBufferPure,
     compositeTimelineRenderGuardPure,
     compositeTimelineRenderOriginPure,
@@ -84,6 +86,50 @@ test('whole-song range starts at zero and includes audio beyond the beat grid', 
     assert.deepEqual(model.lanes.map(lane => lane.subtitle),
         ['Base track', 'Fill track', 'Hybrid result']);
     assert.equal(model.hasFillAdditions, true);
+});
+
+test('source-lane preprocessing follows immutable analysis-array identity only', () => {
+    const primary = [
+        entry('late', 4, 4.25, 0, 4),
+        entry('duplicate', 6, 6.25, 1, 5),
+        entry('duplicate', 2, 2.25, 1, 9),
+        entry('early', 1, 1.25, 2, 7),
+    ];
+    const secondary = [entry('secondary', 3, 3.25, 3, 8, 'secondary')];
+    const resultEntries = [entry('result:1', 1, 1.25)];
+    const plan = {
+        beats,
+        compatibility: { stringCount: 6 },
+        sourceEntries: { primary, secondary },
+    };
+    const build = () => buildCompositeTimelineViewModel({ plan, resultEntries });
+    const first = build();
+    const second = build();
+    assert.strictEqual(second.lanes[0].entries, first.lanes[0].entries,
+        'the same analysis-owned primary array reuses its prepared projection');
+    assert.strictEqual(second.lanes[1].entries, first.lanes[1].entries,
+        'the same analysis-owned secondary array reuses its prepared projection');
+    assert.deepEqual(first.lanes[0].entries.map(candidate => [candidate.id, candidate.fret]), [
+        ['early', 7], ['duplicate', 9], ['late', 4],
+    ], 'cached preprocessing preserves last-id-wins deduplication and exact sort order');
+    assert.notStrictEqual(second.lanes[2].entries, first.lanes[2].entries,
+        'mutable result entries are deliberately prepared for every view build');
+
+    resultEntries.push(entry('result:2', 5, 5.25));
+    const afterResultMutation = build();
+    assert.deepEqual(afterResultMutation.lanes[2].entries.map(candidate => candidate.id),
+        ['result:1', 'result:2'], 'a same-identity result array never returns a stale projection');
+
+    plan.sourceEntries.primary = primary.slice();
+    const afterSourceReplacement = build();
+    assert.notStrictEqual(afterSourceReplacement.lanes[0].entries,
+        afterResultMutation.lanes[0].entries,
+        'replacing an analysis source array rebuilds its prepared projection');
+    assert.deepEqual(afterSourceReplacement.lanes[0].entries,
+        afterResultMutation.lanes[0].entries);
+    assert.strictEqual(afterSourceReplacement.lanes[1].entries,
+        afterResultMutation.lanes[1].entries,
+        'an unchanged source array retains its independently cached projection');
 });
 
 test('display playhead beat always remains on a visible song edge', () => {
@@ -442,10 +488,149 @@ test('dense overview groups visual intervals but keeps late focused markers inte
         'a late inspected passage remains selectable');
     assert.match(map, /data-composite-map-decision-density=/);
     assert.match(map, /data-composite-map-passage-density=/);
-    assert.match(map, /Dense 20000 decision markers and 20000 passage markers are visually grouped/,
-        'the accessible description does not imply that grouped marks are individual controls');
+    assert.match(map, /data-composite-map-density-kind="decision"[^>]*pointer-events="fill"/,
+        'a delegated handler can distinguish and hit a grouped decision path');
+    assert.match(map, /data-composite-map-density-kind="passage"[^>]*pointer-events="fill"/,
+        'a delegated handler can distinguish and hit a grouped passage path');
+    assert.match(map, /Dense 20000 decision markers and 20000 passage markers are visually grouped[^<]*clicking a grouped marker opens the exact section/,
+        'the accessible description explains that grouped marks still open exact sections');
+    assert.match(map, /data-composite-map-density-state="(?:resolved|unresolved|invalid)"[^>]*aria-hidden="true"/,
+        'decorative grouped paths defer their name to the containing labelled map button');
+    assert.ok((map.match(/data-composite-map-decision-density=/g) || []).length <= 3,
+        'decision aggregation emits at most one path per visible state');
+    assert.ok((map.match(/data-composite-map-passage-density=/g) || []).length <= 6,
+        'passage aggregation emits at most one path per visible state');
     assert.ok(map.length < 250_000,
         `twenty thousand intervals should not produce unbounded markup (${map.length} chars)`);
+});
+
+test('dense overview hit index resolves overlaps, visual gaps, states, and focus deterministically', () => {
+    const decisions = [
+        { id: 'early', index: 0, startBeat: 1, endBeat: 3, state: 'unresolved' },
+        { id: 'top', index: 1, startBeat: 2, endBeat: 4, state: 'unresolved' },
+        { id: 'right', index: 2, startBeat: 6, endBeat: 7, state: 'unresolved' },
+        { id: 'resolved', index: 3, startBeat: 2, endBeat: 5, state: 'resolved' },
+        { id: 'focused', index: 4, startBeat: 2, endBeat: 5, state: 'unresolved' },
+        { id: 'other-state', index: 5, startBeat: 8, endBeat: 9, state: 'imported-new-state' },
+    ];
+    const passages = [
+        { id: 'passage:left', startBeat: 10, endBeat: 11, state: 'review' },
+        { id: 'passage:right', startBeat: 13, endBeat: 14, state: 'review' },
+        { id: 'passage:active', startBeat: 10, endBeat: 14, state: 'review', active: true },
+    ];
+    const view = { review: { id: 'focused' }, decisions, passages };
+    const index = compositeTimelineOverviewIntervalIndexPure(view);
+
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2.5, {
+        kind: 'decision', state: 'unresolved',
+    })?.id, 'top', 'later ordinary paint order wins an overlap');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 5, {
+        kind: 'decision', state: 'unresolved',
+    })?.id, 'right', 'an equal visual-gap distance selects the later painted interval');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2.5, {
+        kind: 'decision', state: 'resolved',
+    })?.id, 'resolved', 'the density marker state filters the exact target');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2.5, {
+        kind: 'decision', state: 'missing-custom-state',
+    }), null, 'an absent grouped state cannot select an unrelated marker');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 8.5, {
+        kind: 'decision', state: 'other',
+    })?.id, 'other-state', 'the literal visual fallback state remains queryable');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 12, {
+        kind: 'passage', state: 'review',
+    })?.id, 'passage:right', 'active exact markers are excluded from grouped hit testing');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(view, 2.5, {
+        kind: 'decision', state: 'unresolved',
+    })?.id, 'top', 'a view remains a correct one-off input without retaining an index');
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2, { kind: 'unknown' }),
+        null, 'unknown marker kinds fail closed');
+});
+
+test('overview interval focus exclusion mirrors rendering for falsy decision ids', () => {
+    for (const focusedId of [0, '']) {
+        const decisions = [
+            { id: focusedId, index: 0, startBeat: 1, endBeat: 3, state: 'unresolved' },
+            { id: 'ordinary', index: 1, startBeat: 5, endBeat: 6, state: 'unresolved' },
+        ];
+        const index = compositeTimelineOverviewIntervalIndexPure({
+            review: { id: focusedId },
+            decisions,
+            passages: [],
+        });
+        assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2, {
+            kind: 'decision', state: 'unresolved',
+        })?.id, 'ordinary', `focused id ${JSON.stringify(focusedId)} stays out of density hits`);
+    }
+});
+
+test('overview interval index matches brute-force marker intent on randomized overlaps', () => {
+    let seed = 0x2f6e2b1;
+    const random = () => {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed / 0x100000000;
+    };
+    const states = ['unresolved', 'resolved', 'invalid'];
+    const decisions = Array.from({ length: 600 }, (_, sourceIndex) => {
+        const startBeat = Math.floor(random() * 1200) / 8;
+        return {
+            id: `random:${sourceIndex}`,
+            index: sourceIndex,
+            startBeat,
+            endBeat: startBeat + Math.floor(random() * 96) / 8,
+            state: states[Math.floor(random() * states.length)],
+        };
+    });
+    const view = { decisions, passages: [] };
+    const index = compositeTimelineOverviewIntervalIndexPure(view);
+    const brute = (beat, state) => {
+        const candidates = decisions.filter(item => item.state === state);
+        const containing = candidates.filter(item => item.startBeat <= beat
+            && item.endBeat >= beat);
+        if (containing.length) return containing.at(-1);
+        let best = null;
+        let bestDistance = Infinity;
+        for (const item of candidates) {
+            const distance = beat < item.startBeat ? item.startBeat - beat
+                : beat > item.endBeat ? beat - item.endBeat : 0;
+            if (distance < bestDistance || (distance === bestDistance
+                    && item.index > best.index)) {
+                best = item;
+                bestDistance = distance;
+            }
+        }
+        return best;
+    };
+    for (let query = 0; query < 2_000; query++) {
+        const beat = Math.floor(random() * 1400) / 8 - 10;
+        const state = states[Math.floor(random() * states.length)];
+        assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, beat, {
+            kind: 'decision', state,
+        })?.id, brute(beat, state)?.id, `beat ${beat}, state ${state}`);
+    }
+});
+
+test('twenty-thousand-marker overview index stays below the renderer long-task regression', () => {
+    const count = 20_000;
+    const decisions = Array.from({ length: count }, (_, index) => ({
+        id: `decision:${index}`,
+        index,
+        startBeat: index * 0.75,
+        endBeat: index * 0.75 + 0.5,
+        state: index % 2 ? 'resolved' : 'unresolved',
+    }));
+    const started = performance.now();
+    const hitIndex = compositeTimelineOverviewIntervalIndexPure({ decisions, passages: [] });
+    const elapsed = performance.now() - started;
+    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(hitIndex, 14_999, {
+        kind: 'decision', state: 'resolved',
+    })?.id, 'decision:19999');
+    assert.ok(hitIndex.decision.all.starts.length <= count,
+        'the exact index stores endpoints, not a song-duration-sized lookup table');
+    // Local cold builds are about 15–45 ms and warm builds about 2–14 ms. Keep
+    // enough headroom for shared/coverage CI while still guarding against the
+    // previous 200–380 ms renderer-blocking implementation.
+    assert.ok(elapsed < 100,
+        `twenty thousand intervals should index below a long-task budget (${elapsed.toFixed(1)} ms)`);
 });
 
 test('ordinary overview counts preserve every decision and passage hit target', () => {

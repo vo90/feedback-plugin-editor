@@ -33,8 +33,17 @@ export const COMPOSITE_TIMELINE_STRIP_VIEWPORTS = 5;
 export const COMPOSITE_TIMELINE_STRIP_MAX_WIDTH = 7680;
 const RANGE_BUFFER_PX = 900;
 const ENTRY_RANGE_INDEX = new WeakMap();
+const SOURCE_ENTRY_PREPROCESSING = new WeakMap();
 const OVERVIEW_WIDTH = 1000;
 export const COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT = 512;
+const OVERVIEW_INTERVAL_INDEX_TYPE = 'composite-timeline-overview-interval-index';
+
+const OVERVIEW_MARKER_STATES = Object.freeze({
+    decision: new Set(['invalid', 'resolved', 'unresolved']),
+    passage: new Set([
+        'automatic', 'review', 'accepted', 'accepted-partial', 'declined', 'left-out',
+    ]),
+});
 
 const TIMELINE_DETAIL_LEVELS = Object.freeze({
     density: Object.freeze({
@@ -83,6 +92,21 @@ function uniqueSortedEntries(entries) {
     return [...unique.values()].sort((a, b) => finite(a.startBeat) - finite(b.startBeat)
         || finite(a.string) - finite(b.string) || finite(a.fret) - finite(b.fret)
         || String(a.id).localeCompare(String(b.id)));
+}
+
+function immutableSourceEntries(entries) {
+    if (!Array.isArray(entries)) return uniqueSortedEntries(entries);
+    const cached = SOURCE_ENTRY_PREPROCESSING.get(entries);
+    if (cached) return cached;
+    // Analysis owns sourceEntries and replaces an entire array when source
+    // material changes; resolution changes never mutate these arrays. Retain
+    // their deduplicated/sorted projection by identity so repeated review-view
+    // builds can also reuse downstream range indexes. Callers treat the cached
+    // projection as read-only. Mutable resultEntries deliberately stay on the
+    // uncached uniqueSortedEntries path below.
+    const prepared = uniqueSortedEntries(entries);
+    SOURCE_ENTRY_PREPROCESSING.set(entries, prepared);
+    return prepared;
 }
 
 function measureMarkers(beats, endBeat) {
@@ -168,8 +192,8 @@ export function buildCompositeTimelineViewModel({
     passageFocusId = '',
 } = {}) {
     if (!plan) return null;
-    const primary = uniqueSortedEntries(plan.sourceEntries?.primary || []);
-    const secondary = uniqueSortedEntries(plan.sourceEntries?.secondary || []);
+    const primary = immutableSourceEntries(plan.sourceEntries?.primary);
+    const secondary = immutableSourceEntries(plan.sourceEntries?.secondary);
     const result = uniqueSortedEntries(resultEntries);
     const hasFillAdditions = result.some(entry => entry.source === 'secondary'
         && !(entry.sources || []).includes('primary'));
@@ -861,6 +885,277 @@ export function compositeTimelineMapViewportPure(view, viewportRange) {
     return { x: lo, width: Math.max(4, hi - lo) };
 }
 
+function compositeTimelineOverviewMarkerState(kind, state) {
+    const value = String(state ?? '');
+    return OVERVIEW_MARKER_STATES[kind]?.has(value) ? value : 'other';
+}
+
+function compositeTimelineOverviewQueryState(kind, state) {
+    const value = String(state ?? '');
+    if (value === 'other') return value;
+    return OVERVIEW_MARKER_STATES[kind]?.has(value) ? value : null;
+}
+
+function overviewHeapPush(heap, value) {
+    let index = heap.length;
+    heap.push(value);
+    while (index > 0) {
+        const parent = (index - 1) >> 1;
+        if (heap[parent] >= value) break;
+        heap[index] = heap[parent];
+        index = parent;
+    }
+    heap[index] = value;
+}
+
+function overviewHeapTop(heap, active) {
+    while (heap.length && !active[heap[0]]) {
+        const tail = heap.pop();
+        if (!heap.length) break;
+        let index = 0;
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= heap.length) break;
+            const right = left + 1;
+            const child = right < heap.length && heap[right] > heap[left] ? right : left;
+            if (heap[child] <= tail) break;
+            heap[index] = heap[child];
+            index = child;
+        }
+        heap[index] = tail;
+    }
+    return heap.length ? heap[0] : -1;
+}
+
+function overviewLowerBound(values, value) {
+    let lower = 0;
+    let upper = values.length;
+    while (lower < upper) {
+        const middle = (lower + upper) >> 1;
+        if (values[middle] < value) lower = middle + 1;
+        else upper = middle;
+    }
+    return lower;
+}
+
+function overviewUpperBound(values, value) {
+    let lower = 0;
+    let upper = values.length;
+    while (lower < upper) {
+        const middle = (lower + upper) >> 1;
+        if (values[middle] <= value) lower = middle + 1;
+        else upper = middle;
+    }
+    return lower;
+}
+
+function compositeTimelineOverviewIntervalGroupIndex(records) {
+    if (!records.length) return null;
+    // Decisions and Experimental passages are normally authored in song order
+    // and do not overlap. Keep that overwhelmingly common case as compact
+    // typed arrays: it builds linearly and an upper-bound lookup is exact. A
+    // strict overlap (shared boundaries are okay) or out-of-order source falls
+    // through to the general sweep index below.
+    let orderedDisjoint = true;
+    let previousStart = -Infinity;
+    let maximumEnd = -Infinity;
+    for (const record of records) {
+        if (record.startBeat < previousStart || record.startBeat < maximumEnd) {
+            orderedDisjoint = false;
+            break;
+        }
+        previousStart = record.startBeat;
+        maximumEnd = Math.max(maximumEnd, record.endBeat);
+    }
+    if (orderedDisjoint) {
+        const starts = new Float64Array(records.length);
+        const ends = new Float64Array(records.length);
+        const sourceIndices = new Int32Array(records.length);
+        for (let index = 0; index < records.length; index++) {
+            starts[index] = records[index].startBeat;
+            ends[index] = records[index].endBeat;
+            sourceIndices[index] = records[index].sourceIndex;
+        }
+        return { orderedDisjoint: true, starts, ends, sourceIndices };
+    }
+    // General overlap path: merge two compact sorted endpoint streams. This
+    // avoids allocating Map/Set buckets for every interval and still creates
+    // the exact top-painted coverage segments required for logarithmic hits.
+    const byStart = records.slice().sort((a, b) => a.startBeat - b.startBeat
+        || a.sourceIndex - b.sourceIndex);
+    const byEnd = records.slice().sort((a, b) => a.endBeat - b.endBeat
+        || a.sourceIndex - b.sourceIndex);
+    const coordinates = [];
+    const pointWinners = [];
+    const spanWinners = [];
+    const startValues = [];
+    const startWinners = [];
+    const endValues = [];
+    const endWinners = [];
+    const active = new Uint8Array(records.at(-1).sourceIndex + 1);
+    const heap = [];
+    let startIndex = 0;
+    let endIndex = 0;
+    while (startIndex < byStart.length || endIndex < byEnd.length) {
+        const nextStart = startIndex < byStart.length
+            ? byStart[startIndex].startBeat : Infinity;
+        const nextEnd = endIndex < byEnd.length ? byEnd[endIndex].endBeat : Infinity;
+        const coordinate = Math.min(nextStart, nextEnd);
+        let startWinner = -1;
+        while (startIndex < byStart.length
+                && byStart[startIndex].startBeat === coordinate) {
+            const sourceIndex = byStart[startIndex++].sourceIndex;
+            active[sourceIndex] = 1;
+            overviewHeapPush(heap, sourceIndex);
+            startWinner = Math.max(startWinner, sourceIndex);
+        }
+        if (startWinner >= 0) {
+            startValues.push(coordinate);
+            startWinners.push(startWinner);
+        }
+        coordinates.push(coordinate);
+        pointWinners.push(overviewHeapTop(heap, active));
+        let endWinner = -1;
+        while (endIndex < byEnd.length && byEnd[endIndex].endBeat === coordinate) {
+            const sourceIndex = byEnd[endIndex++].sourceIndex;
+            active[sourceIndex] = 0;
+            endWinner = Math.max(endWinner, sourceIndex);
+        }
+        if (endWinner >= 0) {
+            endValues.push(coordinate);
+            endWinners.push(endWinner);
+        }
+        spanWinners.push(overviewHeapTop(heap, active));
+    }
+    return {
+        coordinates: Float64Array.from(coordinates),
+        pointWinners: Int32Array.from(pointWinners),
+        spanWinners: Int32Array.from(spanWinners),
+        starts: {
+            values: Float64Array.from(startValues),
+            winners: Int32Array.from(startWinners),
+        },
+        ends: {
+            values: Float64Array.from(endValues),
+            winners: Int32Array.from(endWinners),
+        },
+    };
+}
+
+function compositeTimelineOverviewKindIndex(items, kind, excluded) {
+    const records = [];
+    const groups = new Map();
+    for (let sourceIndex = 0; sourceIndex < items.length; sourceIndex++) {
+        const item = items[sourceIndex];
+        if (!item || excluded(item)) continue;
+        const startBeat = finite(item.startBeat);
+        const record = {
+            sourceIndex,
+            startBeat,
+            endBeat: Math.max(startBeat, finite(item.endBeat, startBeat)),
+        };
+        records.push(record);
+        const state = compositeTimelineOverviewMarkerState(kind, item.state);
+        if (!groups.has(state)) groups.set(state, []);
+        groups.get(state).push(record);
+    }
+    return {
+        items,
+        all: compositeTimelineOverviewIntervalGroupIndex(records),
+        states: new Map([...groups].map(([state, stateRecords]) => [
+            state, compositeTimelineOverviewIntervalGroupIndex(stateRecords),
+        ])),
+    };
+}
+
+/**
+ * Build one hit-test snapshot for the dense overview. The controller can
+ * retain this next to the rendered map and perform every pointer lookup in
+ * logarithmic time, provided it rebuilds the cache when the view changes.
+ * Focused markers are deliberately excluded because they keep their ordinary
+ * individual SVG hit targets above the density paths.
+ */
+export function compositeTimelineOverviewIntervalIndexPure(view = {}) {
+    const review = view.review;
+    return {
+        type: OVERVIEW_INTERVAL_INDEX_TYPE,
+        decision: compositeTimelineOverviewKindIndex(view.decisions || [], 'decision',
+            item => Boolean(review) && item.id === review.id),
+        passage: compositeTimelineOverviewKindIndex(view.passages || [], 'passage',
+            item => Boolean(item.active)),
+    };
+}
+
+function compositeTimelineOverviewGroupHitPure(kindIndex, group, beat) {
+    if (!group) return null;
+    const value = finite(beat);
+    if (group.orderedDisjoint) {
+        const previous = overviewUpperBound(group.starts, value) - 1;
+        if (previous >= 0 && group.ends[previous] >= value) {
+            return kindIndex.items[group.sourceIndices[previous]] || null;
+        }
+        const next = previous + 1;
+        const previousWinner = previous >= 0 ? group.sourceIndices[previous] : -1;
+        const nextWinner = next < group.starts.length ? group.sourceIndices[next] : -1;
+        if (nextWinner < 0) return kindIndex.items[previousWinner] || null;
+        if (previousWinner < 0) return kindIndex.items[nextWinner] || null;
+        const nextDistance = group.starts[next] - value;
+        const previousDistance = value - group.ends[previous];
+        const winner = nextDistance < previousDistance ? nextWinner
+            : previousDistance < nextDistance ? previousWinner
+                : Math.max(nextWinner, previousWinner);
+        return kindIndex.items[winner] || null;
+    }
+    const at = overviewLowerBound(group.coordinates, value);
+    let winner = -1;
+    if (at < group.coordinates.length && group.coordinates[at] === value) {
+        winner = group.pointWinners[at];
+    } else if (at > 0) {
+        winner = group.spanWinners[at - 1];
+    }
+    if (winner >= 0) return kindIndex.items[winner] || null;
+
+    // A density path is quantised to overview pixels, so its painted run can
+    // include a tiny visual gap between exact intervals. In that gap choose
+    // the nearest edge. Equal-distance ties select the later source item,
+    // matching SVG paint order for ordinary overlapping markers.
+    const nextStart = overviewLowerBound(group.starts.values, value);
+    const previousEnd = overviewUpperBound(group.ends.values, value) - 1;
+    const nextWinner = nextStart < group.starts.values.length
+        ? group.starts.winners[nextStart] : -1;
+    const previousWinner = previousEnd >= 0 ? group.ends.winners[previousEnd] : -1;
+    if (nextWinner < 0) return kindIndex.items[previousWinner] || null;
+    if (previousWinner < 0) return kindIndex.items[nextWinner] || null;
+    const nextDistance = group.starts.values[nextStart] - value;
+    const previousDistance = value - group.ends.values[previousEnd];
+    winner = nextDistance < previousDistance ? nextWinner
+        : previousDistance < nextDistance ? previousWinner
+            : Math.max(nextWinner, previousWinner);
+    return kindIndex.items[winner] || null;
+}
+
+/**
+ * Resolve a click on a grouped decision/passage marker to one exact interval.
+ * Pass an index returned by `compositeTimelineOverviewIntervalIndexPure` on a
+ * hot pointer path; passing a view directly is a convenient one-off fallback.
+ */
+export function compositeTimelineOverviewIntervalAtBeatPure(viewOrIndex, beat, {
+    kind = 'decision',
+    state,
+} = {}) {
+    if (kind !== 'decision' && kind !== 'passage') return null;
+    const index = viewOrIndex?.type === OVERVIEW_INTERVAL_INDEX_TYPE
+        ? viewOrIndex : compositeTimelineOverviewIntervalIndexPure(viewOrIndex);
+    const kindIndex = index[kind];
+    let group = kindIndex.all;
+    if (state != null && state !== '') {
+        const queryState = compositeTimelineOverviewQueryState(kind, state);
+        if (!queryState) return null;
+        group = kindIndex.states.get(queryState);
+    }
+    return compositeTimelineOverviewGroupHitPure(kindIndex, group, beat);
+}
+
 function compositeTimelineOverviewDensityMarkup(entries, toX, {
     width = OVERVIEW_WIDTH,
     y = 17,
@@ -869,6 +1164,7 @@ function compositeTimelineOverviewDensityMarkup(entries, toX, {
     include = () => true,
     attribute = 'data-composite-map-density="true"',
     fixedOpacity = null,
+    combineRuns = false,
 } = {}) {
     // One difference-array update per note and at most `width` output bins.
     // The overview therefore represents every note in arbitrarily large songs
@@ -888,9 +1184,15 @@ function compositeTimelineOverviewDensityMarkup(entries, toX, {
     let active = 0;
     let runStart = -1;
     let runOpacity = 0;
+    const combinedCommands = [];
     const flush = end => {
         if (runStart < 0) return;
-        runs.push(`<rect ${attribute} x="${runStart.toFixed(1)}" y="${y}" width="${Math.max(1, end - runStart).toFixed(1)}" height="${height}" rx="1" fill="${fill}" opacity="${runOpacity.toFixed(2)}"/>`);
+        const runWidth = Math.max(1, end - runStart);
+        if (combineRuns) {
+            combinedCommands.push(`M${runStart.toFixed(1)} ${y}h${runWidth.toFixed(1)}v${height}h-${runWidth.toFixed(1)}Z`);
+        } else {
+            runs.push(`<rect ${attribute} x="${runStart.toFixed(1)}" y="${y}" width="${runWidth.toFixed(1)}" height="${height}" rx="1" fill="${fill}" opacity="${runOpacity.toFixed(2)}"/>`);
+        }
         runStart = -1;
     };
     for (let bin = 0; bin < width; bin++) {
@@ -908,6 +1210,9 @@ function compositeTimelineOverviewDensityMarkup(entries, toX, {
         } else if (opacity && runStart < 0) runStart = bin;
     }
     flush(width);
+    if (combinedCommands.length) {
+        runs.push(`<path ${attribute} d="${combinedCommands.join('')}" fill="${fill}" opacity="${finite(fixedOpacity, 0.72).toFixed(2)}"/>`);
+    }
     return runs.join('');
 }
 
@@ -930,8 +1235,9 @@ function compositeTimelineOverviewGroupedIntervals(items, toX, {
             y,
             height,
             fill: colors[state] || colors.other || '#64748b',
-            attribute: `data-composite-map-${kind}-density="${escapeMarkup(state)}" aria-hidden="true"`,
+            attribute: `data-composite-map-${kind}-density="${escapeMarkup(state)}" data-composite-map-density-kind="${kind}" data-composite-map-density-state="${escapeMarkup(state)}" pointer-events="fill" style="cursor:pointer" aria-hidden="true"`,
             fixedOpacity: 0.72,
+            combineRuns: true,
         })).join('');
 }
 
@@ -991,7 +1297,7 @@ export function renderCompositeTimelineMapSvg(view, _viewportRange, _playheadBea
         : passageItems.map(passage =>
             compositeTimelineOverviewPassageMarkup(passage, x, width, passageColors)).join('');
     const groupedDescription = denseDecisions || densePassages
-        ? `. Dense ${denseDecisions ? `${decisionItems.length} decision markers` : ''}${denseDecisions && densePassages ? ' and ' : ''}${densePassages ? `${passageItems.length} passage markers` : ''} are visually grouped by position and status; focused markers remain individually selectable`
+        ? `. Dense ${denseDecisions ? `${decisionItems.length} decision markers` : ''}${denseDecisions && densePassages ? ' and ' : ''}${densePassages ? `${passageItems.length} passage markers` : ''} are visually grouped by position and status; clicking a grouped marker opens the exact section at that position, and focused markers remain individually selectable`
         : '';
     const accessibleLabel = `Whole-song Hybrid overview${groupedDescription}`;
     return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" width="100%" height="42" role="img" aria-label="${escapeMarkup(accessibleLabel)}" style="display:block">`
