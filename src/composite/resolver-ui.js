@@ -4508,15 +4508,6 @@ async function finishMerge() {
             settleStaleCreation();
             return;
         }
-        const response = await fetch('/api/plugins/editor/add-arrangement', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: request.sessionId, arrangement }),
-            signal: request.controller.signal,
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
-
         // If the user is currently deciding whether to cancel this request,
         // do not commit behind that prompt. Keeping the builder resumes this
         // exact request; discarding invalidates it before this continuation.

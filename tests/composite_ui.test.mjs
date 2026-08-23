@@ -56,7 +56,7 @@ test('continuous Hybrid preferences persist once with the latest live value', ()
 
 test('Hybrid review uses one responsive sticky toolbar instead of a side or below panel', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
-    const theme = fs.readFileSync(new URL('../assets/v3-theme.css', import.meta.url), 'utf8');
+    const theme = fs.readFileSync(new URL('../assets/composite/hybrid.css', import.meta.url), 'utf8');
     assert.match(resolver, /editor-composite-review-toolbar/);
     assert.match(resolver, /Decision details/);
     assert.match(resolver,
@@ -361,7 +361,7 @@ test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () 
         'Space or click on the active sound button toggles it off instead of restarting it');
     assert.match(resolver, /export function editorTeardownCompositeArrangementUi/);
     assert.match(main,
-        /window\.__editorScreenTeardown = \(\) => \{[\s\S]*editorTeardownCompositeArrangementUi\(\)/,
+        /window\.__editorScreenTeardown = \(\) => \{[\s\S]*hybridFeature\?\.editorTeardownCompositeArrangementUi\?\.\(\)/,
         'Editor reinjection removes the Hybrid document listener and body-mounted modal');
 });
 

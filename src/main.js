@@ -109,11 +109,6 @@ import {
     editorShowNewTrackModal
 } from './new-track.js';
 import {
-    editorHideCompositeArrangementModal, editorShowCompositeArrangementModal,
-    editorTeardownCompositeArrangementUi
-} from './composite/resolver-ui.js';
-import { installHybridPerformanceTools } from './composite/performance.js';
-import {
     _editorTogglePartsView, _partsViewDraw, _partsViewOnDblClick, _partsViewOnMouseDown,
     _partsViewRegionDelete, _partsViewRegionDrag, _partsViewRegionDrop, _refreshPartsViewButton
 } from './parts-view.js';
@@ -687,8 +682,43 @@ window.editorNewTrackSetType = editorNewTrackSetType;
 window.editorNewTrackSetInstrument = editorNewTrackSetInstrument;
 window.editorNewTrackSetSource = editorNewTrackSetSource;
 window.editorNewTrackCreate = editorNewTrackCreate;
-window.editorShowCompositeArrangementModal = editorShowCompositeArrangementModal;
-window.editorHideCompositeArrangementModal = editorHideCompositeArrangementModal;
+let _hybridFeatureModule = null;
+let _hybridFeatureImport = null;
+let _hybridFeatureGeneration = 0;
+
+function _loadHybridFeature() {
+    if (_hybridFeatureModule) return Promise.resolve(_hybridFeatureModule);
+    if (_hybridFeatureImport) return _hybridFeatureImport;
+    const pending = import('./composite/entry.js').then(module => {
+        if (_hybridFeatureImport === pending) {
+            _hybridFeatureModule = module;
+            _hybridFeatureImport = null;
+        }
+        return module;
+    }, error => {
+        if (_hybridFeatureImport === pending) _hybridFeatureImport = null;
+        throw error;
+    });
+    _hybridFeatureImport = pending;
+    return pending;
+}
+
+window.editorShowCompositeArrangementModal = async () => {
+    const generation = _hybridFeatureGeneration;
+    try {
+        const feature = await _loadHybridFeature();
+        if (generation !== _hybridFeatureGeneration) {
+            feature.editorTeardownCompositeArrangementUi?.();
+            return false;
+        }
+        return await feature.editorShowCompositeArrangementModal();
+    } catch (error) {
+        if (generation !== _hybridFeatureGeneration) return false;
+        console.error('[Editor] Hybrid Track failed to open:', error);
+        setStatus('Hybrid Track could not be opened. Reload the Editor and try again.');
+        return false;
+    }
+};
 
 // Save-format modal (file-ops.js owns the logic; HTML calls these by name).
 window.editorHideSaveFormatModal = editorHideSaveFormatModal;
@@ -892,9 +922,11 @@ window.__editorScreenTeardown = () => {
     // Unblock any awaiting session-transition prompt before its listener is
     // swept below, so a re-injection can't strand guardSessionTransition.
     try { dismissSessionPrompt(); } catch (_) {}
-    if (typeof editorTeardownCompositeArrangementUi === 'function') {
-        try { editorTeardownCompositeArrangementUi(); } catch (_) {}
-    }
+    _hybridFeatureGeneration++;
+    const hybridFeature = _hybridFeatureModule;
+    _hybridFeatureModule = null;
+    _hybridFeatureImport = null;
+    try { hybridFeature?.editorTeardownCompositeArrangementUi?.(); } catch (_) {}
     _globalListeners.removeAll();
     // Stop any playback this injection owns — the audio graph outlives the
     // DOM, so a replaced screen would otherwise keep sounding.
@@ -2288,10 +2320,6 @@ function init() {
     // this only blocks a stray double-invocation (e.g. a late boot-poll tick).
     if (_editorInited) return;
     _editorInited = true;
-    // Opt-in, local-only Hybrid diagnostics. The installer is inert unless a
-    // developer enabled it before Editor startup, so the normal player UI and
-    // runtime do not gain an observer or a window-level diagnostics surface.
-    installHybridPerformanceTools();
     _applyV3Layout();
     S.history = new EditHistory();
 
