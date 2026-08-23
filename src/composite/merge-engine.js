@@ -14,6 +14,7 @@ export const COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS = 0.001;
 export const COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS = 0.005;
 export const COMPOSITE_TIMING_TOLERANCE_BEAT_FRACTION = 0.01;
 const compositePlanResolutionRevisions = new WeakMap();
+const compositePlanResolutionIndexes = new WeakMap();
 
 // Resolution state is intentionally kept outside the plan: plans cross the
 // analysis Worker boundary and must remain structured-clone-safe. Consumers
@@ -27,6 +28,24 @@ export function compositePlanResolutionRevision(plan) {
 function markCompositePlanResolutionChanged(plan) {
     if (!plan || typeof plan !== 'object') return;
     compositePlanResolutionRevisions.set(plan, compositePlanResolutionRevision(plan) + 1);
+}
+
+/**
+ * Hybrid plans are analysis-owned snapshots: conflict/fixed arrays, entries,
+ * and the beat map remain immutable after analysis, while resolution changes
+ * go through resolveCompositeConflict/clearCompositeConflictResolution. A
+ * caller that deliberately changes any of those fields in place must call this
+ * first-class escape hatch after the edit and before another cached resolution
+ * operation.
+ *
+ * Derived indexes stay in WeakMaps, so invalidation changes no serialized plan
+ * data and Worker-cloned plans build their own index on first use.
+ */
+export function invalidateCompositeConflictResolutionIndex(plan) {
+    if (!plan || typeof plan !== 'object') return false;
+    compositePlanResolutionIndexes.delete(plan);
+    markCompositePlanResolutionChanged(plan);
+    return true;
 }
 
 function clone(value) {
@@ -570,15 +589,41 @@ function expandSelectionUnits(group, selectedEntryIds) {
     return expanded;
 }
 
-function selectionFor(group, resolution, selectedEntryIds) {
-    const available = conflictEntries(group);
-    if (resolution === 'primary') return available.filter(entry => compositeEntryHasSource(entry, 'primary'));
-    if (resolution === 'secondary') return available.filter(entry => compositeEntryHasSource(entry, 'secondary'));
+function selectionFor(group, resolution, selectedEntryIds, metadata = null) {
+    const available = metadata ? metadata.entries : conflictEntries(group);
+    if (resolution === 'primary') {
+        return metadata ? metadata.primaryEntries
+            : available.filter(entry => compositeEntryHasSource(entry, 'primary'));
+    }
+    if (resolution === 'secondary') {
+        return metadata ? metadata.secondaryEntries
+            : available.filter(entry => compositeEntryHasSource(entry, 'secondary'));
+    }
     if (resolution === 'custom') {
-        const ids = expandSelectionUnits(group, selectedEntryIds);
-        return available.filter(e => ids.has(e.id));
+        if (!metadata) {
+            const ids = expandSelectionUnits(group, selectedEntryIds);
+            return available.filter(entry => ids.has(entry.id));
+        }
+        const ids = new Set();
+        for (const entryId of selectedEntryIds || []) {
+            for (const entry of metadata.selectionUnitsByEntryId.get(entryId) || []) {
+                ids.add(entry.id);
+            }
+        }
+        return available.filter(entry => ids.has(entry.id));
     }
     return [];
+}
+
+function compositeSelectionFailure(a, b, beats, stringCount) {
+    const displayString = Math.max(1, Math.trunc(finite(stringCount, 6)) - a.string);
+    const overlapMilliseconds = Math.max(1,
+        Math.round(collisionOverlapSeconds(a, b, beats) * 1000));
+    return {
+        ok: false,
+        error: `String ${displayString} has source notes overlapping by ${overlapMilliseconds} ms.`,
+        entryIds: [a.id, b.id],
+    };
 }
 
 export function validateCompositeSelection(entries, beats = [], stringCount = 6) {
@@ -591,20 +636,256 @@ export function validateCompositeSelection(entries, beats = [], stringCount = 6)
         }
     });
     if (first) {
-        const displayString = Math.max(1,
-            Math.trunc(finite(stringCount, 6)) - first.a.string);
-        const overlapMilliseconds = Math.max(1,
-            Math.round(collisionOverlapSeconds(first.a, first.b, beats) * 1000));
-        return {
-            ok: false,
-            error: `String ${displayString} has source notes overlapping by ${overlapMilliseconds} ms.`,
-            entryIds: [first.a.id, first.b.id],
-        };
+        return compositeSelectionFailure(first.a, first.b, beats, stringCount);
     }
     return { ok: true, error: '' };
 }
 
-function entriesWithCandidateResolution(plan, currentGroup, selected) {
+function buildResolutionGroupMetadata(group, index) {
+    const entries = conflictEntries(group);
+    const entriesByPlayableGroup = new Map();
+    for (const entry of entries) {
+        if (!entry.playableGroupId) continue;
+        if (!entriesByPlayableGroup.has(entry.playableGroupId)) {
+            entriesByPlayableGroup.set(entry.playableGroupId, []);
+        }
+        entriesByPlayableGroup.get(entry.playableGroupId).push(entry);
+    }
+    const selectionUnitsByEntryId = new Map(entries.map(entry => [entry.id,
+        entry.playableGroupId ? entriesByPlayableGroup.get(entry.playableGroupId) : [entry]]));
+    return {
+        group,
+        index,
+        entries,
+        entryOrderById: new Map(entries.map((entry, entryIndex) => [entry.id, entryIndex])),
+        primaryEntries: entries.filter(entry => compositeEntryHasSource(entry, 'primary')),
+        secondaryEntries: entries.filter(entry => compositeEntryHasSource(entry, 'secondary')),
+        selectionUnitsByEntryId,
+    };
+}
+
+function resolutionGroupMetadata(index, groupIndex) {
+    if (!Number.isInteger(groupIndex) || groupIndex < 0
+            || groupIndex >= index.groupMetadata.length) return null;
+    if (!index.groupMetadata[groupIndex]) {
+        index.groupMetadata[groupIndex] = buildResolutionGroupMetadata(
+            index.conflicts[groupIndex], groupIndex);
+    }
+    return index.groupMetadata[groupIndex];
+}
+
+function compositeEntryIntervalRecord(entry, beats) {
+    const startTime = timeOf(beats, entry && entry.startBeat);
+    const endTime = timeOf(beats, entry && entry.effectiveEndBeat);
+    if (!entry || !Number.isFinite(startTime) || !Number.isFinite(endTime)
+        || !Number.isFinite(entry.string)) return null;
+    return {
+        id: entry.id,
+        string: entry.string,
+        startTime: Math.min(startTime, endTime),
+        endTime: Math.max(startTime, endTime),
+    };
+}
+
+function buildCompositeIntervalIndex(records) {
+    let sorted = true;
+    for (let index = 1; index < records.length; index++) {
+        if (records[index].startTime < records[index - 1].startTime) {
+            sorted = false;
+            break;
+        }
+    }
+    if (!sorted) {
+        records.sort((left, right) => left.startTime - right.startTime
+            || left.endTime - right.endTime || String(left.id).localeCompare(String(right.id)));
+    }
+    const starts = new Float64Array(records.length);
+    let leafBase = 1;
+    while (leafBase < records.length) leafBase *= 2;
+    const maxEnds = new Float64Array(leafBase * 2);
+    maxEnds.fill(-Infinity);
+    for (let index = 0; index < records.length; index++) {
+        starts[index] = records[index].startTime;
+        maxEnds[leafBase + index] = records[index].endTime;
+    }
+    for (let node = leafBase - 1; node > 0; node--) {
+        maxEnds[node] = Math.max(maxEnds[node * 2], maxEnds[node * 2 + 1]);
+    }
+    return { records, starts, leafBase, maxEnds };
+}
+
+function queryCompositeIntervalIndex(intervalIndex, minimum, maximum, stats, visitor) {
+    if (!intervalIndex) return;
+    const { records, starts, leafBase, maxEnds } = intervalIndex;
+    let lower = 0;
+    let upper = records.length;
+    while (lower < upper) {
+        stats.intervalIndexBinarySteps++;
+        const middle = (lower + upper) >> 1;
+        if (starts[middle] <= maximum) lower = middle + 1;
+        else upper = middle;
+    }
+    const pastLastCandidate = lower;
+    const visit = (node, start, end) => {
+        stats.intervalIndexNodesVisited++;
+        if (start >= pastLastCandidate || maxEnds[node] < minimum) return;
+        if (end - start === 1) {
+            stats.intervalIndexEntriesVisited++;
+            stats.intervalRecordsMatched++;
+            visitor(records[start].id);
+            return;
+        }
+        const middle = (start + end) >> 1;
+        visit(node * 2, start, middle);
+        if (middle < pastLastCandidate) visit(node * 2 + 1, middle, end);
+    };
+    if (pastLastCandidate) visit(1, 0, leafBase);
+    // Retain the original diagnostic name as a combined bounded-work counter
+    // while exposing its two deterministic components separately.
+    stats.intervalTreeNodesVisited = stats.intervalIndexBinarySteps
+        + stats.intervalIndexNodesVisited;
+}
+
+function compositeResolutionIntervalIndex(index, string) {
+    if (index.intervalIndexesByString.has(string)) {
+        return index.intervalIndexesByString.get(string);
+    }
+    const candidates = index.intervalEntriesByString.get(string) || [];
+    const records = [];
+    for (const entry of candidates) {
+        const record = compositeEntryIntervalRecord(entry, index.plan.beats);
+        if (record) records.push(record);
+        else {
+            index.stats.indexedEntries--;
+            index.stats.unindexedEntries++;
+        }
+    }
+    const intervalIndex = records.length ? buildCompositeIntervalIndex(records) : null;
+    index.intervalIndexesByString.set(string, intervalIndex);
+    index.stats.intervalBucketsBuilt++;
+    index.stats.intervalEntriesMaterialized += candidates.length;
+    return intervalIndex;
+}
+
+function compositeResolutionIndexIsCurrent(index, plan) {
+    return index && index.conflicts === plan.conflicts
+        && index.fixedEntries === plan.fixedEntries
+        && index.revision === compositePlanResolutionRevision(plan);
+}
+
+function addCompositeCollisionEdge(index, a, b, reason) {
+    if (!a || !b || a.id === b.id) return;
+    const key = a.id < b.id ? `${a.id}\u0000${b.id}` : `${b.id}\u0000${a.id}`;
+    if (index.collisionEdges.has(key)) return;
+    index.collisionEdges.set(key, { aId: a.id, bId: b.id, reason });
+    for (const id of [a.id, b.id]) {
+        if (!index.collisionEdgeKeysById.has(id)) index.collisionEdgeKeysById.set(id, new Set());
+        index.collisionEdgeKeysById.get(id).add(key);
+    }
+}
+
+function queryCompositePotentialActiveEntries(index, entry, visitor) {
+    const record = compositeEntryIntervalRecord(entry, index.plan.beats);
+    if (!record) {
+        for (const active of index.activeEntriesById.values()) {
+            index.stats.unindexedEntriesVisited++;
+            visitor(active);
+        }
+        return;
+    }
+    const minimum = record.startTime - COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS - 1e-9;
+    const maximum = record.endTime + COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS + 1e-9;
+    const visitedIds = new Set();
+    queryCompositeIntervalIndex(compositeResolutionIntervalIndex(index, record.string),
+        minimum, maximum, index.stats, id => {
+            if (visitedIds.has(id)) return;
+            visitedIds.add(id);
+            const active = index.activeEntriesById.get(id);
+            if (active) visitor(active);
+        });
+    for (const id of index.unindexedActiveIds) {
+        if (visitedIds.has(id)) continue;
+        const active = index.activeEntriesById.get(id);
+        if (!active) continue;
+        index.stats.unindexedEntriesVisited++;
+        visitor(active);
+    }
+}
+
+function flagCompositeAmbiguousEntryId(index, entryId) {
+    if (index.ambiguousEntryIds.has(entryId)) return;
+    index.ambiguousEntryIds.add(entryId);
+    index.hasDuplicateEntryIds = true;
+    index.stats.duplicateEntryIds++;
+}
+
+function checkCompositeCandidateEntryIds(index, entries) {
+    for (const entry of entries) {
+        index.stats.candidateOwnershipEntriesChecked++;
+        const active = index.activeEntriesById.get(entry && entry.id);
+        if (active && active !== entry) flagCompositeAmbiguousEntryId(index, entry.id);
+    }
+}
+
+function activateCompositeResolutionEntries(index, entries, ownerIndex,
+    { indexCollisions = true } = {}) {
+    for (const entry of entries) {
+        if (!entry || entry.id == null) continue;
+        index.stats.activeOwnershipEntriesChecked++;
+        const activeEntry = index.activeEntriesById.get(entry.id);
+        if (activeEntry && activeEntry !== entry) {
+            flagCompositeAmbiguousEntryId(index, entry.id);
+        }
+        if (!index.activeOwnersById.has(entry.id)) index.activeOwnersById.set(entry.id, new Set());
+        const owners = index.activeOwnersById.get(entry.id);
+        if (owners.has(ownerIndex)) continue;
+        const wasActive = owners.size > 0;
+        owners.add(ownerIndex);
+        if (wasActive) continue;
+        if (indexCollisions) {
+            queryCompositePotentialActiveEntries(index, entry, active => {
+                if (entriesShareSource(entry, active)) return;
+                index.stats.collisionPairsChecked++;
+                const reason = compositeCollisionReason(entry, active, index.plan.beats);
+                if (reason) addCompositeCollisionEdge(index, entry, active, reason);
+            });
+        }
+        index.activeEntriesById.set(entry.id, entry);
+        if (!compositeEntryIntervalRecord(entry, index.plan.beats)) {
+            index.unindexedActiveIds.add(entry.id);
+        }
+    }
+}
+
+function deactivateCompositeResolutionEntries(index, entries, ownerIndex) {
+    for (const entry of entries) {
+        const owners = index.activeOwnersById.get(entry && entry.id);
+        if (!owners || !owners.delete(ownerIndex) || owners.size) continue;
+        index.activeOwnersById.delete(entry.id);
+        index.activeEntriesById.delete(entry.id);
+        index.unindexedActiveIds.delete(entry.id);
+        for (const edgeKey of index.collisionEdgeKeysById.get(entry.id) || []) {
+            const edge = index.collisionEdges.get(edgeKey);
+            if (!edge) continue;
+            index.collisionEdges.delete(edgeKey);
+            const otherId = edge.aId === entry.id ? edge.bId : edge.aId;
+            const otherKeys = index.collisionEdgeKeysById.get(otherId);
+            if (otherKeys) {
+                otherKeys.delete(edgeKey);
+                if (!otherKeys.size) index.collisionEdgeKeysById.delete(otherId);
+            }
+        }
+        index.collisionEdgeKeysById.delete(entry.id);
+    }
+}
+
+function selectedCompositeResolutionEntries(metadata) {
+    if (!metadata.group.resolution) return [];
+    const ids = new Set(metadata.group.selectedEntryIds || []);
+    return metadata.entries.filter(entry => ids.has(entry.id));
+}
+
+function entriesWithLegacyCandidateResolution(plan, currentGroup, selected) {
     const entries = [...(plan.fixedEntries || []), ...selected];
     for (const group of plan.conflicts || []) {
         if (group === currentGroup || !group.resolution) continue;
@@ -616,18 +897,14 @@ function entriesWithCandidateResolution(plan, currentGroup, selected) {
     return [...unique.values()];
 }
 
-export function resolveCompositeConflict(plan, conflictId, resolution, selectedEntryIds = []) {
-    const group = plan && plan.conflicts && plan.conflicts.find(c => c.id === conflictId);
-    if (!group) return { ok: false, error: 'Review section not found.' };
-    if (!['primary', 'secondary', 'custom'].includes(resolution)) {
-        return { ok: false, error: 'Unknown review choice.' };
-    }
-    const selected = selectionFor(group, resolution, selectedEntryIds);
-    const validation = validateCompositeSelection(
-        entriesWithCandidateResolution(plan, group, selected),
-        plan.beats,
-        plan.compatibility && plan.compatibility.stringCount,
-    );
+function resolveCompositeConflictWithLegacyValidation(plan, index, metadata,
+    resolution, selected) {
+    index.stats.legacyValidationAttempts++;
+    const group = metadata.group;
+    const wasResolved = Boolean(group.resolution);
+    const validation = validateCompositeSelection(entriesWithLegacyCandidateResolution(
+        plan, group, selected), plan.beats,
+        plan.compatibility && plan.compatibility.stringCount);
     const selectedIds = new Set(selected.map(entry => entry.id));
     const crossesBlockBoundary = !validation.ok && (validation.entryIds || [])
         .some(entryId => !selectedIds.has(entryId));
@@ -637,26 +914,288 @@ export function resolveCompositeConflict(plan, conflictId, resolution, selectedE
     if (!validation.ok) {
         group.resolution = null;
         group.selectedEntryIds = [];
-        plan.stats.unresolvedConflicts = plan.conflicts.filter(c => !c.resolution).length;
-        markCompositePlanResolutionChanged(plan);
+        if (wasResolved) index.unresolvedCount++;
+        commitCompositeResolutionMutation(plan, index);
+        return validation;
+    }
+    group.resolution = resolution;
+    group.selectedEntryIds = selected.map(entry => entry.id);
+    if (!wasResolved) index.unresolvedCount--;
+    commitCompositeResolutionMutation(plan, index);
+    return { ok: true, selected: selected.slice() };
+}
+
+function buildCompositeResolutionIndex(plan) {
+    const conflicts = Array.isArray(plan && plan.conflicts) ? plan.conflicts : [];
+    const fixedEntries = Array.isArray(plan && plan.fixedEntries) ? plan.fixedEntries : [];
+    const groupMetadata = new Array(conflicts.length);
+    const resolvedGroupIndexes = [];
+    const groupIndexById = new Map();
+    const intervalEntriesByString = new Map();
+    let indexedEntryCount = 0;
+    let unindexedEntryCount = 0;
+    const classifyEntry = entry => {
+        if (!entry || !Number.isFinite(entry.string)
+                || !Number.isFinite(entry.startBeat)
+                || !Number.isFinite(entry.effectiveEndBeat)) {
+            unindexedEntryCount++;
+            return;
+        }
+        indexedEntryCount++;
+        let entries = intervalEntriesByString.get(entry.string);
+        if (!entries) {
+            entries = [];
+            intervalEntriesByString.set(entry.string, entries);
+        }
+        entries.push(entry);
+    };
+    // The interval structure is only a spatial accelerator, so raw inactive
+    // candidates remain compact. Active fixed/resolved ownership is checked as
+    // it is registered below, and every future candidate is checked against it
+    // before localized validation. Any ambiguous id permanently moves this
+    // malformed plan to conservative legacy whole-selection validation.
+    for (const entry of fixedEntries) classifyEntry(entry);
+    let unresolvedCount = 0;
+    for (let groupIndex = 0; groupIndex < conflicts.length; groupIndex++) {
+        const group = conflicts[groupIndex];
+        if (group.resolution) resolvedGroupIndexes.push(groupIndex);
+        else unresolvedCount++;
+        // Preserve the legacy Array.find behavior for malformed/restored plans
+        // containing duplicate conflict ids.
+        if (!groupIndexById.has(group.id)) groupIndexById.set(group.id, groupIndex);
+        for (const entry of group.primaryEntries || []) classifyEntry(entry);
+        for (const entry of group.secondaryEntries || []) classifyEntry(entry);
+    }
+    const intervalIndexesByString = new Map();
+    const fixedOrderById = new Map();
+    for (const entry of fixedEntries) {
+        if (!fixedOrderById.has(entry.id)) fixedOrderById.set(entry.id, fixedOrderById.size);
+    }
+    const index = {
+        plan,
+        conflicts: plan.conflicts,
+        fixedEntries: plan.fixedEntries,
+        revision: compositePlanResolutionRevision(plan),
+        groupMetadata,
+        groupIndexById,
+        fixedOrderById,
+        intervalEntriesByString,
+        intervalIndexesByString,
+        hasDuplicateEntryIds: false,
+        ambiguousEntryIds: new Set(),
+        unindexedActiveIds: new Set(),
+        activeEntriesById: new Map(),
+        activeOwnersById: new Map(),
+        selectedEntriesByGroupIndex: new Map(),
+        collisionEdges: new Map(),
+        collisionEdgeKeysById: new Map(),
+        unresolvedCount,
+        stats: {
+            indexBuilds: 1,
+            duplicateEntryIds: 0,
+            nonStringEntryIds: 0,
+            activeOwnershipEntriesChecked: 0,
+            candidateOwnershipEntriesChecked: 0,
+            legacyValidationAttempts: 0,
+            indexedEntries: indexedEntryCount,
+            unindexedEntries: unindexedEntryCount,
+            resolutionAttempts: 0,
+            candidateEntriesVisited: 0,
+            intervalTreeNodesVisited: 0,
+            intervalIndexBinarySteps: 0,
+            intervalIndexNodesVisited: 0,
+            intervalIndexEntriesVisited: 0,
+            intervalBucketsBuilt: 0,
+            intervalEntriesMaterialized: 0,
+            intervalRecordsMatched: 0,
+            unindexedEntriesVisited: 0,
+            collisionPairsChecked: 0,
+            existingCollisionPairsVisited: 0,
+        },
+    };
+    activateCompositeResolutionEntries(index, fixedEntries, -1, { indexCollisions: false });
+    for (const groupIndex of resolvedGroupIndexes) {
+        const metadata = resolutionGroupMetadata(index, groupIndex);
+        const selected = selectedCompositeResolutionEntries(metadata);
+        index.selectedEntriesByGroupIndex.set(metadata.index, selected);
+        activateCompositeResolutionEntries(index, selected, metadata.index,
+            { indexCollisions: false });
+    }
+    const activeEntries = [...index.activeEntriesById.values()];
+    forEachCompositeSelectionCollision(activeEntries, plan.beats, (a, b, reason) => {
+        index.stats.collisionPairsChecked++;
+        addCompositeCollisionEdge(index, a, b, reason);
+    });
+    compositePlanResolutionIndexes.set(plan, index);
+    return index;
+}
+
+function compositeResolutionIndex(plan) {
+    const cached = compositePlanResolutionIndexes.get(plan);
+    return compositeResolutionIndexIsCurrent(cached, plan)
+        ? cached : buildCompositeResolutionIndex(plan);
+}
+
+// Build the private index during idle time without changing any plan field or
+// its resolution revision. The resolver can call this opportunistically so the
+// first player choice does not pay the one-time indexing cost.
+export function prewarmCompositeConflictResolutionIndex(plan) {
+    if (!plan || typeof plan !== 'object') return false;
+    compositeResolutionIndex(plan);
+    return true;
+}
+
+function compareCompositeOrderKeys(left, right) {
+    for (let index = 0; index < Math.max(left.length, right.length); index++) {
+        const difference = finite(left[index]) - finite(right[index]);
+        if (difference) return difference;
+    }
+    return 0;
+}
+
+function compositeResolutionEntryOrderKey(index, candidateOrderById, entry) {
+    if (index.fixedOrderById.has(entry.id)) return [0, index.fixedOrderById.get(entry.id), 0];
+    if (candidateOrderById.has(entry.id)) return [1, candidateOrderById.get(entry.id), 0];
+    const owners = index.activeOwnersById.get(entry.id) || [];
+    let ownerIndex = Infinity;
+    for (const owner of owners) if (owner >= 0) ownerIndex = Math.min(ownerIndex, owner);
+    const metadata = resolutionGroupMetadata(index, ownerIndex);
+    return [2, ownerIndex,
+        metadata ? finite(metadata.entryOrderById.get(entry.id), Infinity) : Infinity];
+}
+
+function validateCompositeResolutionCandidate(index, metadata, selected) {
+    const candidateOrderById = new Map();
+    for (const entry of selected) {
+        if (!candidateOrderById.has(entry.id)) candidateOrderById.set(entry.id, candidateOrderById.size);
+    }
+    let first = null;
+    const consider = (a, b, reason) => {
+        const aKey = compositeResolutionEntryOrderKey(index, candidateOrderById, a);
+        const bKey = compositeResolutionEntryOrderKey(index, candidateOrderById, b);
+        const ordered = compareCompositeOrderKeys(aKey, bKey) <= 0
+            ? { a, b, aKey, bKey, reason } : { a: b, b: a, aKey: bKey, bKey: aKey, reason };
+        if (!first || compareCompositeOrderKeys(ordered.aKey, first.aKey) < 0
+            || compareCompositeOrderKeys(ordered.aKey, first.aKey) === 0
+                && compareCompositeOrderKeys(ordered.bKey, first.bKey) < 0) first = ordered;
+    };
+    for (const edge of index.collisionEdges.values()) {
+        index.stats.existingCollisionPairsVisited++;
+        const a = index.activeEntriesById.get(edge.aId);
+        const b = index.activeEntriesById.get(edge.bId);
+        if (a && b) consider(a, b, edge.reason);
+    }
+    forEachCompositeSelectionCollision(selected, index.plan.beats, (a, b, reason) => {
+        index.stats.collisionPairsChecked++;
+        consider(a, b, reason);
+    });
+    for (const entry of selected) {
+        index.stats.candidateEntriesVisited++;
+        queryCompositePotentialActiveEntries(index, entry, active => {
+            if (active.id === entry.id || entriesShareSource(entry, active)) return;
+            index.stats.collisionPairsChecked++;
+            const reason = compositeCollisionReason(entry, active, index.plan.beats);
+            if (reason) consider(entry, active, reason);
+        });
+    }
+    if (!first) return { ok: true, error: '' };
+    return compositeSelectionFailure(first.a, first.b, index.plan.beats,
+        index.plan.compatibility && index.plan.compatibility.stringCount);
+}
+
+function commitCompositeResolutionMutation(plan, index) {
+    if (plan.stats) plan.stats.unresolvedConflicts = index.unresolvedCount;
+    markCompositePlanResolutionChanged(plan);
+    index.revision = compositePlanResolutionRevision(plan);
+}
+
+export function compositeConflictResolutionDiagnostics(plan) {
+    const index = compositePlanResolutionIndexes.get(plan);
+    if (!index || !compositeResolutionIndexIsCurrent(index, plan)) return null;
+    return {
+        ...index.stats,
+        activeEntries: index.activeEntriesById.size,
+        unresolvedConflicts: index.unresolvedCount,
+        collisionEdges: index.collisionEdges.size,
+    };
+}
+
+export function resolveCompositeConflict(plan, conflictId, resolution, selectedEntryIds = []) {
+    if (!plan || typeof plan !== 'object') {
+        return { ok: false, error: 'Review section not found.' };
+    }
+    const index = compositeResolutionIndex(plan);
+    const groupIndex = index.groupIndexById.get(conflictId);
+    const metadata = Number.isInteger(groupIndex)
+        ? resolutionGroupMetadata(index, groupIndex) : null;
+    const group = metadata && metadata.group;
+    if (!group) return { ok: false, error: 'Review section not found.' };
+    if (!['primary', 'secondary', 'custom'].includes(resolution)) {
+        return { ok: false, error: 'Unknown review choice.' };
+    }
+    index.stats.resolutionAttempts++;
+    const selected = selectionFor(group, resolution, selectedEntryIds, metadata);
+    checkCompositeCandidateEntryIds(index, selected);
+    if (index.hasDuplicateEntryIds) {
+        return resolveCompositeConflictWithLegacyValidation(
+            plan, index, metadata, resolution, selected);
+    }
+    const previousSelected = index.selectedEntriesByGroupIndex.get(metadata.index) || [];
+    const wasResolved = !!group.resolution;
+    deactivateCompositeResolutionEntries(index, previousSelected, metadata.index);
+    index.selectedEntriesByGroupIndex.set(metadata.index, []);
+    const validation = validateCompositeResolutionCandidate(index, metadata, selected);
+    const selectedIds = new Set(selected.map(entry => entry.id));
+    const crossesBlockBoundary = !validation.ok && (validation.entryIds || [])
+        .some(entryId => !selectedIds.has(entryId));
+    group.validationKind = crossesBlockBoundary ? 'transition' : validation.ok ? '' : 'selection';
+    group.validationError = crossesBlockBoundary
+        ? `Transition conflict: ${validation.error}` : validation.error;
+    if (!validation.ok) {
+        group.resolution = null;
+        group.selectedEntryIds = [];
+        if (wasResolved) index.unresolvedCount++;
+        commitCompositeResolutionMutation(plan, index);
         return validation;
     }
     group.resolution = resolution;
     group.selectedEntryIds = selected.map(e => e.id);
-    plan.stats.unresolvedConflicts = plan.conflicts.filter(c => !c.resolution).length;
-    markCompositePlanResolutionChanged(plan);
-    return { ok: true, selected };
+    const committedSelected = selected.slice();
+    index.selectedEntriesByGroupIndex.set(metadata.index, committedSelected);
+    activateCompositeResolutionEntries(index, committedSelected,
+        metadata.index, { indexCollisions: false });
+    if (!wasResolved) index.unresolvedCount--;
+    commitCompositeResolutionMutation(plan, index);
+    return { ok: true, selected: selected.slice() };
 }
 
 export function clearCompositeConflictResolution(plan, conflictId) {
-    const group = plan && plan.conflicts && plan.conflicts.find(c => c.id === conflictId);
+    if (!plan || typeof plan !== 'object') return { ok: false, error: 'Conflict not found.' };
+    const index = compositeResolutionIndex(plan);
+    const groupIndex = index.groupIndexById.get(conflictId);
+    const metadata = Number.isInteger(groupIndex)
+        ? resolutionGroupMetadata(index, groupIndex) : null;
+    const group = metadata && metadata.group;
     if (!group) return { ok: false, error: 'Conflict not found.' };
+    const wasResolved = !!group.resolution;
+    if (index.hasDuplicateEntryIds) {
+        group.resolution = null;
+        group.selectedEntryIds = [];
+        group.validationError = '';
+        group.validationKind = '';
+        if (wasResolved) index.unresolvedCount++;
+        commitCompositeResolutionMutation(plan, index);
+        return { ok: true };
+    }
+    const selected = index.selectedEntriesByGroupIndex.get(metadata.index) || [];
+    deactivateCompositeResolutionEntries(index, selected, metadata.index);
+    index.selectedEntriesByGroupIndex.set(metadata.index, []);
     group.resolution = null;
     group.selectedEntryIds = [];
     group.validationError = '';
     group.validationKind = '';
-    plan.stats.unresolvedConflicts = plan.conflicts.filter(c => !c.resolution).length;
-    markCompositePlanResolutionChanged(plan);
+    if (wasResolved) index.unresolvedCount++;
+    commitCompositeResolutionMutation(plan, index);
     return { ok: true };
 }
 

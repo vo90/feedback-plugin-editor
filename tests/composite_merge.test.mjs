@@ -7,8 +7,12 @@ import {
     COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS,
     compositeCompatibility,
     compositeCollisionReason,
+    compositeConflictResolutionDiagnostics,
+    compositePlanResolutionRevision,
     compositeTimingToleranceSeconds,
+    invalidateCompositeConflictResolutionIndex,
     materializeCompositeArrangement,
+    prewarmCompositeConflictResolutionIndex,
     prepareCompositeSources,
     resolveCompositeConflict,
     validateCompositeSelection,
@@ -437,6 +441,129 @@ function legacyFirstCollision(entries, timeline) {
     return null;
 }
 
+function referenceConflictEntries(group) {
+    const unique = new Map();
+    for (const entry of [...(group.primaryEntries || []), ...(group.secondaryEntries || [])]) {
+        unique.set(entry.id, entry);
+    }
+    return [...unique.values()];
+}
+
+function referenceConflictSelection(group, resolution, selectedEntryIds) {
+    const available = referenceConflictEntries(group);
+    if (resolution === 'primary' || resolution === 'secondary') {
+        return available.filter(entry => entrySources(entry).has(resolution));
+    }
+    const requested = new Set(selectedEntryIds || []);
+    const playableGroups = new Set(available.filter(entry => requested.has(entry.id))
+        .map(entry => entry.playableGroupId).filter(Boolean));
+    return available.filter(entry => requested.has(entry.id)
+        || entry.playableGroupId && playableGroups.has(entry.playableGroupId));
+}
+
+function referenceResolveConflict(plan, conflictId, resolution, selectedEntryIds = []) {
+    const group = plan.conflicts.find(candidate => candidate.id === conflictId);
+    if (!group) return { ok: false, error: 'Review section not found.' };
+    if (!['primary', 'secondary', 'custom'].includes(resolution)) {
+        return { ok: false, error: 'Unknown review choice.' };
+    }
+    const selected = referenceConflictSelection(group, resolution, selectedEntryIds);
+    const entries = [...plan.fixedEntries, ...selected];
+    for (const other of plan.conflicts) {
+        if (other === group || !other.resolution) continue;
+        const ids = new Set(other.selectedEntryIds || []);
+        entries.push(...referenceConflictEntries(other).filter(entry => ids.has(entry.id)));
+    }
+    const unique = new Map();
+    for (const entry of entries) unique.set(entry.id, entry);
+    const validation = validateCompositeSelection([...unique.values()], plan.beats,
+        plan.compatibility.stringCount);
+    const selectedIds = new Set(selected.map(entry => entry.id));
+    const transition = !validation.ok && validation.entryIds
+        .some(entryId => !selectedIds.has(entryId));
+    group.validationKind = transition ? 'transition' : validation.ok ? '' : 'selection';
+    group.validationError = transition ? `Transition conflict: ${validation.error}` : validation.error;
+    if (!validation.ok) {
+        group.resolution = null;
+        group.selectedEntryIds = [];
+        plan.stats.unresolvedConflicts = plan.conflicts.filter(candidate => !candidate.resolution).length;
+        return validation;
+    }
+    group.resolution = resolution;
+    group.selectedEntryIds = selected.map(entry => entry.id);
+    plan.stats.unresolvedConflicts = plan.conflicts.filter(candidate => !candidate.resolution).length;
+    return { ok: true, selected };
+}
+
+function referenceClearConflict(plan, conflictId) {
+    const group = plan.conflicts.find(candidate => candidate.id === conflictId);
+    if (!group) return { ok: false, error: 'Conflict not found.' };
+    group.resolution = null;
+    group.selectedEntryIds = [];
+    group.validationError = '';
+    group.validationKind = '';
+    plan.stats.unresolvedConflicts = plan.conflicts.filter(candidate => !candidate.resolution).length;
+    return { ok: true };
+}
+
+function resolutionResultShape(result) {
+    return {
+        ok: result.ok,
+        error: result.error || '',
+        entryIds: result.entryIds || [],
+        selectedEntryIds: (result.selected || []).map(entry => entry.id),
+    };
+}
+
+function resolutionStateShape(plan) {
+    return {
+        unresolved: plan.stats.unresolvedConflicts,
+        conflicts: plan.conflicts.map(group => ({
+            id: group.id,
+            resolution: group.resolution,
+            selectedEntryIds: group.selectedEntryIds,
+            validationKind: group.validationKind,
+            validationError: group.validationError,
+        })),
+    };
+}
+
+function resolutionFixtureEntry(id, source, startBeat, fret) {
+    return {
+        id,
+        source,
+        sources: [source],
+        startBeat,
+        endBeat: startBeat + 1,
+        effectiveEndBeat: startBeat + 1,
+        string: 0,
+        fret,
+    };
+}
+
+function resolutionFixtureConflict(id, { primaryEntries = [], secondaryEntries = [] } = {}) {
+    return {
+        id,
+        primaryEntries,
+        secondaryEntries,
+        resolution: null,
+        selectedEntryIds: [],
+        validationKind: '',
+        validationError: '',
+    };
+}
+
+function resolutionFixturePlan(conflicts, fixedEntries = []) {
+    return {
+        ok: true,
+        beats: [],
+        compatibility: { stringCount: 6 },
+        fixedEntries,
+        conflicts,
+        stats: { unresolvedConflicts: conflicts.filter(group => !group.resolution).length },
+    };
+}
+
 test('indexed selection validation preserves exhaustive first-conflict ordering', () => {
     let state = 0x5eed1234;
     const random = () => {
@@ -470,6 +597,384 @@ test('indexed selection validation preserves exhaustive first-conflict ordering'
         const actual = validateCompositeSelection(entries, beats);
         assert.deepEqual(actual.ok ? null : actual.entryIds, expected, `sample ${sample}`);
     }
+});
+
+test('localized conflict resolution matches whole-song validation through random out-of-order edits', () => {
+    let state = 0xc0111de5;
+    const observedValidationKinds = new Set();
+    const random = () => {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        return state / 0x100000000;
+    };
+    const randomEntry = (id, source) => {
+        const startBeat = Math.floor(random() * 160) / 8;
+        const duration = random() < 0.35 ? 0 : Math.floor(random() * 24) / 8;
+        return {
+            id,
+            source,
+            sources: [source],
+            startBeat,
+            endBeat: startBeat + duration,
+            effectiveEndBeat: startBeat + Math.max(duration, 1e-4),
+            string: Math.floor(random() * 3),
+            fret: Math.floor(random() * 13),
+        };
+    };
+    for (let sample = 0; sample < 30; sample++) {
+        const fixedEntries = Array.from({ length: 8 }, (_, index) =>
+            randomEntry(`fixed:${sample}:${index}`, 'primary'));
+        const conflicts = Array.from({ length: 18 }, (_, groupIndex) => {
+            const playableGroupId = `gesture:${sample}:${groupIndex}`;
+            const primaryEntries = Array.from({ length: 1 + (random() < 0.3 ? 1 : 0) },
+                (_, entryIndex) => ({
+                    ...randomEntry(`primary:${sample}:${groupIndex}:${entryIndex}`, 'primary'),
+                    playableGroupId: entryIndex === 0 && random() < 0.25 ? playableGroupId : undefined,
+                }));
+            const secondaryEntries = Array.from({ length: 1 + (random() < 0.3 ? 1 : 0) },
+                (_, entryIndex) => ({
+                    ...randomEntry(`secondary:${sample}:${groupIndex}:${entryIndex}`, 'secondary'),
+                    playableGroupId: entryIndex === 0 && random() < 0.25 ? playableGroupId : undefined,
+                }));
+            return {
+                id: `conflict:${sample}:${groupIndex}`,
+                primaryEntries,
+                secondaryEntries,
+                resolution: null,
+                selectedEntryIds: [],
+                validationKind: '',
+                validationError: '',
+            };
+        });
+        const initial = {
+            ok: true,
+            beats: [],
+            compatibility: { stringCount: 6 },
+            fixedEntries,
+            conflicts,
+            stats: { unresolvedConflicts: conflicts.length },
+        };
+        const localized = structuredClone(initial);
+        const reference = structuredClone(initial);
+        for (let operation = 0; operation < 90; operation++) {
+            const groupIndex = Math.floor(random() * conflicts.length);
+            const localizedGroup = localized.conflicts[groupIndex];
+            const referenceGroup = reference.conflicts[groupIndex];
+            if (random() < 0.2) {
+                assert.deepEqual(clearCompositeConflictResolution(localized, localizedGroup.id),
+                    referenceClearConflict(reference, referenceGroup.id),
+                    `clear sample ${sample}, operation ${operation}`);
+            } else {
+                const resolution = ['primary', 'secondary', 'custom'][Math.floor(random() * 3)];
+                const available = referenceConflictEntries(referenceGroup);
+                const selectedIds = available.filter(() => random() < 0.5).map(entry => entry.id);
+                const actual = resolveCompositeConflict(localized, localizedGroup.id,
+                    resolution, selectedIds);
+                const expected = referenceResolveConflict(reference, referenceGroup.id,
+                    resolution, selectedIds);
+                assert.deepEqual(resolutionResultShape(actual), resolutionResultShape(expected),
+                    `resolve sample ${sample}, operation ${operation}`);
+            }
+            if (localizedGroup.validationKind) {
+                observedValidationKinds.add(localizedGroup.validationKind);
+            }
+            assert.deepEqual(resolutionStateShape(localized), resolutionStateShape(reference),
+                `state sample ${sample}, operation ${operation}`);
+        }
+    }
+    assert.deepEqual([...observedValidationKinds].sort(), ['selection', 'transition']);
+});
+
+test('returned selections cannot mutate the private active-resolution index', () => {
+    const first = resolutionFixtureConflict('first', {
+        primaryEntries: [
+            resolutionFixtureEntry('first:early', 'primary', 0, 3),
+            resolutionFixtureEntry('first:late', 'primary', 10, 5),
+        ],
+    });
+    const second = resolutionFixtureConflict('second', {
+        secondaryEntries: [resolutionFixtureEntry('second:late', 'secondary', 10, 7)],
+    });
+    const plan = resolutionFixturePlan([first, second]);
+
+    const resolved = resolveCompositeConflict(plan, first.id, 'primary');
+    assert.equal(resolved.ok, true);
+    assert.deepEqual(resolved.selected.map(entry => entry.id), ['first:early', 'first:late']);
+    resolved.selected.pop();
+    assert.deepEqual(first.selectedEntryIds, ['first:early', 'first:late'],
+        'the public result is not the index-owned selection array');
+
+    assert.equal(clearCompositeConflictResolution(plan, first.id).ok, true);
+    assert.equal(compositeConflictResolutionDiagnostics(plan).activeEntries, 0,
+        'clearing deactivates every privately stored entry despite caller mutation');
+    assert.equal(resolveCompositeConflict(plan, second.id, 'secondary').ok, true,
+        'no popped entry remains behind as a ghost collision');
+});
+
+test('explicit invalidation adopts deliberate in-place resolution mutations', () => {
+    const first = resolutionFixtureConflict('first', {
+        primaryEntries: [resolutionFixtureEntry('first:note', 'primary', 4, 3)],
+    });
+    const second = resolutionFixtureConflict('second', {
+        secondaryEntries: [resolutionFixtureEntry('second:note', 'secondary', 4, 7)],
+    });
+    const plan = resolutionFixturePlan([first, second]);
+    assert.equal(resolveCompositeConflict(plan, first.id, 'primary').ok, true);
+
+    // This is deliberately outside the supported resolve/clear ownership path.
+    first.resolution = null;
+    first.selectedEntryIds = [];
+    plan.stats.unresolvedConflicts = 2;
+    const revision = compositePlanResolutionRevision(plan);
+    assert.equal(invalidateCompositeConflictResolutionIndex(plan), true);
+    assert.equal(compositePlanResolutionRevision(plan), revision + 1);
+    assert.equal(compositeConflictResolutionDiagnostics(plan), null,
+        'the stale active-entry index is discarded immediately');
+
+    assert.equal(resolveCompositeConflict(plan, second.id, 'secondary').ok, true);
+    assert.equal(first.resolution, null);
+    assert.equal(second.resolution, 'secondary');
+    assert.equal(plan.stats.unresolvedConflicts, 1);
+    assert.equal(invalidateCompositeConflictResolutionIndex(null), false);
+});
+
+test('duplicate conflict ids retain legacy first-match resolution semantics', () => {
+    const first = resolutionFixtureConflict('duplicate', {
+        primaryEntries: [resolutionFixtureEntry('first:note', 'primary', 0, 3)],
+    });
+    const second = resolutionFixtureConflict('duplicate', {
+        primaryEntries: [resolutionFixtureEntry('second:note', 'primary', 8, 5)],
+    });
+    const plan = resolutionFixturePlan([first, second]);
+    const result = resolveCompositeConflict(plan, 'duplicate', 'primary');
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.selected.map(entry => entry.id), ['first:note']);
+    assert.equal(first.resolution, 'primary');
+    assert.equal(second.resolution, null);
+    assert.equal(plan.stats.unresolvedConflicts, 1);
+});
+
+test('duplicate possible-entry ids cannot create false localized spatial collisions', () => {
+    for (const activeStartBeat of [0, 10]) {
+        const activeEntry = resolutionFixtureEntry('shared:note', 'primary', activeStartBeat, 3);
+        const shadowEntry = resolutionFixtureEntry('shared:note', 'primary',
+            activeStartBeat === 0 ? 10 : 0, 3);
+        const candidateEntry = resolutionFixtureEntry('candidate:note', 'secondary', 10, 7);
+        const active = resolutionFixtureConflict('active', { primaryEntries: [activeEntry] });
+        active.resolution = 'primary';
+        active.selectedEntryIds = [activeEntry.id];
+        const shadow = resolutionFixtureConflict('shadow', { primaryEntries: [shadowEntry] });
+        const candidate = resolutionFixtureConflict('candidate', {
+            secondaryEntries: [candidateEntry],
+        });
+        const initial = resolutionFixturePlan([active, shadow, candidate]);
+        const localized = structuredClone(initial);
+        const reference = structuredClone(initial);
+        const actual = resolveCompositeConflict(localized, 'candidate', 'secondary');
+        const expected = referenceResolveConflict(reference, 'candidate', 'secondary');
+        assert.deepEqual(resolutionResultShape(actual), resolutionResultShape(expected),
+            `active duplicate at beat ${activeStartBeat}`);
+        assert.deepEqual(resolutionStateShape(localized), resolutionStateShape(reference));
+    }
+});
+
+test('fixed duplicate ids use exact legacy ordering instead of localized ownership', () => {
+    const fixedEarly = resolutionFixtureEntry('fixed:shared', 'primary', 0, 3);
+    const fixedLate = resolutionFixtureEntry('fixed:shared', 'primary', 10, 5);
+    const candidate = resolutionFixtureConflict('candidate', {
+        secondaryEntries: [resolutionFixtureEntry('candidate:note', 'secondary', 10, 7)],
+    });
+    const initial = resolutionFixturePlan([candidate], [fixedEarly, fixedLate]);
+    const localized = structuredClone(initial);
+    const reference = structuredClone(initial);
+    const actual = resolveCompositeConflict(localized, 'candidate', 'secondary');
+    const expected = referenceResolveConflict(reference, 'candidate', 'secondary');
+    assert.deepEqual(resolutionResultShape(actual), resolutionResultShape(expected));
+    assert.deepEqual(resolutionStateShape(localized), resolutionStateShape(reference));
+    assert.equal(actual.ok, false, 'the later fixed duplicate is the authoritative overlap');
+    const diagnostics = compositeConflictResolutionDiagnostics(localized);
+    assert.equal(diagnostics.duplicateEntryIds, 1);
+    assert.equal(diagnostics.legacyValidationAttempts, 1);
+    assert.equal(diagnostics.activeOwnershipEntriesChecked, 2);
+    assert.equal(diagnostics.intervalBucketsBuilt, 0,
+        'duplicate plans never consult ambiguous localized ownership');
+});
+
+test('duplicate resolved-owner fallback follows resolve, clear, and retry lifecycle exactly', () => {
+    const fixed = resolutionFixtureEntry('owner:shared', 'primary', 0, 3);
+    const ownerEntry = resolutionFixtureEntry('owner:shared', 'primary', 10, 5);
+    const owner = resolutionFixtureConflict('owner', { primaryEntries: [ownerEntry] });
+    owner.resolution = 'primary';
+    owner.selectedEntryIds = [ownerEntry.id];
+    const candidate = resolutionFixtureConflict('candidate', {
+        secondaryEntries: [resolutionFixtureEntry('candidate:note', 'secondary', 10, 7)],
+    });
+    const initial = resolutionFixturePlan([owner, candidate], [fixed]);
+    const localized = structuredClone(initial);
+    const reference = structuredClone(initial);
+
+    assert.deepEqual(resolutionResultShape(resolveCompositeConflict(
+        localized, 'candidate', 'secondary')),
+    resolutionResultShape(referenceResolveConflict(reference, 'candidate', 'secondary')));
+    assert.deepEqual(clearCompositeConflictResolution(localized, 'owner'),
+        referenceClearConflict(reference, 'owner'));
+    const retried = resolveCompositeConflict(localized, 'candidate', 'secondary');
+    const expectedRetry = referenceResolveConflict(reference, 'candidate', 'secondary');
+    assert.deepEqual(resolutionResultShape(retried), resolutionResultShape(expectedRetry));
+    assert.equal(retried.ok, true,
+        'after the resolved duplicate owner is cleared, only the non-overlapping fixed note remains');
+    assert.deepEqual(resolutionStateShape(localized), resolutionStateShape(reference));
+    const diagnostics = compositeConflictResolutionDiagnostics(localized);
+    assert.equal(diagnostics.duplicateEntryIds, 1);
+    assert.equal(diagnostics.legacyValidationAttempts, 2);
+});
+
+test('resolution-index prewarming is repeatable and leaves the plan untouched', () => {
+    const conflict = resolutionFixtureConflict('prewarm', {
+        primaryEntries: [resolutionFixtureEntry('prewarm:note', 'primary', 2, 3)],
+    });
+    const plan = resolutionFixturePlan([conflict]);
+    const before = structuredClone(plan);
+    const revision = compositePlanResolutionRevision(plan);
+
+    assert.equal(prewarmCompositeConflictResolutionIndex(plan), true);
+    const diagnostics = compositeConflictResolutionDiagnostics(plan);
+    assert.equal(diagnostics.indexBuilds, 1);
+    assert.equal(diagnostics.resolutionAttempts, 0);
+    assert.deepEqual(plan, before);
+    assert.equal(compositePlanResolutionRevision(plan), revision);
+
+    assert.equal(prewarmCompositeConflictResolutionIndex(plan), true);
+    assert.deepEqual(compositeConflictResolutionDiagnostics(plan), diagnostics,
+        'a second prewarm reuses the already-current private index');
+    assert.deepEqual(plan, before);
+    assert.equal(prewarmCompositeConflictResolutionIndex(null), false);
+});
+
+test('twenty-thousand-conflict prewarm defers interval work with deterministic bounds', () => {
+    const count = 20_000;
+    const conflicts = Array.from({ length: count }, (_, index) => {
+        const startBeat = index * 2;
+        const makeEntry = (source, fret) => ({
+            id: `${source}:scale:${index}`,
+            source,
+            sources: [source],
+            startBeat,
+            endBeat: startBeat,
+            effectiveEndBeat: startBeat + 1e-4,
+            string: index % 6,
+            fret,
+        });
+        return resolutionFixtureConflict(`scale:${index}`, {
+            primaryEntries: [makeEntry('primary', 3)],
+            secondaryEntries: [makeEntry('secondary', 7)],
+        });
+    });
+    const plan = resolutionFixturePlan(conflicts);
+    assert.equal(prewarmCompositeConflictResolutionIndex(plan), true);
+    const prewarmed = compositeConflictResolutionDiagnostics(plan);
+    assert.equal(prewarmed.indexBuilds, 1);
+    assert.equal(prewarmed.resolutionAttempts, 0);
+    assert.equal(prewarmed.indexedEntries, count * 2);
+    assert.equal(prewarmed.intervalBucketsBuilt, 0,
+        'prewarm indexes review ids but leaves unused string intervals lazy');
+    assert.equal(prewarmed.intervalEntriesMaterialized, 0);
+    assert.equal(prewarmed.intervalIndexNodesVisited, 0);
+    assert.equal(prewarmed.activeOwnershipEntriesChecked, 0);
+
+    assert.equal(resolveCompositeConflict(plan, conflicts.at(-1).id, 'secondary').ok, true);
+    const queried = compositeConflictResolutionDiagnostics(plan);
+    assert.equal(queried.intervalBucketsBuilt, 1,
+        'the first hot query materializes only its one string bucket');
+    assert.equal(queried.candidateOwnershipEntriesChecked, 1);
+    assert.ok(queried.intervalEntriesMaterialized > 6_000
+        && queried.intervalEntriesMaterialized < 7_000);
+    assert.ok(queried.intervalIndexBinarySteps < 40);
+    assert.ok(queried.intervalIndexEntriesVisited <= 4);
+    assert.equal(plan.stats.unresolvedConflicts, count - 1);
+});
+
+test('late conflict choices use the local interval index instead of scanning every review block', () => {
+    const count = 6000;
+    const conflicts = Array.from({ length: count }, (_, index) => {
+        const startBeat = index * 2;
+        const makeEntry = (source, fret) => ({
+            id: `${source}:${index}`,
+            source,
+            sources: [source],
+            startBeat,
+            endBeat: startBeat,
+            effectiveEndBeat: startBeat + 1e-4,
+            string: index % 6,
+            fret,
+        });
+        return {
+            id: `late:${index}`,
+            primaryEntries: [makeEntry('primary', 3)],
+            secondaryEntries: [makeEntry('secondary', 7)],
+            resolution: null,
+            selectedEntryIds: [],
+            validationKind: '',
+            validationError: '',
+        };
+    });
+    const plan = {
+        ok: true,
+        beats: [],
+        compatibility: { stringCount: 6 },
+        fixedEntries: [],
+        conflicts,
+        stats: { unresolvedConflicts: conflicts.length },
+    };
+    assert.equal(resolveCompositeConflict(plan, conflicts[0].id, 'primary').ok, true);
+    const before = compositeConflictResolutionDiagnostics(plan);
+    assert.ok(before.indexedEntries >= count * 2);
+    assert.equal(resolveCompositeConflict(plan, conflicts.at(-1).id, 'secondary').ok, true);
+    const after = compositeConflictResolutionDiagnostics(plan);
+    assert.equal(after.resolutionAttempts - before.resolutionAttempts, 1);
+    assert.equal(after.candidateEntriesVisited - before.candidateEntriesVisited, 1);
+    assert.ok(after.intervalTreeNodesVisited - before.intervalTreeNodesVisited < 100);
+    assert.ok(after.intervalRecordsMatched - before.intervalRecordsMatched <= 4);
+    assert.equal(plan.stats.unresolvedConflicts, count - 2);
+
+    const cloned = structuredClone(plan);
+    assert.equal(resolveCompositeConflict(cloned, conflicts[Math.floor(count / 2)].id, 'primary').ok, true);
+    assert.equal(cloned.stats.unresolvedConflicts, count - 3);
+    assert.equal(compositeConflictResolutionDiagnostics(cloned).indexBuilds, 1);
+});
+
+test('one long early trail cannot force a linear localized interval query', () => {
+    const count = 10_000;
+    const fixed = {
+        ...resolutionFixtureEntry('fixed:long-trail', 'primary', 0, 3),
+        endBeat: count * 2 + 4,
+        effectiveEndBeat: count * 2 + 4,
+    };
+    const conflicts = Array.from({ length: count }, (_, index) => {
+        const startBeat = index * 2 + 2;
+        return resolutionFixtureConflict(`trail:${index}`, {
+            secondaryEntries: [{
+                ...resolutionFixtureEntry(`trail:note:${index}`, 'secondary', startBeat, 7),
+                endBeat: startBeat + 0.25,
+                effectiveEndBeat: startBeat + 0.25,
+                string: 0,
+            }],
+        });
+    });
+    const initial = resolutionFixturePlan(conflicts, [fixed]);
+    const localized = structuredClone(initial);
+    const reference = structuredClone(initial);
+    assert.equal(prewarmCompositeConflictResolutionIndex(localized), true);
+    const before = compositeConflictResolutionDiagnostics(localized);
+    const actual = resolveCompositeConflict(localized, conflicts.at(-1).id, 'secondary');
+    const expected = referenceResolveConflict(reference, conflicts.at(-1).id, 'secondary');
+    assert.deepEqual(resolutionResultShape(actual), resolutionResultShape(expected));
+    const after = compositeConflictResolutionDiagnostics(localized);
+    assert.equal(after.intervalBucketsBuilt - before.intervalBucketsBuilt, 1);
+    assert.ok(after.intervalIndexBinarySteps - before.intervalIndexBinarySteps < 20);
+    assert.ok(after.intervalIndexNodesVisited - before.intervalIndexNodesVisited < 100,
+        'segment maxima prune the thousands of expired intervals behind one long trail');
+    assert.ok(after.intervalIndexEntriesVisited - before.intervalIndexEntriesVisited <= 3);
+    assert.equal(after.candidateEntriesVisited - before.candidateEntriesVisited, 1);
 });
 
 test('duplicate indexing remains one-to-one across a long repeated position', () => {
