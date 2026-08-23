@@ -55,9 +55,9 @@ localStorage.removeItem('editorHybridPerf');
 ## Repeatable planner benchmark
 
 ```powershell
-npm run benchmark:hybrid -- --notes=1000 --iterations=3
-npm run benchmark:hybrid -- --notes=5000 --iterations=3
-npm run benchmark:hybrid -- --notes=20000 --iterations=3
+node scripts/hybrid-performance.mjs --notes=1000 --iterations=3
+node scripts/hybrid-performance.mjs --notes=5000 --iterations=3
+node scripts/hybrid-performance.mjs --notes=20000 --iterations=3
 ```
 
 The benchmark is synthetic and complements, rather than replaces, profiling
@@ -127,12 +127,17 @@ with every release run.
 ## Release evidence
 
 Keep benchmark JSON and Chromium traces outside the repository because they
-can contain local song metadata. Summarize the reproducible evidence here:
+can contain local song metadata. Summarize the reproducible evidence here.
+
+The measurements below are a historical, pre-isolation baseline. They were
+captured before Hybrid audition moved from the shared Editor transport to its
+feature-owned controller, so they must not be presented as release evidence
+for the refactored branch without a fresh desktop trace and soak run.
 
 | Field | Value |
 | --- | --- |
 | Date | 2026-08-23 |
-| Measured code | `feature/hybrid-performance-release` at `aee04bd` |
+| Historical measured code | `feature/hybrid-performance-release` at `aee04bd` |
 | Machine | Intel Core i7-9750H, 6 cores / 12 threads, 15.8 GB RAM |
 | Runtime | Node 24.18.0; Electron 35.7.5 |
 | Power / graphics | Windows Balanced, AC power; GTX 1650 Max-Q + Intel UHD 630 |

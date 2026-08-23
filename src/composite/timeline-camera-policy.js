@@ -88,4 +88,3 @@ export function compositeTimelineCameraUrgencyPure({
     if (headroom <= soft && !standbyReady) return 'soft';
     return 'none';
 }
-
