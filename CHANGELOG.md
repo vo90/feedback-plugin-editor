@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guided Hybrid can review matching repetitions once.** A remembered setup
+  option keeps the existing occurrence-by-occurrence workflow or groups the
+  same choice-dependent Lead/Rhythm material across the song. Automatic notes
+  shared by both arrangements may differ and remain local to their occurrence.
+  Grouped Lead, Rhythm, and Custom choices map to each occurrence's own note
+  IDs; bar splits mirror at the same relative boundary. Every copy still
+  receives independent whole-trail transition validation, and an unsafe copy
+  automatically falls back to its own review instead of blocking or weakening
+  the safe copies. The review UI exposes every grouped location for context
+  audition and can detach any one occurrence on demand.
+- **Guided Hybrid replaces the impractical Full Union workflow.** The composite
+  resolver now builds adaptive decision blocks from real bars and named song
+  sections, automatically collapses identical/empty/single-source regions, and
+  asks for Lead, Rhythm, or Custom only where the arrangements differ. Blocks
+  stop at four bars by default and can be split at any internal bar. Complete
+  chords, trails, linked notes, and slides remain atomic; cross-block source
+  changes receive the same final physical-playability validation as custom
+  selections. Full Union is no longer exposed in the editor.
 - **Save is now project persistence; Export to Library is publishing.** Importing
   files creates only an unsaved editing session. A new project's first Save
   chooses a `.feedpak` name and location through the native picker, later saves
@@ -80,6 +98,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing behavior, so a bare scroll can never edit. Every other profile is untouched.
 ### Changed
 
+- **Hybrid review and preview stay responsive on dense songs.** Analysis and
+  materialization remain off the UI thread, while playback now reuses prepared
+  guide events and resolved-note revisions. Review navigation retains the
+  existing workspace, timeline cameras render only bounded visible strips, and
+  grouped overview markers still open the exact section under the pointer.
+  Opt-in, local-only diagnostics cover Play response, display cadence, input
+  latency, render work, and lifecycle growth for repeatable release checks.
+- **Composite Gap Fill now protects every complete playable trail.** The merge
+  derives occupied spans from authored sustain regardless of technique or fret,
+  inherits chord-level duration when needed, follows linked notes and connected
+  slides to their destinations, and treats coincident chords / connected
+  gestures atomically. A rhythm event is admitted only when its entire longest
+  trail fits inside a lead-silence window. The resolver exposes a shared
+  **Beats / Seconds** timing-unit selector for the minimum usable gap and
+  per-side transition margin. Beats remains the default (1 beat / 1/4 beat);
+  seconds uses fixed real time through tempo changes (initially 0.5 s / 0.125 s).
+  The selected unit and separate values for each unit are remembered locally.
 - **The auto fret-hand anchor engine now looks ahead and stops thrashing on lone
   notes.** `_compute_anchors` was a single forward-greedy pass — fixed width 4,
   no look-ahead, relocating one fret below any note that fell outside the current
