@@ -34,6 +34,7 @@ export const COMPOSITE_TIMELINE_STRIP_MAX_WIDTH = 7680;
 const RANGE_BUFFER_PX = 900;
 const ENTRY_RANGE_INDEX = new WeakMap();
 const SOURCE_ENTRY_PREPROCESSING = new WeakMap();
+const ENTRY_TECHNIQUE_METADATA = new WeakMap();
 const OVERVIEW_WIDTH = 1000;
 export const COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT = 512;
 const OVERVIEW_INTERVAL_INDEX_TYPE = 'composite-timeline-overview-interval-index';
@@ -48,16 +49,25 @@ const OVERVIEW_MARKER_STATES = Object.freeze({
 const TIMELINE_DETAIL_LEVELS = Object.freeze({
     density: Object.freeze({
         id: 'density', laneBeatStep: 0, rulerBeatStep: 0,
-        staticNoteStyle: 'density',
     }),
     compact: Object.freeze({
         id: 'compact', laneBeatStep: 2, rulerBeatStep: 1,
-        staticNoteStyle: 'fret',
     }),
     full: Object.freeze({
         id: 'full', laneBeatStep: 1, rulerBeatStep: 1,
-        staticNoteStyle: 'full',
     }),
+});
+
+const TIMELINE_NOTE_GLYPH = Object.freeze({
+    minWidth: 20,
+    digitWidth: 8,
+    horizontalPadding: 10,
+    height: 18,
+    radius: 7,
+    fretFontSize: 11,
+    badgeFontSize: 8,
+    outlineWidth: 1.5,
+    selectedOutlineWidth: 2.5,
 });
 
 const COLORS = Object.freeze({
@@ -153,15 +163,30 @@ export function compositeTimelineLaneHeightPure(value) {
         Math.min(HYBRID_TIMELINE_LANE_MAX, Math.round(finite(value, 158))));
 }
 
-// Rendering policy is intentionally based only on zoom, so the ruler and all
-// three lanes always choose the same level. The normal 120 px/beat view keeps
-// the existing complete notation; 60 px/beat removes decorative per-note SVG
-// nodes, and very small whole-song views collapse static attacks into paths.
+// Zoom changes the amount of ruler/grid chrome, never the appearance of a
+// musical note. Static note heads use a batched renderer below, so the same
+// fixed-size notation remains affordable at compact zooms.
 export function compositeTimelineDetailLevelPure(zoom) {
     const value = compositeTimelineZoomPure(zoom);
     if (value >= 90) return TIMELINE_DETAIL_LEVELS.full;
     if (value >= 24) return TIMELINE_DETAIL_LEVELS.compact;
     return TIMELINE_DETAIL_LEVELS.density;
+}
+
+export function compositeTimelineNoteGlyphMetricsPure(fret) {
+    const label = String(finite(fret));
+    return {
+        label,
+        width: Math.max(TIMELINE_NOTE_GLYPH.minWidth,
+            TIMELINE_NOTE_GLYPH.horizontalPadding
+                + label.length * TIMELINE_NOTE_GLYPH.digitWidth),
+        height: TIMELINE_NOTE_GLYPH.height,
+        radius: TIMELINE_NOTE_GLYPH.radius,
+        fretFontSize: TIMELINE_NOTE_GLYPH.fretFontSize,
+        badgeFontSize: TIMELINE_NOTE_GLYPH.badgeFontSize,
+        outlineWidth: TIMELINE_NOTE_GLYPH.outlineWidth,
+        selectedOutlineWidth: TIMELINE_NOTE_GLYPH.selectedOutlineWidth,
+    };
 }
 
 export function compositeTimelineSongRangePure({ beats = [], durationSeconds = 0, entries = [] } = {}) {
@@ -663,33 +688,51 @@ function badgeSummary(techniqueLabels) {
     return visible.join(' · ');
 }
 
+function entryTechniqueMetadata(entry) {
+    const note = entry && entry.note;
+    if (note && typeof note === 'object') {
+        const cached = ENTRY_TECHNIQUE_METADATA.get(note);
+        if (cached) return cached;
+        const techniqueLabels = compositeTechniqueLabels(note);
+        const metadata = {
+            techniqueLabels,
+            tremolo: techniqueLabels.includes('Tremolo'),
+            badge: badgeSummary(techniqueLabels),
+        };
+        ENTRY_TECHNIQUE_METADATA.set(note, metadata);
+        return metadata;
+    }
+    const techniqueLabels = compositeTechniqueLabels(note);
+    return {
+        techniqueLabels,
+        tremolo: techniqueLabels.includes('Tremolo'),
+        badge: badgeSummary(techniqueLabels),
+    };
+}
+
 function entryDisplayMetadata(entry, stringCount, {
     detailed = true,
     includeTechniques = true,
 } = {}) {
     // Technique extraction walks nested authored data. Compute it once for all
     // title, badge, and trail decisions made while rendering this note.
-    const techniqueLabels = includeTechniques
-        ? compositeTechniqueLabels(entry && entry.note) : [];
-    if (!detailed) {
-        return {
-            tremolo: techniqueLabels.includes('Tremolo'),
-            badge: '',
-            title: '',
-        };
-    }
+    const technique = includeTechniques
+        ? entryTechniqueMetadata(entry)
+        : { techniqueLabels: [], tremolo: false, badge: '' };
+    const { techniqueLabels, tremolo, badge } = technique;
+    if (!detailed) return { tremolo, badge, title: '' };
     const string = Math.max(1, stringCount - Math.trunc(finite(entry && entry.string)));
     const trail = Math.max(0, finite(entry && entry.endBeat) - finite(entry && entry.startBeat));
     const techniques = techniqueLabels.join(', ') || 'No techniques';
     return {
-        tremolo: techniqueLabels.includes('Tremolo'),
-        badge: badgeSummary(techniqueLabels),
+        tremolo,
+        badge,
         title: `String ${string}, fret ${finite(entry && entry.fret)}, beat ${finite(entry && entry.startBeat).toFixed(3)}, ${trail.toFixed(3)} beat trail. ${techniques}.`,
     };
 }
 
-function entryNeedsFullTimelineDetail(view, entry, detail) {
-    if (detail.id === 'full' || entry?.selectable || entry?.inConflict
+function entryNeedsDetailedTimelineMarkup(view, entry) {
+    if (entry?.selectable || entry?.inConflict
             || entry?.selected || entry?.invalid) return true;
     const focus = view?.review || view?.passageFocus;
     if (!focus) return false;
@@ -697,6 +740,25 @@ function entryNeedsFullTimelineDetail(view, entry, detail) {
     const end = Math.max(start, finite(focus.endBeat, start));
     return finite(entry?.startBeat) <= end + 1e-4
         && entryEndBeat(entry) >= start - 1e-4;
+}
+
+function roundedTimelineNoteHeadPath(x, y, metrics) {
+    const halfWidth = metrics.width / 2;
+    const halfHeight = metrics.height / 2;
+    const left = x - halfWidth;
+    const right = x + halfWidth;
+    const top = y - halfHeight;
+    const bottom = y + halfHeight;
+    const radius = Math.min(metrics.radius, halfWidth, halfHeight);
+    return `M${(left + radius).toFixed(1)} ${top.toFixed(1)}`
+        + `H${(right - radius).toFixed(1)}`
+        + `A${radius} ${radius} 0 0 1 ${right.toFixed(1)} ${(top + radius).toFixed(1)}`
+        + `V${(bottom - radius).toFixed(1)}`
+        + `A${radius} ${radius} 0 0 1 ${(right - radius).toFixed(1)} ${bottom.toFixed(1)}`
+        + `H${(left + radius).toFixed(1)}`
+        + `A${radius} ${radius} 0 0 1 ${left.toFixed(1)} ${(bottom - radius).toFixed(1)}`
+        + `V${(top + radius).toFixed(1)}`
+        + `A${radius} ${radius} 0 0 1 ${(left + radius).toFixed(1)} ${top.toFixed(1)}Z`;
 }
 
 function lineMarkup(view, height, visibleRange, zoom, renderOptions = {}) {
@@ -729,7 +791,7 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
     const z = compositeTimelineZoomPure(zoom);
     const surface = timelineRenderSurface(view.context, z, renderOptions);
     const contentWidth = surface.surfaceWidth;
-    const detail = compositeTimelineDetailLevelPure(z);
+    const overviewDensity = renderOptions.overviewDensity === true;
     const colors = COLORS[lane.id] || COLORS.result;
     const top = 28;
     const bottom = 22;
@@ -743,7 +805,9 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
         strings.push(`<line x1="${startX}" y1="${y.toFixed(1)}" x2="${contentWidth}" y2="${y.toFixed(1)}" stroke="#64748b" stroke-width="1" opacity="0.75"/>`);
     }
     const detailedNotes = [];
-    const compactNotes = [];
+    const staticHeadPaths = [];
+    const staticFretLabels = [];
+    const staticTechniqueLabels = [];
     const densityHeads = [];
     const authoredTrails = [];
     const tremoloTrails = [];
@@ -756,12 +820,12 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
         const authoredEndX = surface.xForBeat(
             Math.max(finite(entry.startBeat), finite(entry.endBeat)));
         const effectiveEndX = surface.xForBeat(entryEndBeat(entry));
-        const fret = String(finite(entry.fret));
-        const width = Math.max(20, 10 + fret.length * 8);
-        const detailed = entryNeedsFullTimelineDetail(view, entry, detail);
+        const glyph = compositeTimelineNoteGlyphMetricsPure(entry.fret);
+        const fret = glyph.label;
+        const detailed = entryNeedsDetailedTimelineMarkup(view, entry);
         const metadata = entryDisplayMetadata(entry, view.stringCount, {
             detailed,
-            includeTechniques: detailed || detail.id === 'compact',
+            includeTechniques: detailed || !overviewDensity,
         });
         if (!detailed) {
             if (authoredEndX > x + 2) {
@@ -771,10 +835,14 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
             if (effectiveEndX > authoredEndX + 2) {
                 effectiveTrails.push(`M${Math.max(x, authoredEndX).toFixed(1)} ${y.toFixed(1)}H${effectiveEndX.toFixed(1)}`);
             }
-            if (detail.staticNoteStyle === 'fret') {
-                compactNotes.push(`<text x="${x.toFixed(1)}" data-composite-compact-note="true" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="${colors.main}" stroke="#0f172a" stroke-width="3" paint-order="stroke" font-size="10" font-weight="700">${escapeMarkup(fret)}</text>`);
-            } else {
+            if (overviewDensity) {
                 densityHeads.push(`M${x.toFixed(1)} ${y.toFixed(1)}h0.1`);
+            } else {
+                staticHeadPaths.push(roundedTimelineNoteHeadPath(x, y, glyph));
+                staticFretLabels.push(`<text x="${x.toFixed(1)}" data-composite-static-note="true" aria-hidden="true" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="#f8fafc" font-size="${glyph.fretFontSize}" font-weight="700">${escapeMarkup(fret)}</text>`);
+                if (metadata.badge) {
+                    staticTechniqueLabels.push(`<text x="${x.toFixed(1)}" data-composite-static-technique="true" aria-hidden="true" y="${(y - 12).toFixed(1)}" text-anchor="middle" fill="#fcd34d" font-size="${glyph.badgeFontSize}" font-weight="700">${escapeMarkup(metadata.badge)}</text>`);
+                }
             }
             continue;
         }
@@ -795,10 +863,10 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
             trails += `<line x1="${Math.max(x, authoredEndX).toFixed(1)}" y1="${y.toFixed(1)}" x2="${effectiveEndX.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${colors.main}" stroke-width="3" stroke-dasharray="5 4" opacity="0.8"/>`;
         }
         detailedNotes.push(`<g${interaction}><title>${escapeMarkup(metadata.title)}</title>${trails}`
-            + `<rect x="${(x - width / 2).toFixed(1)}" y="${(y - 9).toFixed(1)}" width="${width}" height="18" rx="7" fill="${colorsForEntry.soft}" stroke="${outline}" stroke-width="${entry.selected && entry.inConflict ? 2.5 : 1.5}"/>`
-            + `<text x="${x.toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="#f8fafc" font-size="11" font-weight="700">${escapeMarkup(fret)}</text>`
-            + (entry.selected && entry.inConflict ? `<circle cx="${(x + width / 2 - 1).toFixed(1)}" cy="${(y - 8).toFixed(1)}" r="4" fill="#f8fafc"/><path d="M${(x + width / 2 - 3).toFixed(1)} ${(y - 8).toFixed(1)}l1.5 1.5 3-3" fill="none" stroke="#065f46" stroke-width="1.5"/>` : '')
-            + (badge ? `<text x="${x.toFixed(1)}" y="${(y - 12).toFixed(1)}" text-anchor="middle" fill="#fcd34d" font-size="8" font-weight="700">${escapeMarkup(badge)}</text>` : '')
+            + `<rect x="${(x - glyph.width / 2).toFixed(1)}" y="${(y - glyph.height / 2).toFixed(1)}" width="${glyph.width}" height="${glyph.height}" rx="${glyph.radius}" fill="${colorsForEntry.soft}" stroke="${outline}" stroke-width="${entry.selected && entry.inConflict ? glyph.selectedOutlineWidth : glyph.outlineWidth}"/>`
+            + `<text x="${x.toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="#f8fafc" font-size="${glyph.fretFontSize}" font-weight="700">${escapeMarkup(fret)}</text>`
+            + (entry.selected && entry.inConflict ? `<circle cx="${(x + glyph.width / 2 - 1).toFixed(1)}" cy="${(y - 8).toFixed(1)}" r="4" fill="#f8fafc"/><path d="M${(x + glyph.width / 2 - 3).toFixed(1)} ${(y - 8).toFixed(1)}l1.5 1.5 3-3" fill="none" stroke="#065f46" stroke-width="1.5"/>` : '')
+            + (badge ? `<text x="${x.toFixed(1)}" y="${(y - 12).toFixed(1)}" text-anchor="middle" fill="#fcd34d" font-size="${glyph.badgeFontSize}" font-weight="700">${escapeMarkup(badge)}</text>` : '')
             + '</g>');
     }
     const staticTrails = (authoredTrails.length
@@ -808,11 +876,14 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
         + (effectiveTrails.length
             ? `<path data-composite-static-trails="effective" d="${effectiveTrails.join('')}" fill="none" stroke="${colors.main}" stroke-width="3" stroke-dasharray="5 4" opacity="0.8"/>` : '');
     const density = densityHeads.length
-        ? `<path data-composite-density-notes="true" d="${densityHeads.join('')}" fill="none" stroke="${colors.main}" stroke-width="5" stroke-linecap="round"/>` : '';
+        ? `<path data-composite-density-notes="true" aria-hidden="true" d="${densityHeads.join('')}" fill="none" stroke="${colors.main}" stroke-width="5" stroke-linecap="round"/>` : '';
+    const staticHeads = staticHeadPaths.length
+        ? `<path data-composite-static-note-heads="true" aria-hidden="true" d="${staticHeadPaths.join('')}" fill="${colors.soft}" stroke="${colors.main}" stroke-width="${TIMELINE_NOTE_GLYPH.outlineWidth}"/>` : '';
     return `<rect width="${contentWidth}" height="${laneHeight}" fill="#0f172a"/>`
         + `<rect x="0" y="0" width="${contentWidth}" height="${laneHeight}" fill="${colors.soft}" opacity="0.18"/>`
         + lineMarkup(view, laneHeight, visibleRange, z, renderOptions) + strings.join('')
-        + staticTrails + density + compactNotes.join('') + detailedNotes.join('')
+        + staticTrails + density + staticHeads + staticTechniqueLabels.join('')
+        + staticFretLabels.join('') + detailedNotes.join('')
         + reviewBandMarkup(view, laneHeight, z, true, renderOptions);
 }
 

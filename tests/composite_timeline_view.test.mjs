@@ -21,6 +21,7 @@ import {
     compositeTimelineLocalToGlobalXPure,
     compositeTimelineMapViewportPure,
     compositeTimelineMapBeatPure,
+    compositeTimelineNoteGlyphMetricsPure,
     compositeTimelineOverviewIntervalAtBeatPure,
     compositeTimelineOverviewIntervalIndexPure,
     compositeTimelineRenderBufferPure,
@@ -243,12 +244,23 @@ test('render-ahead scales with the real viewport instead of a fixed song window'
         'a 4K strip begins standby work with three quarters of its runway remaining');
 });
 
-test('timeline detail policy keeps 120 full and progressively simplifies 60 and Fit', () => {
+test('timeline detail policy changes only ruler and grid density', () => {
     assert.equal(compositeTimelineDetailLevelPure(120).id, 'full');
     assert.equal(compositeTimelineDetailLevelPure(60).id, 'compact');
     assert.equal(compositeTimelineDetailLevelPure(3).id, 'density');
     assert.equal(compositeTimelineDetailLevelPure(89.99).id, 'compact');
     assert.equal(compositeTimelineDetailLevelPure(90).id, 'full');
+});
+
+test('timeline note glyph metrics are fixed CSS-pixel dimensions', () => {
+    assert.deepEqual(compositeTimelineNoteGlyphMetricsPure(7), {
+        label: '7', width: 20, height: 18, radius: 7,
+        fretFontSize: 11, badgeFontSize: 8,
+        outlineWidth: 1.5, selectedOutlineWidth: 2.5,
+    });
+    assert.equal(compositeTimelineNoteGlyphMetricsPure(12).width, 26,
+        'the existing two-digit fret width rule is preserved');
+    assert.equal(compositeTimelineNoteGlyphMetricsPure(120).width, 34);
 });
 
 test('bounded strip geometry keeps a viewport-centered local surface and clamps at song edges', () => {
@@ -733,8 +745,9 @@ test('a fret marker on either song boundary stays wholly inside the tablature', 
         + COMPOSITE_TIMELINE_EDGE_PADDING - noteHalfWidth;
     const lastLeft = compositeTimelineXForBeatPure(model.context.endBeat,
         model.context, 120) - noteHalfWidth;
-    assert.match(lane, new RegExp(`x="${firstLeft.toFixed(1)}"`));
-    assert.match(lane, new RegExp(`x="${lastLeft.toFixed(1)}"`));
+    const radius = compositeTimelineNoteGlyphMetricsPure(24).radius;
+    assert.match(lane, new RegExp(`M${(firstLeft + radius).toFixed(1)} `));
+    assert.match(lane, new RegExp(`M${(lastLeft + radius).toFixed(1)} `));
     assert.ok(firstLeft > COMPOSITE_TIMELINE_GUTTER);
     assert.ok(compositeTimelineContentWidthPure(model.context, 120)
         - (lastLeft + noteHalfWidth * 2) > 0);
@@ -843,35 +856,98 @@ test('the ruler thins labels and beat ticks at whole-song fit zoom', () => {
     assert.ok((fitted.match(/<line /g) || []).length < (detailed.match(/<line /g) || []).length);
 });
 
-test('static timeline markup scales down at 60 and Fit while 120 stays fully labelled', () => {
+test('static timeline notation stays canonical at every normal zoom and batches its heads', () => {
     const model = view();
     model.lanes[2].entries = Array.from({ length: 96 }, (_, index) =>
-        entry(`dense:${index}`, index / 4, index / 4 + 0.25,
-            index % 6, index % 24, 'primary'));
+        ({
+            ...entry(`dense:${index}`, index / 4, index / 4 + 0.25,
+                index % 6, index % 24, 'primary'),
+            note: { techniques: index % 7 === 0 ? { bend: true } : {} },
+        }));
     const visible = { startBeat: 0, endBeat: model.context.endBeat };
-    const full = renderCompositeTimelineLaneContents(model, 'result', 158, visible, 120);
-    const compact = renderCompositeTimelineLaneContents(model, 'result', 158, visible, 60);
-    const fitted = renderCompositeTimelineLaneContents(model, 'result', 158, visible, 3);
+    for (const zoom of [5, 60, 89.99, 90, 120, 240, 480]) {
+        const markup = renderCompositeTimelineLaneContents(
+            model, 'result', 158, visible, zoom);
+        assert.equal((markup.match(/data-composite-static-note-heads=/g) || []).length, 1,
+            `${zoom} px/beat batches every ordinary rounded head into one path`);
+        assert.equal((markup.match(/data-composite-static-note="true"/g) || []).length, 96,
+            `${zoom} px/beat retains one readable fret label per attack`);
+        assert.equal((markup.match(/<g/g) || []).length, 0,
+            `${zoom} px/beat does not restore a full group/title subtree per static note`);
+        assert.equal((markup.match(/<title>/g) || []).length, 0);
+        assert.match(markup,
+            /data-composite-static-note-heads="true"[^>]*stroke-width="1\.5"/);
+        assert.match(markup,
+            /data-composite-static-note="true"[^>]*fill="#f8fafc"[^>]*font-size="11"/);
+        assert.match(markup,
+            /data-composite-static-technique="true"[^>]*font-size="8"[^>]*>B<\/text>/,
+        'visible technique notation is not removed by zoom');
+        assert.match(markup,
+            /data-composite-static-note="true" aria-hidden="true"/,
+        'decorative static labels do not flood the accessibility tree');
+        assert.ok(markup.indexOf('data-composite-static-technique="true"')
+            < markup.indexOf('data-composite-static-note="true"'),
+        'fret labels paint after technique badges and remain visually dominant');
+        assert.equal((markup.match(/data-composite-density-notes=/g) || []).length, 0,
+            'density rendering is never selected by an implicit zoom threshold');
+    }
 
-    assert.equal((full.match(/<g/g) || []).length, 96);
-    assert.equal((full.match(/<title>/g) || []).length, 96);
-    assert.equal((full.match(/data-composite-compact-note/g) || []).length, 0);
-    assert.equal((compact.match(/<g/g) || []).length, 0);
-    assert.equal((compact.match(/<title>/g) || []).length, 0);
-    assert.equal((compact.match(/data-composite-compact-note/g) || []).length, 96,
-        '60 px/beat retains one readable fret label per static attack');
-    assert.equal((compact.match(/data-composite-static-trails=/g) || []).length, 1,
-        'all ordinary compact trails share one SVG path');
-    assert.equal((fitted.match(/data-composite-density-notes=/g) || []).length, 1,
-        'Fit collapses all static attacks into one SVG path');
-    assert.equal((fitted.match(/data-composite-compact-note|<title>|<g/g) || []).length, 0);
-    assert.ok(compact.length < full.length * 0.55,
-        'compact markup is less than 55% of full detail for a dense static lane');
-    assert.ok(fitted.length < full.length * 0.15,
-        'Fit markup is less than 15% of full detail for a dense static lane');
+    const overview = renderCompositeTimelineLaneContents(
+        model, 'result', 158, visible, 3, { overviewDensity: true });
+    assert.equal((overview.match(/data-composite-density-notes=/g) || []).length, 1,
+        'an explicit overview may collapse static attacks into one SVG path');
+    assert.equal((overview.match(/data-composite-static-note(?:-heads)?=/g) || []).length, 0);
 });
 
-test('Fit keeps manual-review notes fully selectable and preserves static trail endpoints', () => {
+test('canonical head geometry is zoom-invariant for static, focused, and interactive notes', () => {
+    const model = view();
+    const authored = {
+        ...entry('canonical', 2, 3, 0, 12),
+        note: { techniques: { bend: true } },
+    };
+    model.lanes[0].entries = [authored];
+    const visible = { startBeat: 0, endBeat: model.context.endBeat };
+    const y = 136;
+    const metrics = compositeTimelineNoteGlyphMetricsPure(12);
+
+    for (const zoom of [5, 60, 89.99, 90, 120, 240, 480]) {
+        const x = compositeTimelineXForBeatPure(2, model.context, zoom);
+        const staticMarkup = renderCompositeTimelineLaneContents(
+            model, 'primary', 158, visible, zoom);
+        assert.match(staticMarkup, new RegExp(
+            `M${(x - metrics.width / 2 + metrics.radius).toFixed(1)} ${(y - 9).toFixed(1)}`
+            + `H${(x + metrics.width / 2 - metrics.radius).toFixed(1)}`),
+        `the ${zoom} px/beat batched path keeps a 26 by 18 rounded head`);
+        assert.match(staticMarkup, new RegExp(
+            `<text x="${x.toFixed(1)}" data-composite-static-note="true"[^>]*font-size="11"[^>]*>12<\\/text>`));
+        assert.match(staticMarkup,
+            /data-composite-static-technique="true"[^>]*font-size="8"[^>]*>B<\/text>/);
+
+        model.review = {
+            id: 'focus', startBeat: 2, endBeat: 3,
+            contextStartBeat: 0, contextEndBeat: 4, state: 'unresolved',
+        };
+        const focusedMarkup = renderCompositeTimelineLaneContents(
+            model, 'primary', 158, visible, zoom);
+        assert.match(focusedMarkup, new RegExp(
+            `<rect x="${(x - 13).toFixed(1)}" y="127\\.0" width="26" height="18" rx="7"[^>]*stroke-width="1\\.5"`));
+        assert.match(focusedMarkup,
+            /fill="#f8fafc" font-size="11" font-weight="700">12<\/text>/);
+        assert.match(focusedMarkup,
+            /fill="#fcd34d" font-size="8" font-weight="700">B<\/text>/);
+
+        model.review = null;
+        model.lanes[0].entries = [{ ...authored, selectable: true }];
+        const interactiveMarkup = renderCompositeTimelineLaneContents(
+            model, 'primary', 158, visible, zoom);
+        assert.match(interactiveMarkup, /data-composite-entry-id="canonical"/);
+        assert.match(interactiveMarkup, new RegExp(
+            `<rect x="${(x - 13).toFixed(1)}" y="127\\.0" width="26" height="18" rx="7"[^>]*stroke-width="1\\.5"`));
+        model.lanes[0].entries = [authored];
+    }
+});
+
+test('explicit density overview keeps manual-review notes fully selectable and preserves static trail endpoints', () => {
     const model = view();
     model.review = {
         id: 'decision:fit', startBeat: 2, endBeat: 4,
@@ -889,7 +965,7 @@ test('Fit keeps manual-review notes fully selectable and preserves static trail 
     model.lanes[0].entries = [focused, longTrail];
     const visible = { startBeat: 0, endBeat: model.context.endBeat };
     const fitted = renderCompositeTimelineLaneContents(
-        model, 'primary', 158, visible, 3);
+        model, 'primary', 158, visible, 3, { overviewDensity: true });
 
     assert.match(fitted, /data-composite-entry-id="focused"/);
     assert.match(fitted, /role="checkbox"/);
@@ -906,7 +982,7 @@ test('Fit keeps manual-review notes fully selectable and preserves static trail 
         'only the non-review attack is density-rendered');
 });
 
-test('an inspected Experimental passage remains detailed below compact zoom', () => {
+test('an inspected Experimental passage remains detailed in explicit density overview', () => {
     const model = view();
     model.passageFocus = { id: 'passage:focus', startBeat: 8, endBeat: 9 };
     model.lanes[1].entries = [
@@ -914,7 +990,8 @@ test('an inspected Experimental passage remains detailed below compact zoom', ()
         entry('passage', 8, 9, 2, 7, 'secondary'),
     ];
     const fitted = renderCompositeTimelineLaneContents(model, 'secondary', 158,
-        { startBeat: 0, endBeat: model.context.endBeat }, 3);
+        { startBeat: 0, endBeat: model.context.endBeat }, 3,
+        { overviewDensity: true });
     assert.match(fitted, /<title>String 4, fret 7,/,
         'the passage under inspection keeps its full note description');
     assert.match(fitted, />7<\/text>/,
