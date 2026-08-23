@@ -28,23 +28,19 @@ import {
     compositeExperimentalMetadataPreview,
     compositeResolvedEntries,
     compositeSelectionUnitIds,
-    materializeCompositeArrangement,
     resolveCompositeConflict,
 } from './merge-engine.js';
 import {
-    analyzeGapFillComposite,
     compositeGapFillDefaultsForUnit,
     normalizeCompositeGapFillOptions,
 } from './gap-fill-engine.js';
 import {
-    analyzeExperimentalAutoComposite,
     experimentalComparisonReport,
     experimentalPassageOutcome,
     normalizeExperimentalProfile,
     refreshExperimentalPlayability,
 } from './experimental-auto-engine.js';
 import {
-    analyzeGuidedComposite,
     clearGuidedRepeatGroup,
     detachGuidedRepeatOccurrence,
     guidedRepeatGroupForBlock,
@@ -53,6 +49,10 @@ import {
     resolveGuidedRepeatGroup,
     splitGuidedRepeatGroup,
 } from './guided-engine.js';
+import {
+    runHybridAnalysisTask,
+    runHybridMaterializationTask,
+} from './analysis-runner.js';
 import {
     buildCompositeConflictViewModel,
     buildCompositeReviewToolbarModel,
@@ -68,13 +68,18 @@ import {
     compositeRecordingPreviewLevelPure,
 } from './preview.js';
 import {
+    beginHybridAnalysis,
     beginHybridCreation,
+    cancelHybridAnalysis,
     cancelHybridCreation,
+    completeHybridAnalysis,
     completeHybridCreation,
     createHybridBuilderSession,
+    hybridAnalysisIsCurrent,
     hybridCloseAction,
     hybridCloseGuardKind,
     hybridCreationIsCurrent,
+    installHybridPlan,
     markHybridReviewWork,
     resetHybridBuilderReview,
 } from './session.js';
@@ -3101,8 +3106,35 @@ function compositeAnalyzeButtonLabel() {
         ? 'Analyze experimental hybrid' : 'Preview automatic hybrid';
 }
 
-function setCompositeAnalysisUi(analyzing) {
-    hybridSession.analyzing = !!analyzing;
+export function _compositeAnalysisConfigTokenPure(config) {
+    return JSON.stringify(config || {});
+}
+
+export function _compositeTaskPhaseLabelPure(phase, config = {}) {
+    if (phase === 'materialize') return 'Building the new Hybrid Track…';
+    if (phase === 'analyze') {
+        if (config.strategy === 'guided') return 'Finding sections to review…';
+        if (config.experimentalEnabled) return 'Checking experimental fill…';
+        return 'Finding safe gaps…';
+    }
+    return 'Preparing tracks…';
+}
+
+function waitForCompositeUiPaint() {
+    return new Promise(resolve => {
+        if (typeof requestAnimationFrame !== 'function') {
+            setTimeout(resolve, 0);
+            return;
+        }
+        // A promise resolved by one rAF resumes in a microtask before that
+        // frame paints. Waiting for the following rAF guarantees that the busy
+        // label is visible even when Worker is unavailable and the local
+        // fallback is about to perform synchronous analysis.
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+    });
+}
+
+function setCompositeAnalysisUi(analyzing, phase = '') {
     const modal = byId('editor-composite-modal');
     if (modal) modal.setAttribute('aria-busy', analyzing ? 'true' : 'false');
     const setup = byId('editor-composite-setup');
@@ -3114,7 +3146,8 @@ function setCompositeAnalysisUi(analyzing) {
             Number(byId('editor-composite-primary')?.value),
             Number(byId('editor-composite-secondary')?.value),
         ).ok;
-        analyze.textContent = analyzing ? 'Analyzing…' : compositeAnalyzeButtonLabel();
+        analyze.textContent = analyzing
+            ? phase || 'Preparing tracks…' : compositeAnalyzeButtonLabel();
     }
     const resume = byId('editor-composite-return-review');
     if (resume) resume.disabled = !!analyzing;
@@ -3180,24 +3213,78 @@ async function analyzeFromDialog() {
         beats: S.beats,
         sections: S.sections,
     };
-    setCompositeAnalysisUi(true);
-    // Let the busy label paint before the DOM-free planner occupies the main
-    // thread. Majesty-sized Experimental analysis is roughly half a second.
-    await new Promise(resolve => requestAnimationFrame(() => resolve()));
-    let plan;
-    try {
-        plan = strategy === 'guided'
-            ? analyzeGuidedComposite({ ...sources, sections: S.sections, repeatMode })
-            : experimentalEnabled
-                ? analyzeExperimentalAutoComposite({
-                    ...sources, gapFill, profile: experimentalProfile,
-                })
-                : analyzeGapFillComposite({ ...sources, gapFill });
-    } catch (cause) {
-        setCompositeAnalysisUi(false);
-        if (error) error.textContent = `Could not analyze the Hybrid Track: ${cause.message}`;
+    const modal = byId('editor-composite-modal');
+    if (!modal) return;
+    const sessionId = S.sessionId;
+    const configToken = _compositeAnalysisConfigTokenPure(config);
+    const request = beginHybridAnalysis(hybridSession, { sessionId, configToken });
+    if (!request) return;
+    const requestIsCurrent = () => {
+        if (byId('editor-composite-modal') !== modal) return false;
+        let currentConfigToken = '';
+        try {
+            currentConfigToken = _compositeAnalysisConfigTokenPure(
+                compositeAnalysisConfigFromDialog(),
+            );
+        } catch (_) { /* a replaced setup is stale by definition */ }
+        return hybridAnalysisIsCurrent(hybridSession, request, {
+            sessionId: S.sessionId,
+            configToken: currentConfigToken,
+        });
+    };
+    const settleStaleRequest = () => {
+        const ownedLifecycle = completeHybridAnalysis(hybridSession, request);
+        if (!ownedLifecycle || byId('editor-composite-modal') !== modal) return;
+        if (S.sessionId !== request.sessionId) {
+            closeCompositeModalImmediately(modal, { restorePreview: false });
+        } else {
+            setCompositeAnalysisUi(false);
+        }
+    };
+    setCompositeAnalysisUi(true, _compositeTaskPhaseLabelPure('prepare', config));
+    await waitForCompositeUiPaint();
+    if (!requestIsCurrent()) {
+        settleStaleRequest();
         return;
     }
+    let plan;
+    try {
+        plan = await runHybridAnalysisTask({
+            sources,
+            strategy,
+            repeatMode,
+            gapFill,
+            experimentalEnabled,
+            experimentalProfile,
+        }, {
+            signal: request.controller.signal,
+            onProgress: phase => {
+                if (!requestIsCurrent()) return;
+                setCompositeAnalysisUi(true,
+                    _compositeTaskPhaseLabelPure(phase, config));
+            },
+        });
+    } catch (cause) {
+        const current = requestIsCurrent();
+        const ownedLifecycle = completeHybridAnalysis(hybridSession, request);
+        if (!current || !ownedLifecycle || byId('editor-composite-modal') !== modal) {
+            if (ownedLifecycle && byId('editor-composite-modal') === modal
+                    && S.sessionId !== request.sessionId) {
+                closeCompositeModalImmediately(modal, { restorePreview: false });
+            }
+            return;
+        }
+        setCompositeAnalysisUi(false);
+        if (cause?.name !== 'AbortError' && error) {
+            error.textContent = `Could not analyze the Hybrid Track: ${cause.message}`;
+        }
+        return;
+    }
+    if (!requestIsCurrent()) {
+        settleStaleRequest();
+        return;
+    }
+    if (!completeHybridAnalysis(hybridSession, request)) return;
     setCompositeAnalysisUi(false);
     if (!plan.ok) {
         if (error) error.textContent = plan.compatibility.errors.join(' ');
@@ -3211,7 +3298,7 @@ async function analyzeFromDialog() {
         return;
     }
     if (error) error.textContent = '';
-    hybridSession.plan = plan;
+    installHybridPlan(hybridSession, plan);
     hybridSession.analysisConfig = structuredClone(config);
     hybridSession.setupDirty = false;
     hybridSession.setupDirtyMessage = '';
@@ -3296,13 +3383,6 @@ async function finishMerge() {
         if (error) error.textContent = 'Another track already uses that name.';
         return;
     }
-    let arrangement;
-    try {
-        arrangement = materializeCompositeArrangement(plan, name);
-    } catch (cause) {
-        if (error) error.textContent = cause.message;
-        return;
-    }
     const request = beginHybridCreation(hybridSession, {
         sessionId: S.sessionId,
         plan,
@@ -3311,7 +3391,49 @@ async function finishMerge() {
     request.modal = modal;
     setCompositeCreationUi(true);
     if (error) error.textContent = 'Creating the new Hybrid Track…';
+    const settleStaleCreation = () => {
+        const ownedLifecycle = hybridSession.createRequestId === request.id;
+        completeHybridCreation(hybridSession, request);
+        if (!ownedLifecycle || byId('editor-composite-modal') !== modal) return;
+        if (S.sessionId !== request.sessionId) {
+            closeCompositeModalImmediately(modal, { restorePreview: false });
+        } else {
+            setCompositeCreationUi(false);
+            if (error) {
+                error.textContent = 'The Hybrid preview changed while the track was being prepared. Review it and try creating the track again.';
+            }
+        }
+    };
+    let arrangement;
     try {
+        // Make the disabled controls and Creating label visible before either
+        // the Worker request or the functional local fallback can do heavy
+        // materialization work.
+        await waitForCompositeUiPaint();
+        if (!hybridCreationIsCurrent(hybridSession, request, {
+            sessionId: S.sessionId,
+            plan: hybridSession.plan,
+        }) || byId('editor-composite-modal') !== modal) {
+            settleStaleCreation();
+            return;
+        }
+        arrangement = await runHybridMaterializationTask(plan, name, {
+            signal: request.controller.signal,
+            onProgress: phase => {
+                if (!hybridCreationIsCurrent(hybridSession, request, {
+                    sessionId: S.sessionId,
+                    plan: hybridSession.plan,
+                }) || byId('editor-composite-modal') !== modal) return;
+                if (error) error.textContent = _compositeTaskPhaseLabelPure(phase);
+            },
+        });
+        if (!hybridCreationIsCurrent(hybridSession, request, {
+            sessionId: S.sessionId,
+            plan: hybridSession.plan,
+        }) || byId('editor-composite-modal') !== modal) {
+            settleStaleCreation();
+            return;
+        }
         const response = await fetch('/api/plugins/editor/add-arrangement', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3400,6 +3522,7 @@ function setCompositeCreationUi(creating) {
 function closeCompositeModalImmediately(modal = byId('editor-composite-modal'), {
     restorePreview = true,
 } = {}) {
+    cancelHybridAnalysis(hybridSession);
     cancelHybridCreation(hybridSession);
     if (restorePreview) {
         restoreCompositePreviewSession();

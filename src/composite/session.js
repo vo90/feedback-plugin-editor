@@ -161,7 +161,8 @@ export function hybridCreationIsCurrent(session, request, { sessionId, plan } = 
         && session.createSessionId === request.sessionId
         && session.createPlan === request.plan
         && sessionId === request.sessionId
-        && plan === request.plan);
+        && plan === request.plan
+        && !request.controller.signal.aborted);
 }
 
 export function completeHybridCreation(session, request) {

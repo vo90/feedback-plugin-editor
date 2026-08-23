@@ -48,3 +48,33 @@ test('Hybrid background tasks terminate immediately when their session aborts', 
     await assert.rejects(pending, error => error?.name === 'AbortError');
     assert.equal(worker.terminated, true);
 });
+
+test('Hybrid analysis remains functional when module Workers are unavailable', async () => {
+    const arrangement = name => ({
+        name,
+        type: 'guitar',
+        tuning: [0, 0, 0, 0, 0, 0],
+        capo: 0,
+        notes: [],
+        chords: [],
+    });
+    const progress = [];
+    const result = await runHybridBackgroundTask('analyze', {
+        strategy: 'gap-fill',
+        sources: {
+            primary: arrangement('Lead'),
+            secondary: arrangement('Rhythm'),
+            beats: [],
+            sections: [],
+        },
+        gapFill: {},
+    }, {
+        workerFactory: () => null,
+        onProgress: phase => progress.push(phase),
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.strategy, 'gap-fill');
+    assert.deepEqual(progress, ['analyze']);
+    assert.doesNotThrow(() => structuredClone(result),
+        'a plan returned through Worker.postMessage must remain cloneable');
+});

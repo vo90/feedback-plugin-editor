@@ -105,6 +105,39 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
         'seek, bind, and maximize cannot multiply the playback animation loop');
 });
 
+test('Hybrid analysis and creation use cancellable background tasks with stale guards', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    assert.match(resolver, /runHybridAnalysisTask/);
+    assert.match(resolver, /runHybridMaterializationTask/);
+    const analyzeStart = resolver.indexOf('async function analyzeFromDialog');
+    const analyzeEnd = resolver.indexOf('function clearEditorSelection', analyzeStart);
+    const analyzeBody = resolver.slice(analyzeStart, analyzeEnd);
+    assert.match(analyzeBody, /beginHybridAnalysis\(hybridSession, \{ sessionId, configToken \}\)/);
+    assert.match(analyzeBody, /signal:\s*request\.controller\.signal/);
+    assert.match(analyzeBody, /hybridAnalysisIsCurrent/);
+    assert.match(analyzeBody, /completeHybridAnalysis/);
+    assert.match(analyzeBody, /installHybridPlan\(hybridSession, plan\)/);
+    assert.doesNotMatch(analyzeBody,
+        /analyzeGapFillComposite|analyzeGuidedComposite|analyzeExperimentalAutoComposite/,
+        'the modal must not run a planner directly on the renderer thread');
+
+    const finishStart = resolver.indexOf('async function finishMerge');
+    const finishEnd = resolver.indexOf('function setCompositeCreationUi', finishStart);
+    const finishBody = resolver.slice(finishStart, finishEnd);
+    assert.ok(finishBody.indexOf('setCompositeCreationUi(true)')
+        < finishBody.indexOf('await waitForCompositeUiPaint()'),
+    'Creating state is installed before yielding a paint');
+    assert.ok(finishBody.indexOf('await waitForCompositeUiPaint()')
+        < finishBody.indexOf('runHybridMaterializationTask'),
+    'materialization starts only after the Creating state can paint');
+    assert.match(finishBody, /signal:\s*request\.controller\.signal/);
+    assert.doesNotMatch(finishBody, /materializeCompositeArrangement/,
+        'the Create button must not materialize synchronously in the renderer');
+    assert.match(resolver,
+        /function closeCompositeModalImmediately[\s\S]*cancelHybridAnalysis\(hybridSession\)/,
+        'closing or tearing down the modal aborts any background analysis');
+});
+
 test('Hybrid playhead is visible and exact before, during, and after playback', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
     assert.match(resolver, /function compositeTimelineDisplayBeatAtTime/);
@@ -481,6 +514,17 @@ test('Hybrid creation becomes stale after a song switch or plan replacement', ()
     assert.equal(hybridCreationIsCurrent(session, request, {
         sessionId: 'song-a', plan: { strategy: 'guided' },
     }), false, 'a delayed response cannot enter a replacement plan');
+});
+
+test('an explicitly aborted Hybrid creation request is never current', () => {
+    const session = createHybridBuilderSession();
+    const plan = { strategy: 'guided' };
+    session.plan = plan;
+    const request = beginHybridCreation(session, { sessionId: 'song-a', plan });
+    request.controller.abort();
+    assert.equal(hybridCreationIsCurrent(session, request, {
+        sessionId: 'song-a', plan,
+    }), false);
 });
 
 test('cancelling Hybrid creation aborts and permanently invalidates its request', () => {
