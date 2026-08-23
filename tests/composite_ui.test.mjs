@@ -59,7 +59,8 @@ test('Hybrid review uses one responsive sticky toolbar instead of a side or belo
     const theme = fs.readFileSync(new URL('../assets/v3-theme.css', import.meta.url), 'utf8');
     assert.match(resolver, /editor-composite-review-toolbar/);
     assert.match(resolver, /Decision details/);
-    assert.match(resolver, /renderCompositeTimelineWorkspace\(timelineView, false, reviewToolbar\)/);
+    assert.match(resolver,
+        /renderCompositeTimelineWorkspace\(\s*presentation\.timelineView, false, presentation\.reviewToolbar\)/);
     assert.match(resolver, /editor-composite-review-details-open-up/);
     assert.match(resolver, /panel\.style\.maxHeight/);
     assert.doesNotMatch(resolver, /editor-composite-decision-panel|editor-composite-review-shell/);
@@ -67,6 +68,57 @@ test('Hybrid review uses one responsive sticky toolbar instead of a side or belo
     assert.match(theme, /@media \(max-width: 56rem\)/);
     assert.match(theme, /@media \(max-height: 44rem\)/);
     assert.doesNotMatch(theme, /editor-composite-decision-panel|editor-composite-review-shell/);
+});
+
+test('same-decision Hybrid choices retain the workspace and update its live model', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const refreshStart = resolver.indexOf('function refreshCurrentCompositeReview');
+    const refreshEnd = resolver.indexOf('\nfunction renderResult', refreshStart);
+    const refreshBody = resolver.slice(refreshStart, refreshEnd);
+    assert.match(refreshBody,
+        /previousToolbar\.replaceWith\(nextToolbar\)[\s\S]*scheduleCompositeReviewTimelineRefresh/,
+        'the same workspace receives a fresh toolbar before its live view refresh');
+    const timelineRefreshStart = resolver.indexOf(
+        'function scheduleCompositeReviewTimelineRefresh');
+    const timelineRefreshEnd = resolver.indexOf(
+        '\n// Resolution and manual-note changes', timelineRefreshStart);
+    const timelineRefreshBody = resolver.slice(timelineRefreshStart, timelineRefreshEnd);
+    assert.match(refreshBody,
+        /captureCompositeReviewUi[\s\S]*restoreCompositeReviewUi/,
+        'focus, open details, and workspace scroll survive the toolbar replacement');
+    assert.match(timelineRefreshBody,
+        /requestAnimationFrame[\s\S]*requestAnimationFrame[\s\S]*dom\.view = presentation\.timelineView/,
+        'full-song model work starts only after the compact decision state can paint');
+    assert.match(timelineRefreshBody,
+        /refreshCompositeTimelineStaticMap[\s\S]*scheduleCompositeTimelineStandby/,
+        'the bounded map updates before dense lanes render through the hidden camera');
+    assert.match(timelineRefreshBody,
+        /includePlayability:\s*false[\s\S]*freshnessDeadlineAt:[\s\S]*\+ 240[\s\S]*onCommitted/,
+        'choice feedback skips full Experimental linting and has a bounded visible-lane commit');
+    assert.doesNotMatch(refreshBody, /result\.innerHTML\s*=/,
+        'same-decision input never replaces the full result DOM');
+    assert.doesNotMatch(refreshBody, /renderResult\(\)/,
+        'same-decision input has no full-render fallback');
+    assert.doesNotMatch(refreshBody,
+        /stopCompositeTimelineUi|bindCompositeTimelineEvents|bindResultEvents/,
+        'retained controls keep their one existing timeline listener set');
+
+    const toggleStart = resolver.indexOf('function toggleCompositeCustomEntry');
+    const toggleEnd = resolver.indexOf('\nfunction inspectExperimentalPassage', toggleStart);
+    const toggleBody = resolver.slice(toggleStart, toggleEnd);
+    assert.match(toggleBody, /markHybridResolutionChanged[\s\S]*refreshCurrentCompositeReview/);
+    assert.doesNotMatch(toggleBody, /renderResult\(\)/,
+        'manual note toggles use the retained update directly');
+
+    const bindStart = resolver.indexOf('function bindCompositeTimelineEvents');
+    const bindEnd = resolver.indexOf('\nfunction renderFinalPreviewResult', bindStart);
+    const boundCallbacks = resolver.slice(bindStart, bindEnd);
+    assert.match(boundCallbacks, /boundDom\.view\.context/);
+    assert.match(boundCallbacks, /const liveView = boundDom\.view/,
+        'retained timeline handlers read the current model instead of a captured decision');
+    assert.match(resolver,
+        /laneId:\s*note\.closest[\s\S]*slot\.lanes\.get\(focusKey\.laneId\)/,
+        'camera swaps restore a duplicate note id inside its original track');
 });
 
 test('Hybrid playback keeps heavy rendering off the per-frame follow path and shares seek state', () => {

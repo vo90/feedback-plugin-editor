@@ -81,6 +81,7 @@ import {
     hybridCloseGuardKind,
     hybridCreationIsCurrent,
     installHybridPlan,
+    markHybridResolutionChanged,
     markHybridReviewWork,
     resetHybridBuilderReview,
 } from './session.js';
@@ -179,6 +180,8 @@ let timelineStandbyCancel = null;
 let timelineStandbySwapFrame = 0;
 let timelineRenderGeneration = 0;
 let timelineBindFrame = 0;
+let timelineReviewRefreshFrame = 0;
+let timelineReviewRefreshGeneration = 0;
 let timelineResizeObserver = null;
 let timelineProgrammaticScrollTarget = null;
 let dialogResizeObserver = null;
@@ -635,12 +638,14 @@ function rememberCompositePreviewSession() {
 }
 
 function updateCompositePreviewButtons() {
+    const reviewRefreshPending = !!timelineViewportDom?.reviewRefreshPending;
     for (const button of document.querySelectorAll('[data-composite-preview]')) {
         const active = button.dataset.compositePreview === hybridSession.previewMode;
         const available = button.dataset.compositePreviewAvailable === 'true';
         button.setAttribute('aria-pressed', active ? 'true' : 'false');
-        button.setAttribute('aria-busy', active && hybridSession.previewLoading ? 'true' : 'false');
-        button.disabled = hybridSession.previewLoading || !available;
+        button.setAttribute('aria-busy', active && hybridSession.previewLoading
+            || reviewRefreshPending ? 'true' : 'false');
+        button.disabled = hybridSession.previewLoading || reviewRefreshPending || !available;
         button.classList.toggle('ring-2', active);
         button.classList.toggle('ring-emerald-400', active);
     }
@@ -995,7 +1000,9 @@ function reviewPlanTimelineView() {
 }
 
 function currentTimelineView() {
-    const cacheKey = `${hybridSession.stage}:${hybridSession.conflictIndex}:${hybridSession.inspectedPassageId}`;
+    const cacheKey = `${hybridSession.stage}:${hybridSession.conflictIndex}:${hybridSession.inspectedPassageId}`
+        + `:${hybridSession.planRevision}:${hybridSession.resolutionRevision}`
+        + `:${hybridSession.viewRevision}`;
     if (timelineViewCache?.plan === hybridSession.plan
             && timelineViewCache.key === cacheKey) return timelineViewCache.view;
     const view = hybridSession.stage === 'final-preview'
@@ -1028,6 +1035,12 @@ function setCompositeContextLoop(view, requestedStartTime = null) {
 }
 
 async function startCompositePreview(mode) {
+    if (timelineViewportDom?.reviewRefreshPending) {
+        const message = 'Updating the tracks for your choice…';
+        setCompositePreviewHelp(message);
+        setStatus(`Hybrid preview: ${message}`);
+        return;
+    }
     const view = currentPreviewView();
     if (!view) return;
     const requestedStartTime = (hybridSession.previewPlaying || hybridSession.previewMode)
@@ -1180,13 +1193,15 @@ function renderCompositeReviewToolbar({
         + `<button type="button" id="editor-composite-apply-next" class="editor-composite-review-continue" ${model.canContinue ? '' : 'disabled'}>${_editorEscHtml(continueLabel)}</button></div></section>`;
 }
 
-function renderConflict(plan) {
-    if (!plan.conflicts.length) {
-        return `<div class="rounded border border-emerald-700/50 bg-emerald-950/20 p-4 text-sm text-emerald-100 flex flex-wrap items-center justify-between gap-3">`
-            + `<div><b class="block text-base mb-1">No choices needed</b>The tracks match here, or only one track is playing at a time. The hybrid is ready to create.</div>`
-            + `<button type="button" id="editor-composite-edit-settings" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm text-gray-200">Back and adjust</button></div>`;
-    }
-    hybridSession.conflictIndex = Math.max(0, Math.min(hybridSession.conflictIndex, plan.conflicts.length - 1));
+function compositeReviewStateClass(group) {
+    return group?.validationError ? 'border-red-700/60'
+        : group?.resolution ? 'border-emerald-700/60' : 'border-amber-700/60';
+}
+
+function currentCompositeReviewPresentation(plan, { includeTimeline = true } = {}) {
+    if (!plan?.conflicts?.length) return null;
+    hybridSession.conflictIndex = Math.max(0, Math.min(
+        hybridSession.conflictIndex, plan.conflicts.length - 1));
     const group = plan.conflicts[hybridSession.conflictIndex];
     const repeatContext = guidedRepeatContext(plan, group);
     const names = selectedSourceNames();
@@ -1199,8 +1214,6 @@ function renderConflict(plan) {
         secondaryName: names.secondary,
         customEntryIds: hasDraft ? draft : null,
     });
-    const resolvedClass = group.validationError ? 'border-red-700/60'
-        : group.resolution ? 'border-emerald-700/60' : 'border-amber-700/60';
     const unresolved = repeatContext
         ? repeatContext.unresolvedDecisions
         : plan.conflicts.filter(conflict => !conflict.resolution).length;
@@ -1208,7 +1221,8 @@ function renderConflict(plan) {
     const splitMarkup = group.splitPoints && group.splitPoints.length
         ? `<div><b class="text-gray-300">Divide this review section at a bar</b><p class="mt-0.5">Use this if the musical part changes inside the highlighted area.</p><div class="flex flex-wrap gap-1 mt-2">${group.splitPoints.map(point => `<button type="button" data-guided-split-beat="${point.beat}" class="px-2 py-1 rounded border border-gray-600 bg-dark-700 hover:border-gray-400">${_editorEscHtml(point.label)}</button>`).join('')}</div></div>`
         : '';
-    const decisionNumber = repeatContext ? repeatContext.groupIndex + 1 : hybridSession.conflictIndex + 1;
+    const decisionNumber = repeatContext
+        ? repeatContext.groupIndex + 1 : hybridSession.conflictIndex + 1;
     const decisionTotal = repeatContext ? repeatContext.groups.length : plan.conflicts.length;
     const model = buildCompositeReviewToolbarModel({
         plan,
@@ -1225,13 +1239,33 @@ function renderConflict(plan) {
                 || hybridSession.customDrafts.has(candidate.block.id))
             : group.resolution || hasDraft,
     });
-    const timelineView = reviewPlanTimelineView();
-    timelineView.selectedLaneId = model.selectedLaneId;
-    const reviewToolbar = renderCompositeReviewToolbar({
-        model, group, view, names, repeatContext, rangeLabel, splitMarkup,
-    });
-    return `<section class="rounded border ${resolvedClass} bg-dark-800/70 p-2.5">`
-        + renderCompositeTimelineWorkspace(timelineView, false, reviewToolbar)
+    const timelineView = includeTimeline ? currentTimelineView() : null;
+    if (includeTimeline && !timelineView) return null;
+    if (timelineView) timelineView.selectedLaneId = model.selectedLaneId;
+    return {
+        group,
+        repeatContext,
+        names,
+        view,
+        model,
+        timelineView,
+        stateClass: compositeReviewStateClass(group),
+        reviewToolbar: renderCompositeReviewToolbar({
+            model, group, view, names, repeatContext, rangeLabel, splitMarkup,
+        }),
+    };
+}
+
+function renderConflict(plan) {
+    if (!plan.conflicts.length) {
+        return `<div class="rounded border border-emerald-700/50 bg-emerald-950/20 p-4 text-sm text-emerald-100 flex flex-wrap items-center justify-between gap-3">`
+            + `<div><b class="block text-base mb-1">No choices needed</b>The tracks match here, or only one track is playing at a time. The hybrid is ready to create.</div>`
+            + `<button type="button" id="editor-composite-edit-settings" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm text-gray-200">Back and adjust</button></div>`;
+    }
+    const presentation = currentCompositeReviewPresentation(plan);
+    return `<section data-composite-review-shell class="rounded border ${presentation.stateClass} bg-dark-800/70 p-2.5">`
+        + renderCompositeTimelineWorkspace(
+            presentation.timelineView, false, presentation.reviewToolbar)
         + `</section>`;
 }
 
@@ -1261,8 +1295,9 @@ function toggleCompositeCustomEntry(entryId) {
     }
     hybridSession.customDrafts.set(conflict.id, [...draft]);
     resolveReviewChoice(hybridSession.plan, conflict.id, 'custom', [...draft]);
+    markHybridResolutionChanged(hybridSession);
     markHybridReviewWork(hybridSession);
-    renderResult();
+    refreshCurrentCompositeReview();
 }
 
 function inspectExperimentalPassage(passageId) {
@@ -1290,38 +1325,41 @@ function applyExperimentalPassageFilter(value = hybridSession.passageFilter) {
     }
 }
 
-function bindResultEvents() {
-    const result = byId('editor-composite-result');
-    if (!result || !hybridSession.plan) return;
-    for (const details of result.querySelectorAll('.editor-composite-review-details')) {
-        details.addEventListener('toggle', () => {
-            if (!details.open) return;
-            requestAnimationFrame(() => {
-                const panel = details.querySelector('.editor-composite-review-details-panel');
-                const boundary = byId('editor-composite-result-workspace')
-                    || byId('editor-composite-dialog');
-                if (!panel || !boundary) return;
-                const summaryRect = details.querySelector('summary')?.getBoundingClientRect();
-                const boundaryRect = boundary.getBoundingClientRect();
-                if (!summaryRect) return;
-                const below = Math.max(0, boundaryRect.bottom - summaryRect.bottom - 12);
-                const above = Math.max(0, summaryRect.top - boundaryRect.top - 12);
-                const desiredHeight = Math.min(480, panel.scrollHeight || 480);
-                const openUp = desiredHeight > below && above > below;
-                details.classList.toggle('editor-composite-review-details-open-up', openUp);
-                const available = openUp ? above : below;
-                panel.style.maxHeight = `${Math.max(144, Math.min(480, available))}px`;
-            });
+function bindCompositeReviewDetails(details) {
+    details?.addEventListener('toggle', () => {
+        if (!details.open) return;
+        requestAnimationFrame(() => {
+            const panel = details.querySelector('.editor-composite-review-details-panel');
+            const boundary = byId('editor-composite-result-workspace')
+                || byId('editor-composite-dialog');
+            if (!panel || !boundary) return;
+            const summaryRect = details.querySelector('summary')?.getBoundingClientRect();
+            const boundaryRect = boundary.getBoundingClientRect();
+            if (!summaryRect) return;
+            const below = Math.max(0, boundaryRect.bottom - summaryRect.bottom - 12);
+            const above = Math.max(0, summaryRect.top - boundaryRect.top - 12);
+            const desiredHeight = Math.min(480, panel.scrollHeight || 480);
+            const openUp = desiredHeight > below && above > below;
+            details.classList.toggle('editor-composite-review-details-open-up', openUp);
+            const available = openUp ? above : below;
+            panel.style.maxHeight = `${Math.max(144, Math.min(480, available))}px`;
         });
+    });
+}
+
+function bindCompositeReviewToolbarEvents(toolbar) {
+    if (!toolbar) return;
+    for (const details of toolbar.querySelectorAll('.editor-composite-review-details')) {
+        bindCompositeReviewDetails(details);
     }
-    for (const marker of result.querySelectorAll('[data-conflict-index]')) {
+    for (const marker of toolbar.querySelectorAll('[data-conflict-index]')) {
         marker.addEventListener('click', () => {
             hybridSession.conflictIndex = Number(marker.dataset.conflictIndex) || 0;
             prepareCurrentReviewFocus(true);
             renderResult();
         });
     }
-    for (const button of result.querySelectorAll('[data-guided-split-beat]')) {
+    for (const button of toolbar.querySelectorAll('[data-guided-split-beat]')) {
         button.addEventListener('click', () => {
             const block = hybridSession.plan.conflicts[hybridSession.conflictIndex];
             const split = splitGuidedRepeatGroup(hybridSession.plan, block.id,
@@ -1331,18 +1369,152 @@ function bindResultEvents() {
                 renderResult();
                 return;
             }
+            markHybridResolutionChanged(hybridSession);
             markHybridReviewWork(hybridSession);
-            for (const replacedId of split.replacedBlockIds || [block.id]) hybridSession.customDrafts.delete(replacedId);
+            for (const replacedId of split.replacedBlockIds || [block.id]) {
+                hybridSession.customDrafts.delete(replacedId);
+            }
             hybridSession.conflictIndex = split.index;
             prepareCurrentReviewFocus(true);
             renderResult();
         });
     }
-    byId('editor-composite-edit-settings')?.addEventListener('click', () => {
+    toolbar.querySelector('#editor-composite-edit-settings')?.addEventListener('click', () => {
         endCompositePreviewPlayback();
         setCompositeReviewMode(false);
         byId('editor-composite-primary')?.focus();
     });
+    toolbar.querySelector('#editor-composite-skip-experimental-review')?.addEventListener('click', () => {
+        for (const conflict of hybridSession.plan.conflicts) {
+            if (!conflict.resolution) resolveCompositeConflict(
+                hybridSession.plan, conflict.id, 'primary');
+        }
+        markHybridResolutionChanged(hybridSession);
+        markHybridReviewWork(hybridSession);
+        enterCompositeFinalPreview();
+    });
+    const moveDecision = offset => {
+        const block = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+        const context = guidedRepeatContext(hybridSession.plan, block);
+        const target = context?.groups[context.groupIndex + offset];
+        if (target) {
+            activateGuidedReviewGroup(hybridSession.plan, target, false);
+            prepareCurrentReviewFocus(true);
+        } else if (!context) {
+            hybridSession.conflictIndex = Math.max(0, Math.min(
+                hybridSession.plan.conflicts.length - 1,
+                hybridSession.conflictIndex + offset,
+            ));
+            prepareCurrentReviewFocus(true);
+        }
+        renderResult();
+    };
+    toolbar.querySelector('#editor-composite-prev')?.addEventListener(
+        'click', () => moveDecision(-1));
+    toolbar.querySelector('#editor-composite-next')?.addEventListener(
+        'click', () => moveDecision(1));
+    for (const button of toolbar.querySelectorAll('[data-resolution]')) {
+        button.addEventListener('click', () => {
+            const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+            const resolution = button.dataset.resolution;
+            if (resolution === 'custom') {
+                if (!hybridSession.customDrafts.has(conflict.id)) {
+                    hybridSession.customDrafts.set(conflict.id,
+                        conflict.resolution === 'custom'
+                            ? [...conflict.selectedEntryIds]
+                            : hybridSession.plan.strategy === 'experimental'
+                                ? conflict.secondaryEntries.map(entry => entry.id)
+                                : conflict.primaryEntries.map(entry => entry.id));
+                }
+                const draft = hybridSession.customDrafts.get(conflict.id);
+                resolveReviewChoice(hybridSession.plan, conflict.id, 'custom', draft);
+            } else {
+                const repeatContext = guidedRepeatContext(hybridSession.plan, conflict);
+                for (const member of repeatContext?.members || [{ block: conflict }]) {
+                    hybridSession.customDrafts.delete(member.block.id);
+                }
+                resolveReviewChoice(hybridSession.plan, conflict.id, resolution);
+            }
+            markHybridResolutionChanged(hybridSession);
+            markHybridReviewWork(hybridSession);
+            refreshCurrentCompositeReview();
+        });
+    }
+    for (const checkbox of toolbar.querySelectorAll('[data-entry-id]')) {
+        checkbox.addEventListener('change', () => {
+            toggleCompositeCustomEntry(checkbox.dataset.entryId);
+        });
+    }
+    toolbar.querySelector('#editor-composite-reset-choice')?.addEventListener('click', () => {
+        const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+        const context = guidedRepeatContext(hybridSession.plan, conflict);
+        for (const member of context?.members || [{ block: conflict }]) {
+            hybridSession.customDrafts.delete(member.block.id);
+        }
+        clearReviewChoice(hybridSession.plan, conflict.id);
+        markHybridResolutionChanged(hybridSession);
+        markHybridReviewWork(hybridSession);
+        refreshCurrentCompositeReview();
+    });
+    toolbar.querySelector('#editor-composite-detach-occurrence')?.addEventListener('click', () => {
+        const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
+        hybridSession.customDrafts.delete(conflict.id);
+        const detached = detachGuidedRepeatOccurrence(hybridSession.plan, conflict.id);
+        if (!detached.ok) conflict.validationError = detached.error;
+        else {
+            markHybridResolutionChanged(hybridSession);
+            markHybridReviewWork(hybridSession);
+        }
+        renderResult();
+    });
+    toolbar.querySelector('#editor-composite-apply-next')?.addEventListener('click', () => {
+        const context = guidedRepeatContext(hybridSession.plan,
+            hybridSession.plan.conflicts[hybridSession.conflictIndex]);
+        let target = null;
+        if (context) {
+            for (let offset = 1; offset < context.groups.length; offset++) {
+                const candidate = context.groups[(context.groupIndex + offset)
+                    % context.groups.length];
+                if (candidate.memberIds.some(id => {
+                    const block = hybridSession.plan.conflicts.find(item => item.id === id);
+                    return block && !block.resolution;
+                })) { target = candidate; break; }
+            }
+        }
+        if (target) {
+            activateGuidedReviewGroup(hybridSession.plan, target);
+            prepareCurrentReviewFocus(true);
+            renderResult();
+        } else if (!context) {
+            const next = hybridSession.plan.conflicts.findIndex((block, index) =>
+                index > hybridSession.conflictIndex && !block.resolution);
+            const wrapped = next >= 0 ? next
+                : hybridSession.plan.conflicts.findIndex(block => !block.resolution);
+            if (wrapped >= 0) {
+                hybridSession.conflictIndex = wrapped;
+                prepareCurrentReviewFocus(true);
+                renderResult();
+            } else {
+                enterCompositeFinalPreview();
+            }
+        } else {
+            enterCompositeFinalPreview();
+        }
+    });
+}
+
+function bindResultEvents() {
+    const result = byId('editor-composite-result');
+    if (!result || !hybridSession.plan) return;
+    const reviewToolbar = result.querySelector('.editor-composite-review-toolbar');
+    bindCompositeReviewToolbarEvents(reviewToolbar);
+    if (!reviewToolbar) {
+        byId('editor-composite-edit-settings')?.addEventListener('click', () => {
+            endCompositePreviewPlayback();
+            setCompositeReviewMode(false);
+            byId('editor-composite-primary')?.focus();
+        });
+    }
     byId('editor-composite-copy-report')?.addEventListener('click', async () => {
         let report = hybridSession.plan?.comparisonReport
             || experimentalComparisonReport(hybridSession.plan);
@@ -1382,38 +1554,12 @@ function bindResultEvents() {
         invalidateCompositeTimelineView();
         renderResult();
     });
-    byId('editor-composite-skip-experimental-review')?.addEventListener('click', () => {
-        for (const conflict of hybridSession.plan.conflicts) {
-            if (!conflict.resolution) resolveCompositeConflict(
-                hybridSession.plan, conflict.id, 'primary');
-        }
-        markHybridReviewWork(hybridSession);
-        enterCompositeFinalPreview();
-    });
     byId('editor-composite-back-review')?.addEventListener('click', () => {
         endCompositePreviewPlayback();
         hybridSession.stage = 'review';
         prepareCurrentReviewFocus(true);
         renderResult();
     });
-    const moveDecision = offset => {
-        const block = hybridSession.plan.conflicts[hybridSession.conflictIndex];
-        const context = guidedRepeatContext(hybridSession.plan, block);
-        const target = context?.groups[context.groupIndex + offset];
-        if (target) {
-            activateGuidedReviewGroup(hybridSession.plan, target, false);
-            prepareCurrentReviewFocus(true);
-        } else if (!context) {
-            hybridSession.conflictIndex = Math.max(0, Math.min(
-                hybridSession.plan.conflicts.length - 1,
-                hybridSession.conflictIndex + offset,
-            ));
-            prepareCurrentReviewFocus(true);
-        }
-        renderResult();
-    };
-    byId('editor-composite-prev')?.addEventListener('click', () => moveDecision(-1));
-    byId('editor-composite-next')?.addEventListener('click', () => moveDecision(1));
     for (const button of result.querySelectorAll('[data-composite-preview]')) {
         button.addEventListener('click', () => toggleCompositePreview(
             button.dataset.compositePreview));
@@ -1460,84 +1606,6 @@ function bindResultEvents() {
     });
     byId('editor-composite-preview-volume')?.addEventListener(
         'change', flushHybridPreviewPreferences);
-    for (const button of result.querySelectorAll('[data-resolution]')) {
-        button.addEventListener('click', () => {
-            const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
-            const resolution = button.dataset.resolution;
-            if (resolution === 'custom') {
-                if (!hybridSession.customDrafts.has(conflict.id)) {
-                    hybridSession.customDrafts.set(conflict.id, conflict.resolution === 'custom'
-                        ? [...conflict.selectedEntryIds]
-                        : hybridSession.plan.strategy === 'experimental'
-                            ? conflict.secondaryEntries.map(e => e.id)
-                            : conflict.primaryEntries.map(e => e.id));
-                }
-                const draft = hybridSession.customDrafts.get(conflict.id);
-                resolveReviewChoice(hybridSession.plan, conflict.id, 'custom', draft);
-            } else {
-                const repeatContext = guidedRepeatContext(hybridSession.plan, conflict);
-                for (const member of repeatContext?.members || [{ block: conflict }]) {
-                    hybridSession.customDrafts.delete(member.block.id);
-                }
-                resolveReviewChoice(hybridSession.plan, conflict.id, resolution);
-            }
-            markHybridReviewWork(hybridSession);
-            renderResult();
-        });
-    }
-    for (const checkbox of result.querySelectorAll('[data-entry-id]')) {
-        checkbox.addEventListener('change', () => {
-            toggleCompositeCustomEntry(checkbox.dataset.entryId);
-        });
-    }
-    byId('editor-composite-reset-choice')?.addEventListener('click', () => {
-        const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
-        const context = guidedRepeatContext(hybridSession.plan, conflict);
-        for (const member of context?.members || [{ block: conflict }]) hybridSession.customDrafts.delete(member.block.id);
-        clearReviewChoice(hybridSession.plan, conflict.id);
-        markHybridReviewWork(hybridSession);
-        renderResult();
-    });
-    byId('editor-composite-detach-occurrence')?.addEventListener('click', () => {
-        const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
-        hybridSession.customDrafts.delete(conflict.id);
-        const detached = detachGuidedRepeatOccurrence(hybridSession.plan, conflict.id);
-        if (!detached.ok) conflict.validationError = detached.error;
-        else markHybridReviewWork(hybridSession);
-        renderResult();
-    });
-    byId('editor-composite-apply-next')?.addEventListener('click', () => {
-        const context = guidedRepeatContext(hybridSession.plan, hybridSession.plan.conflicts[hybridSession.conflictIndex]);
-        let target = null;
-        if (context) {
-            for (let offset = 1; offset < context.groups.length; offset++) {
-                const candidate = context.groups[(context.groupIndex + offset) % context.groups.length];
-                if (candidate.memberIds.some(id => {
-                    const block = hybridSession.plan.conflicts.find(item => item.id === id);
-                    return block && !block.resolution;
-                })) { target = candidate; break; }
-            }
-        }
-        if (target) {
-            activateGuidedReviewGroup(hybridSession.plan, target);
-            prepareCurrentReviewFocus(true);
-            renderResult();
-        } else if (!context) {
-            const next = hybridSession.plan.conflicts.findIndex((block, index) =>
-                index > hybridSession.conflictIndex && !block.resolution);
-            const wrapped = next >= 0 ? next
-                : hybridSession.plan.conflicts.findIndex(block => !block.resolution);
-            if (wrapped >= 0) {
-                hybridSession.conflictIndex = wrapped;
-                prepareCurrentReviewFocus(true);
-                renderResult();
-            } else {
-                enterCompositeFinalPreview();
-            }
-        } else {
-            enterCompositeFinalPreview();
-        }
-    });
     if (_compositeTimelineStageActivePure(hybridSession.stage)) {
         bindCompositeTimelineEvents();
     }
@@ -1739,6 +1807,30 @@ function renderCompositeTimelineMapOverlays(view, viewportRange) {
         + `<span style="position:absolute;left:-1px;top:2px;width:2px;height:38px;background:#fb7185"></span></span>`;
 }
 
+function compositeTimelineMapKeyMarkup(view) {
+    const decisionKey = view.decisions.length
+        ? (view.decisions.some(decision => decision.state === 'unresolved')
+            ? '<span><i class="editor-composite-map-review" aria-hidden="true"></i>Needs review</span>' : '')
+            + (view.decisions.some(decision => decision.state === 'resolved')
+                ? '<span><i class="editor-composite-map-resolved" aria-hidden="true"></i>Reviewed sections</span>' : '')
+            + (view.decisions.some(decision => decision.state === 'invalid')
+                ? '<span><i class="editor-composite-map-invalid" aria-hidden="true"></i>Needs attention</span>' : '')
+        : '';
+    const passageKey = view.passages?.length
+        ? '<span><i class="editor-composite-map-passage-auto" aria-hidden="true"></i>Automatic passage</span>'
+            + (view.passages.some(passage => passage.state === 'review')
+                ? '<span><i class="editor-composite-map-review" aria-hidden="true"></i>Passage to review</span>' : '')
+            + (view.passages.some(passage => ['accepted', 'accepted-partial'].includes(passage.state))
+                ? '<span><i class="editor-composite-map-resolved" aria-hidden="true"></i>Accepted passage</span>' : '')
+            + (view.passages.some(passage => ['left-out', 'declined'].includes(passage.state))
+                ? '<span><i class="editor-composite-map-passage-out" aria-hidden="true"></i>Left-out passage</span>' : '')
+        : '';
+    return `<span><i class="editor-composite-map-base" aria-hidden="true"></i>Hybrid notes</span>`
+        + (view.hasFillAdditions
+            ? `<span><i class="editor-composite-map-fill" aria-hidden="true"></i>Added from ${_editorEscHtml(view.names.secondary)}</span>` : '')
+        + decisionKey + passageKey;
+}
+
 function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar = '') {
     const zoom = hybridPreviewPreferences.timelineZoom;
     const width = compositeTimelineContentWidthPure(view.context, zoom);
@@ -1780,23 +1872,6 @@ function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar
         : view.inspectedPassage
             ? 'The full song remains scrollable while playback loops this passage and its handoffs.'
             : 'All three tracks stay aligned while you scroll, zoom, and resize them.';
-    const decisionKey = view.decisions.length
-        ? (view.decisions.some(decision => decision.state === 'unresolved')
-            ? '<span><i class="editor-composite-map-review" aria-hidden="true"></i>Needs review</span>' : '')
-            + (view.decisions.some(decision => decision.state === 'resolved')
-                ? '<span><i class="editor-composite-map-resolved" aria-hidden="true"></i>Reviewed sections</span>' : '')
-            + (view.decisions.some(decision => decision.state === 'invalid')
-                ? '<span><i class="editor-composite-map-invalid" aria-hidden="true"></i>Needs attention</span>' : '')
-        : '';
-    const passageKey = view.passages?.length
-        ? '<span><i class="editor-composite-map-passage-auto" aria-hidden="true"></i>Automatic passage</span>'
-            + (view.passages.some(passage => passage.state === 'review')
-                ? '<span><i class="editor-composite-map-review" aria-hidden="true"></i>Passage to review</span>' : '')
-            + (view.passages.some(passage => ['accepted', 'accepted-partial'].includes(passage.state))
-                ? '<span><i class="editor-composite-map-resolved" aria-hidden="true"></i>Accepted passage</span>' : '')
-            + (view.passages.some(passage => ['left-out', 'declined'].includes(passage.state))
-                ? '<span><i class="editor-composite-map-passage-out" aria-hidden="true"></i>Left-out passage</span>' : '')
-        : '';
     const manualChip = view.manualSelectionActive && !reviewToolbar
         ? `<span class="rounded-full border border-amber-600/60 bg-amber-950/50 px-2 py-1 text-[11px] text-amber-100" role="status" title="Select notes in the aligned tracks; white outlines show notes included in the hybrid">Manual mix · outlined notes are included</span>` : '';
     return `<div class="sticky top-0 z-50 -mx-1 mb-2 rounded-lg border border-slate-700 bg-slate-950/95 p-1.5 shadow-xl backdrop-blur-sm">`
@@ -1812,7 +1887,7 @@ function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar
         + `<button type="button" id="editor-composite-lanes-reset" class="rounded bg-dark-700 px-2.5 py-1.5 text-left text-xs">Reset track sizes</button>`
         + `<p class="mt-1 border-t border-gray-700 pt-1 text-[11px] text-gray-500">Ruler: seek · Ctrl+wheel: zoom · drag lane edge: resize · Space: play/stop · 1–4: sound</p></div></details></div></div>`
         + `<section class="rounded-xl border border-slate-700 bg-slate-950/60 p-2">`
-        + `<div class="editor-composite-map-key"><span><i class="editor-composite-map-base" aria-hidden="true"></i>Hybrid notes</span>${view.hasFillAdditions ? `<span><i class="editor-composite-map-fill" aria-hidden="true"></i>Added from ${_editorEscHtml(view.names.secondary)}</span>` : ''}${decisionKey}${passageKey}</div>`
+        + `<div data-composite-map-key class="editor-composite-map-key">${compositeTimelineMapKeyMarkup(view)}</div>`
         + `<button type="button" id="editor-composite-timeline-map" class="relative mb-1.5 block w-full overflow-hidden rounded-lg border border-slate-700 bg-slate-950 p-0 text-left" style="touch-action:none" title="Click or drag to move through the song" aria-label="Navigate the whole song">${renderCompositeTimelineMapSvg(view, viewport)}${renderCompositeTimelineMapOverlays(view, viewport)}</button>`
         + `<div id="editor-composite-timeline-scroller" class="relative overflow-x-auto overflow-y-hidden rounded-lg border border-slate-700 bg-slate-950" style="contain:layout paint style" tabindex="0" aria-label="Scrollable full-song Hybrid timeline; Control plus mouse wheel changes time zoom">`
         + `<div id="editor-composite-timeline-content" class="relative" style="width:${width}px;min-width:100%;height:${timelineHeight}px">`
@@ -1831,12 +1906,14 @@ function cancelCompositeTimelineStandbyWork(dom = timelineViewportDom) {
     if (dom) dom.standbyPending = false;
 }
 
-function scheduleCompositeTimelineIdle(callback) {
+function scheduleCompositeTimelineIdle(callback, timeoutMs = 0) {
     if (typeof globalThis.requestIdleCallback === 'function') {
         // Do not use a timeout here. A timed-out idle callback is allowed to
         // run with no frame budget, which previously forced a dense lane into
         // the middle of playback every 50 ms.
-        const id = globalThis.requestIdleCallback(callback);
+        const timeout = Math.max(0, Number(timeoutMs) || 0);
+        const id = globalThis.requestIdleCallback(
+            callback, timeout ? { timeout } : undefined);
         return () => globalThis.cancelIdleCallback?.(id);
     }
     const id = setTimeout(() => {
@@ -1993,7 +2070,14 @@ function compositeTimelineFocusedControl(camera) {
     const active = document.activeElement;
     if (!camera?.contains(active)) return null;
     const note = active.closest?.('[data-composite-entry-id]');
-    if (note) return { kind: 'note', value: note.dataset.compositeEntryId };
+    if (note) {
+        return {
+            kind: 'note',
+            value: note.dataset.compositeEntryId,
+            laneId: note.closest?.('[data-composite-timeline-row]')
+                ?.dataset.compositeTimelineRow || '',
+        };
+    }
     const grip = active.closest?.('[data-composite-lane-resize]');
     if (grip) return { kind: 'grip', value: grip.dataset.compositeLaneResize };
     return { kind: 'timeline', value: '' };
@@ -2003,8 +2087,11 @@ function restoreCompositeTimelineFocus(dom, slot, focusKey) {
     if (!focusKey) return;
     let target = null;
     if (focusKey.kind === 'note') {
-        target = [...slot.camera.querySelectorAll('[data-composite-entry-id]')]
-            .find(entry => entry.dataset.compositeEntryId === focusKey.value);
+        const lane = focusKey.laneId ? slot.lanes.get(focusKey.laneId)?.row : slot.camera;
+        if (lane) {
+            target = [...lane.querySelectorAll('[data-composite-entry-id]')]
+                .find(entry => entry.dataset.compositeEntryId === focusKey.value);
+        }
     } else if (focusKey.kind === 'grip') {
         target = [...slot.camera.querySelectorAll('[data-composite-lane-resize]')]
             .find(grip => grip.dataset.compositeLaneResize === focusKey.value);
@@ -2034,16 +2121,19 @@ function refreshCompositeTimelineZoomControls(dom) {
 }
 
 function stopCompositeTimelineUi() {
+    timelineReviewRefreshGeneration += 1;
     cancelCompositeTimelineStandbyWork();
     if (timelineViewportFrame) cancelAnimationFrame(timelineViewportFrame);
     if (timelinePlayheadFrame) cancelAnimationFrame(timelinePlayheadFrame);
     if (timelineZoomFrame) cancelAnimationFrame(timelineZoomFrame);
     if (timelineBindFrame) cancelAnimationFrame(timelineBindFrame);
+    if (timelineReviewRefreshFrame) cancelAnimationFrame(timelineReviewRefreshFrame);
     for (const cleanup of timelineViewportDom?.cleanup || []) cleanup();
     timelineViewportFrame = 0;
     timelinePlayheadFrame = 0;
     timelineZoomFrame = 0;
     timelineBindFrame = 0;
+    timelineReviewRefreshFrame = 0;
     timelinePendingZoom = null;
     timelineProgrammaticScrollTarget = null;
     timelineResizeObserver?.disconnect();
@@ -2176,8 +2266,12 @@ function compositeTimelineVisualScrollLeft(dom = timelineViewportDom) {
         ? Number(dom.visualScrollLeft) : scroller.scrollLeft);
 }
 
-function scheduleCompositeTimelineStandby(dom, rawVisualScroll) {
+function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
     if (!dom?.view || !dom.scroller || (dom.cameraSlots?.length || 0) < 2) return;
+    const retainedOptions = dom.reviewRefreshOptions || {};
+    const freshnessDeadlineAt = Math.max(0, Number(
+        options.freshnessDeadlineAt ?? retainedOptions.freshnessDeadlineAt) || 0);
+    const onCommitted = options.onCommitted || retainedOptions.onCommitted || null;
     const zoom = hybridPreviewPreferences.timelineZoom;
     const visualScroll = clampCompositeTimelineScroll(dom, rawVisualScroll);
     const standbyIndex = dom.activeCameraIndex === 0 ? 1 : 0;
@@ -2252,10 +2346,16 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll) {
         const currentVisual = compositeTimelineVisualScrollLeft(dom);
         abandon();
         if (dom === timelineViewportDom) {
-            scheduleCompositeTimelineStandby(dom, currentVisual);
+            scheduleCompositeTimelineStandby(dom, currentVisual, {
+                freshnessDeadlineAt,
+                onCommitted,
+            });
         }
     };
     const queueStep = () => {
+        const now = globalThis.performance?.now?.() || Date.now();
+        const timeout = freshnessDeadlineAt
+            ? Math.max(16, freshnessDeadlineAt - now) : 0;
         cancelPendingIdle = scheduleCompositeTimelineIdle(deadline => {
             cancelPendingIdle = null;
             if (cancelled || generation !== timelineRenderGeneration
@@ -2264,8 +2364,15 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll) {
                 abandon();
                 return;
             }
-            if (compositeTimelineInputPending()
-                    || Math.max(0, Number(deadline?.timeRemaining?.()) || 0) < 8) {
+            const currentTime = globalThis.performance?.now?.() || Date.now();
+            // Ordinary scroll/render-ahead work remains purely idle. A review
+            // choice gets a bounded paused-transport escape hatch so the
+            // visible lanes cannot disagree with the chosen/audio result
+            // indefinitely under continuous pointer movement.
+            const freshnessDue = freshnessDeadlineAt && currentTime >= freshnessDeadlineAt
+                && !S.playing;
+            if (!freshnessDue && (compositeTimelineInputPending()
+                    || Math.max(0, Number(deadline?.timeRemaining?.()) || 0) < 8)) {
                 queueStep();
                 return;
             }
@@ -2313,9 +2420,10 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll) {
                     standby.pendingRange = null;
                     updateCompositeTimelineFixedLaneHeights(dom);
                     applyCompositeTimelineCamera(dom, swapState.currentVisual);
+                    onCommitted?.();
                 });
             });
-        });
+        }, timeout);
     };
     queueStep();
 }
@@ -2696,7 +2804,7 @@ function bindCompositeTimelineEvents() {
             hybridSession.timelineScrollLeft = visualScroll;
             applyCompositeTimelineCamera(dom, visualScroll);
         }
-        updateCompositeTimelineMapViewport(dom, view, scroller,
+        updateCompositeTimelineMapViewport(dom, dom.view, scroller,
             compositeTimelineVisualScrollLeft(dom));
         scheduleCompositeTimelineViewport();
     }, { passive: true });
@@ -2725,13 +2833,14 @@ function bindCompositeTimelineEvents() {
     scroller.addEventListener('touchstart', prepareManualScroll, { passive: true });
     const seekFromRuler = (event, slot) => {
         if (timelineViewportDom !== boundDom) return;
+        const liveView = boundDom.view;
         const ruler = slot.rulerSvg;
         const rect = ruler.getBoundingClientRect();
         const contentX = event.clientX - rect.left
             + (slot.renderOriginX || timelineViewportDom?.renderOriginX || 0);
         if (contentX < COMPOSITE_TIMELINE_GUTTER) return;
-        const beat = Math.max(view.context.startBeat, Math.min(view.context.endBeat,
-            compositeTimelineBeatForXPure(contentX, view.context,
+        const beat = Math.max(liveView.context.startBeat, Math.min(liveView.context.endBeat,
+            compositeTimelineBeatForXPure(contentX, liveView.context,
                 hybridPreviewPreferences.timelineZoom)));
         const time = Math.max(0, timeOf(hybridSession.plan.beats, beat));
         rememberCompositePreviewSession();
@@ -2756,7 +2865,7 @@ function bindCompositeTimelineEvents() {
     });
     byId('editor-composite-time-fit')?.addEventListener('click', () => {
         scheduleCompositeTimelineZoom(compositeTimelineFitZoomPure(
-            view.context, scroller.clientWidth), 0, true, true);
+            boundDom.view.context, scroller.clientWidth), 0, true, true);
     });
     byId('editor-composite-time-follow')?.addEventListener('click', () => {
         setHybridPreviewPreferences({
@@ -2770,13 +2879,13 @@ function bindCompositeTimelineEvents() {
             clientX,
             mapLeft: rect.left,
             mapWidth: rect.width,
-            context: view.context,
+            context: boundDom.view.context,
         });
         const time = Math.max(0, timeOf(hybridSession.plan.beats, beat));
         const scrollLeft = clampTimelineScroll(scroller,
             compositeTimelineCenteredScrollPure({
                 beat,
-                context: view.context,
+                context: boundDom.view.context,
                 zoom: hybridPreviewPreferences.timelineZoom,
                 viewportWidth: scroller.clientWidth,
             }));
@@ -2786,7 +2895,7 @@ function bindCompositeTimelineEvents() {
         hybridSession.timelineSeekTime = location.time;
         hybridSession.timelineScrollLeft = location.scrollLeft;
         const contentX = compositeTimelineXForBeatPure(
-            location.beat, view.context, hybridPreviewPreferences.timelineZoom);
+            location.beat, boundDom.view.context, hybridPreviewPreferences.timelineZoom);
         applyCompositeTimelineCamera(boundDom, location.scrollLeft, contentX);
         updateCompositeTimelineMapFrame(
             boundDom, location.beat, location.scrollLeft, 0, true);
@@ -2926,7 +3035,7 @@ function bindCompositeTimelineEvents() {
                 scrollLeft: clampTimelineScroll(scroller,
                     compositeTimelineCenteredScrollPure({
                         beat,
-                        context: view.context,
+                        context: boundDom.view.context,
                         zoom: hybridPreviewPreferences.timelineZoom,
                         viewportWidth: scroller.clientWidth,
                     })),
@@ -2943,7 +3052,7 @@ function bindCompositeTimelineEvents() {
         mapPointerGesture = null;
     });
     byId('editor-composite-focus-review')?.addEventListener('click', () => {
-        centerCurrentReviewInTimeline(view, scroller);
+        centerCurrentReviewInTimeline(boundDom.view, scroller);
     });
     const applyLaneHeights = laneHeights => {
         setHybridPreviewPreferences({
@@ -3067,13 +3176,15 @@ function bindCompositeTimelineEvents() {
     timelineBindFrame = requestAnimationFrame(() => {
         timelineBindFrame = 0;
         if (timelineViewportDom !== boundDom) return;
-        if (view.review && hybridSession.timelineFocusReview) {
-            centerCurrentReviewInTimeline(view, scroller);
-        } else if (view.passageFocus && hybridSession.timelineFocusPassage) {
-            const beat = (view.passageFocus.startBeat + view.passageFocus.endBeat) / 2;
+        const liveView = boundDom.view;
+        if (liveView.review && hybridSession.timelineFocusReview) {
+            centerCurrentReviewInTimeline(liveView, scroller);
+        } else if (liveView.passageFocus && hybridSession.timelineFocusPassage) {
+            const beat = (liveView.passageFocus.startBeat
+                + liveView.passageFocus.endBeat) / 2;
             const nextScroll = clampTimelineScroll(scroller,
                 compositeTimelineCenteredScrollPure({
-                    beat, context: view.context,
+                    beat, context: liveView.context,
                     zoom: hybridPreviewPreferences.timelineZoom,
                     viewportWidth: scroller.clientWidth,
                 }));
@@ -3116,29 +3227,27 @@ function renderFinalPreviewResult(plan, names, normalizationDetails, repeatNotic
         + `</section>`;
 }
 
-function renderResult() {
-    invalidateCompositeTimelineView();
-    stopCompositeTimelineUi();
-    if (hybridSession.previewMode) endCompositePreviewPlayback();
-    const result = byId('editor-composite-result');
-    if (!result || !hybridSession.plan) return;
-    updateCompositeStageIndicator(hybridSession.stage);
-    if (hybridSession.plan.strategy === 'experimental') {
-        refreshExperimentalPlayability(hybridSession.plan);
-        hybridSession.plan.comparisonReport = experimentalComparisonReport(hybridSession.plan);
+function refreshCompositePlanDerivedState(plan, { includePlayability = true } = {}) {
+    if (plan.strategy === 'experimental' && includePlayability) {
+        refreshExperimentalPlayability(plan);
+        plan.comparisonReport = experimentalComparisonReport(plan);
     }
-    if (hybridSession.plan.strategy === 'guided') guidedReviewGroups(hybridSession.plan);
-    const stats = hybridSession.plan.stats;
-    const unresolvedBlocks = hybridSession.plan.conflicts.filter(c => !c.resolution).length;
-    const normalized = stats.timingAdjustments || 0;
-    const normalizationNotice = normalized ? `<details class="mb-3 rounded border border-gray-700 bg-dark-900/50 px-3 py-2 text-xs text-gray-400">`
-        + `<summary class="cursor-pointer hover:text-gray-200">Technical details: ${normalized} tiny import timing ${normalized === 1 ? 'seam was' : 'seams were'} cleaned up</summary>`
-        + `<p class="mt-2">The cleanup stayed within the tempo-aware ${Math.round(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS * 1000)} ms safety limit. Only the new hybrid uses the adjusted trail; both original tracks remain unchanged.</p></details>` : '';
-    const repeatNotice = hybridSession.plan.repeatNotice;
+    if (plan.strategy === 'guided') guidedReviewGroups(plan);
+}
+
+function compositeResultNotices(plan) {
+    const normalized = plan.stats?.timingAdjustments || 0;
+    const normalizationNotice = normalized
+        ? `<details class="mb-3 rounded border border-gray-700 bg-dark-900/50 px-3 py-2 text-xs text-gray-400">`
+            + `<summary class="cursor-pointer hover:text-gray-200">Technical details: ${normalized} tiny import timing ${normalized === 1 ? 'seam was' : 'seams were'} cleaned up</summary>`
+            + `<p class="mt-2">The cleanup stayed within the tempo-aware ${Math.round(COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS * 1000)} ms safety limit. Only the new hybrid uses the adjusted trail; both original tracks remain unchanged.</p></details>`
+        : '';
+    const repeatNotice = plan.repeatNotice;
     let repeatNoticeMarkup = '';
     if (repeatNotice && (repeatNotice.requested > 1 || repeatNotice.kind !== 'applied')) {
         if (repeatNotice.kind === 'partial') {
-            const failures = repeatNotice.failed.map(failure => `${failure.label}: ${failure.error}`).join(' ');
+            const failures = repeatNotice.failed
+                .map(failure => `${failure.label}: ${failure.error}`).join(' ');
             repeatNoticeMarkup = `<div class="mb-3 rounded border border-amber-700/60 bg-amber-950/25 px-3 py-2 text-xs text-amber-100"><b>Your choice worked in ${repeatNotice.applied} of ${repeatNotice.requested} matching sections.</b> ${repeatNotice.failed.length} ${repeatNotice.failed.length === 1 ? 'section needs' : 'sections need'} a separate choice because the surrounding notes differ. ${_editorEscHtml(failures)}</div>`;
         } else if (repeatNotice.kind === 'detached') {
             repeatNoticeMarkup = `<div class="mb-3 rounded border border-sky-800/50 bg-sky-950/20 px-3 py-2 text-xs text-sky-100"><b>${_editorEscHtml(repeatNotice.label)} can now have its own choice.</b></div>`;
@@ -3146,12 +3255,255 @@ function renderResult() {
             repeatNoticeMarkup = `<div class="mb-3 rounded border border-emerald-800/50 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-100"><b>Your choice was used in all ${repeatNotice.applied} matching sections.</b> Each section passed its own playability check.</div>`;
         }
     }
+    return { normalizationNotice, repeatNoticeMarkup };
+}
+
+function elementFromCompositeMarkup(markup) {
+    const template = document.createElement('template');
+    template.innerHTML = String(markup || '').trim();
+    return template.content.firstElementChild;
+}
+
+const COMPOSITE_REVIEW_FOCUS_KEYS = Object.freeze([
+    'resolution', 'entryId', 'conflictIndex', 'guidedSplitBeat',
+]);
+
+function captureCompositeReviewUi(toolbar) {
+    const active = document.activeElement;
+    let focus = null;
+    if (active && toolbar.contains(active)) {
+        if (active.id) focus = { kind: 'id', value: active.id };
+        if (!focus) {
+            for (const key of COMPOSITE_REVIEW_FOCUS_KEYS) {
+                if (active.dataset?.[key] != null) {
+                    focus = { kind: 'data', key, value: active.dataset[key] };
+                    break;
+                }
+            }
+        }
+        if (!focus && active.matches?.('summary')) {
+            focus = {
+                kind: 'summary',
+                value: [...toolbar.querySelectorAll('summary')].indexOf(active),
+            };
+        }
+    }
+    return {
+        focus,
+        workspaceScrollTop: byId('editor-composite-result-workspace')?.scrollTop || 0,
+        details: [...toolbar.querySelectorAll('details')].map(details => ({
+            open: details.open,
+            panelScrollTop: details.querySelector(
+                '.editor-composite-review-details-panel')?.scrollTop || 0,
+        })),
+    };
+}
+
+function restoreCompositeReviewUi(toolbar, snapshot) {
+    const details = [...toolbar.querySelectorAll('details')];
+    for (const [index, state] of (snapshot?.details || []).entries()) {
+        const current = details[index];
+        if (!current) continue;
+        current.open = state.open;
+        const panel = current.querySelector('.editor-composite-review-details-panel');
+        if (panel) panel.scrollTop = state.panelScrollTop;
+    }
+    const workspace = byId('editor-composite-result-workspace');
+    if (workspace) workspace.scrollTop = snapshot?.workspaceScrollTop || 0;
+    const focus = snapshot?.focus;
+    let target = null;
+    if (focus?.kind === 'id') {
+        target = [...toolbar.querySelectorAll('[id]')]
+            .find(candidate => candidate.id === focus.value);
+    } else if (focus?.kind === 'data') {
+        target = [...toolbar.querySelectorAll(`[data-${focus.key.replace(
+            /[A-Z]/g, character => `-${character.toLowerCase()}`)}]`)]
+            .find(candidate => candidate.dataset[focus.key] === focus.value);
+    } else if (focus?.kind === 'summary') {
+        target = toolbar.querySelectorAll('summary')[focus.value];
+    }
+    if (target?.disabled) target = null;
+    if (!target && focus) {
+        target = toolbar.querySelector(
+            '[data-resolution][aria-pressed="true"], [data-resolution], button:not([disabled])');
+    }
+    if (!target?.focus) return;
+    try { target.focus({ preventScroll: true }); }
+    catch (_) { target.focus(); }
+}
+
+function refreshCompositePreviewAvailability(view) {
+    const modes = new Map(compositePreviewModesPure(view, {
+        audioAvailable: !!S.audioBuffer,
+        resultReady: !!view.conflict?.resolution,
+    }).map(mode => [mode.id, mode]));
+    const shortcuts = { song: '1', primary: '2', secondary: '3', result: '4' };
+    for (const button of document.querySelectorAll('[data-composite-preview]')) {
+        const mode = modes.get(button.dataset.compositePreview);
+        if (!mode) continue;
+        button.dataset.compositePreviewAvailable = mode.available ? 'true' : 'false';
+        button.title = mode.unavailableReason || `${mode.label} (${shortcuts[mode.id]})`;
+    }
+    updateCompositePreviewButtons();
+}
+
+function refreshCompositeTimelineHeaders(dom, view) {
+    for (const lane of view.lanes) {
+        const previous = dom.headers?.get(lane.id);
+        if (!previous) continue;
+        const replacement = elementFromCompositeMarkup(renderCompositeTimelineLaneHeader(
+            view, lane.id,
+            compositeTimelineLaneHeightPure(hybridPreviewPreferences.laneHeights[lane.id]),
+            { fixed: true },
+        ));
+        if (!replacement) continue;
+        previous.replaceWith(replacement);
+        dom.headers.set(lane.id, replacement);
+    }
+}
+
+function refreshCompositeTimelineStaticMap(dom, view) {
+    const map = dom?.map;
+    if (!map) return;
+    const viewport = timelineActualViewportRange(view, dom.scroller,
+        compositeTimelineVisualScrollLeft(dom), dom.viewportWidth);
+    const previousSvg = map.querySelector('svg');
+    const replacementSvg = elementFromCompositeMarkup(
+        renderCompositeTimelineMapSvg(view, viewport));
+    if (previousSvg && replacementSvg) previousSvg.replaceWith(replacementSvg);
+    const key = map.parentElement?.querySelector('[data-composite-map-key]');
+    if (key) key.innerHTML = compositeTimelineMapKeyMarkup(view);
+    updateCompositeTimelineMapViewport(dom, view, dom.scroller,
+        compositeTimelineVisualScrollLeft(dom), dom.viewportWidth);
+}
+
+function scheduleCompositeReviewTimelineRefresh(conflictId) {
+    const generation = ++timelineReviewRefreshGeneration;
+    if (timelineReviewRefreshFrame) cancelAnimationFrame(timelineReviewRefreshFrame);
+    // Leave one real paint between the compact toolbar response and full-song
+    // model construction. The second frame updates the bounded map/header
+    // surfaces, while lane SVG work remains split across idle camera slices.
+    timelineReviewRefreshFrame = requestAnimationFrame(() => {
+        if (generation !== timelineReviewRefreshGeneration) {
+            timelineReviewRefreshFrame = 0;
+            return;
+        }
+        timelineReviewRefreshFrame = requestAnimationFrame(() => {
+            timelineReviewRefreshFrame = 0;
+            const plan = hybridSession.plan;
+            const dom = timelineViewportDom;
+            const conflict = plan?.conflicts?.[hybridSession.conflictIndex];
+            if (generation !== timelineReviewRefreshGeneration
+                    || hybridSession.stage !== 'review' || !dom
+                    || conflict?.id !== conflictId) return;
+            // Resolution-dependent Experimental reports and full-song
+            // playability are not needed to redraw the current decision. They
+            // are refreshed when entering final preview/copying the report,
+            // away from this post-input frame.
+            refreshCompositePlanDerivedState(plan, { includePlayability: false });
+            invalidateCompositeTimelineView();
+            const presentation = currentCompositeReviewPresentation(plan);
+            if (!presentation?.timelineView) return;
+            dom.view = presentation.timelineView;
+            dom.reviewRefreshPending = true;
+            refreshCompositePreviewAvailability(presentation.timelineView);
+            refreshCompositeTimelineHeaders(dom, presentation.timelineView);
+            refreshCompositeTimelineStaticMap(dom, presentation.timelineView);
+            // A Stop/seek issued by the choice may have queued render-ahead
+            // against the previous model between paints. Invalidate it again
+            // now that the new live view is installed.
+            cancelCompositeTimelineStandbyWork(dom);
+            const finishReviewRefresh = () => {
+                if (timelineViewportDom !== dom) return;
+                dom.reviewRefreshPending = false;
+                dom.reviewRefreshOptions = null;
+                updateCompositePreviewButtons();
+                setCompositePreviewHelp('Tracks updated · choose a sound to preview.');
+            };
+            if ((dom.cameraSlots?.length || 0) > 1) {
+                const reviewRefreshOptions = {
+                    freshnessDeadlineAt: (globalThis.performance?.now?.() || Date.now()) + 240,
+                    onCommitted: finishReviewRefresh,
+                };
+                dom.reviewRefreshOptions = reviewRefreshOptions;
+                scheduleCompositeTimelineStandby(
+                    dom, compositeTimelineVisualScrollLeft(dom), reviewRefreshOptions);
+            } else {
+                refreshCompositeTimelineViewport(true);
+                finishReviewRefresh();
+            }
+            refreshCompositeTimelinePlayheadNow();
+        });
+    });
+}
+
+// Resolution and manual-note changes keep the same review decision in place.
+// Retain its workspace, controls, scroll camera, and listeners; replace only
+// the decision toolbar, then build updated lane SVGs in the hidden camera and
+// atomically swap them during idle time.
+function refreshCurrentCompositeReview() {
+    const plan = hybridSession.plan;
+    const previousToolbar = byId('editor-composite-result')
+        ?.querySelector('.editor-composite-review-toolbar');
+    const dom = timelineViewportDom;
+    const conflict = plan?.conflicts?.[hybridSession.conflictIndex];
+    if (hybridSession.stage !== 'review' || !plan || !conflict || !previousToolbar
+            || !dom?.view?.review || dom.view.review.id !== conflict.id) {
+        return false;
+    }
+    if (hybridSession.previewMode) endCompositePreviewPlayback();
+    const snapshot = captureCompositeReviewUi(previousToolbar);
+    refreshCompositePlanDerivedState(plan, { includePlayability: false });
+    invalidateCompositeTimelineView();
+    const presentation = currentCompositeReviewPresentation(plan, {
+        includeTimeline: false,
+    });
+    const nextToolbar = elementFromCompositeMarkup(presentation?.reviewToolbar);
+    if (!presentation || !nextToolbar) {
+        return false;
+    }
+    dom.reviewRefreshPending = true;
+    updateCompositePreviewButtons();
+    setCompositePreviewHelp('Updating the tracks for your choice…');
+    previousToolbar.replaceWith(nextToolbar);
+    bindCompositeReviewToolbarEvents(nextToolbar);
+    const shell = nextToolbar.closest('[data-composite-review-shell]');
+    if (shell) {
+        shell.classList.remove(
+            'border-red-700/60', 'border-emerald-700/60', 'border-amber-700/60');
+        shell.classList.add(presentation.stateClass);
+    }
+    const notices = compositeResultNotices(plan);
+    const noticeRegion = byId('editor-composite-result')
+        ?.querySelector('[data-composite-review-notices]');
+    if (noticeRegion) {
+        noticeRegion.innerHTML = notices.normalizationNotice + notices.repeatNoticeMarkup;
+    }
+    const finish = byId('editor-composite-finish');
+    if (finish) finish.disabled = plan.conflicts.some(block => !block.resolution);
+    cancelCompositeTimelineStandbyWork(dom);
+    restoreCompositeReviewUi(nextToolbar, snapshot);
+    scheduleCompositeReviewTimelineRefresh(conflict.id);
+    return true;
+}
+
+function renderResult() {
+    invalidateCompositeTimelineView();
+    stopCompositeTimelineUi();
+    if (hybridSession.previewMode) endCompositePreviewPlayback();
+    const result = byId('editor-composite-result');
+    if (!result || !hybridSession.plan) return;
+    updateCompositeStageIndicator(hybridSession.stage);
+    refreshCompositePlanDerivedState(hybridSession.plan);
+    const unresolvedBlocks = hybridSession.plan.conflicts.filter(c => !c.resolution).length;
+    const { normalizationNotice, repeatNoticeMarkup } = compositeResultNotices(
+        hybridSession.plan);
     const names = selectedSourceNames();
     if (hybridSession.stage === 'final-preview') {
         result.innerHTML = renderFinalPreviewResult(hybridSession.plan, names,
             normalizationNotice, repeatNoticeMarkup);
     } else {
-        result.innerHTML = normalizationNotice + repeatNoticeMarkup
+        result.innerHTML = `<div data-composite-review-notices>${normalizationNotice}${repeatNoticeMarkup}</div>`
             + renderConflict(hybridSession.plan);
     }
     const finish = byId('editor-composite-finish');
