@@ -10,7 +10,6 @@ import { beatOf, timeOf } from '../beats.js';
 import {
     COMPOSITE_BEAT_EPS,
     clearCompositeConflictResolution,
-    compositeCollisionReason,
     compositeEntryHasSource,
     compositePlanResolutionRevision,
     compositeTimingToleranceSeconds,
@@ -18,6 +17,9 @@ import {
     prepareCompositeSources,
     resolveCompositeConflict,
 } from './merge-engine.js';
+import {
+    compositeEntryOccupancyEnd,
+} from './occupancy.js';
 
 export const GUIDED_MAX_REVIEW_BARS = 4;
 export const GUIDED_REPEAT_MODE_EVERY = 'every-occurrence';
@@ -250,6 +252,7 @@ function buildBaseCells({ prepared, beats, sections, primary, secondary }) {
             secondaryEntries: [],
             forcedReview: false,
             transitionReview: false,
+            unsafeSplitBefore: false,
             kind: 'empty',
         });
     }
@@ -281,43 +284,169 @@ function classifyCell(cell) {
     return 'review';
 }
 
+function guidedOccupancyRecords(cells, lane, beats) {
+    const records = [];
+    for (const cell of cells) {
+        const entries = lane === 'secondary' ? cell.secondaryEntries
+            : [...cell.primaryEntries, ...cell.commonEntries];
+        for (const entry of entries) {
+            const startBeat = finite(entry && entry.startBeat);
+            const endBeat = compositeEntryOccupancyEnd(entry);
+            records.push({
+                id: `${lane}:${entry.id}`,
+                lane,
+                startBeat,
+                endBeat,
+                effectiveEndBeat: endBeat,
+                firstCellIndex: cell.index,
+                lastCellIndex: cell.index,
+            });
+        }
+    }
+    const result = records.sort((left, right) =>
+        left.startBeat - right.startBeat || left.endBeat - right.endBeat
+        || left.id.localeCompare(right.id));
+    let maximumEndTime = -Infinity;
+    let maximumAttackReachTime = -Infinity;
+    for (const record of result) {
+        record.startTime = timeOf(beats, record.startBeat);
+        record.endTime = timeOf(beats, record.endBeat);
+        record.attackTolerance = compositeTimingToleranceSeconds(beats, record.startBeat);
+        record.attackReachTime = record.startTime + record.attackTolerance;
+        maximumEndTime = Math.max(maximumEndTime, record.endTime);
+        maximumAttackReachTime = Math.max(maximumAttackReachTime, record.attackReachTime);
+        record.prefixMaximumEndTime = maximumEndTime;
+        record.prefixMaximumAttackReachTime = maximumAttackReachTime;
+    }
+    return result;
+}
+
+function lowerBoundGuidedRecord(records, value, field) {
+    let low = 0;
+    let high = records.length;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (records[middle][field] < value) low = middle + 1;
+        else high = middle;
+    }
+    return low;
+}
+
+function upperBoundGuidedRecord(records, value, field) {
+    let low = 0;
+    let high = records.length;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (records[middle][field] <= value) low = middle + 1;
+        else high = middle;
+    }
+    return low;
+}
+
+function firstGuidedPrefixAtLeast(records, count, value, field) {
+    let low = 0;
+    let high = count;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (records[middle][field] < value) low = middle + 1;
+        else high = middle;
+    }
+    return low < count ? low : -1;
+}
+
+function firstGuidedPrefixAbove(records, count, value, field) {
+    let low = 0;
+    let high = count;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (records[middle][field] <= value) low = middle + 1;
+        else high = middle;
+    }
+    return low < count ? low : -1;
+}
+
+function earliestGuidedDependency(current, opposite) {
+    const count = upperBoundGuidedRecord(opposite, current.startTime + 1e-9, 'startTime');
+    if (!count) return null;
+
+    // A prior trail must exceed the later attack by more than the normal seam
+    // tolerance. Prefix maxima let one long early trail be found in O(log n).
+    const trailIndex = firstGuidedPrefixAbove(opposite, count,
+        current.startTime + current.attackTolerance + 1e-9,
+        'prefixMaximumEndTime');
+
+    // Near-simultaneous zero-length attacks are occupied even though neither
+    // interval reaches beyond the seam tolerance. Either attack's local
+    // tolerance may establish the match.
+    const byCurrentTolerance = lowerBoundGuidedRecord(opposite,
+        current.startTime - current.attackTolerance - 1e-9, 'startTime');
+    const byEarlierTolerance = firstGuidedPrefixAtLeast(opposite, count,
+        current.startTime - 1e-9, 'prefixMaximumAttackReachTime');
+    let attackIndex = Math.min(byCurrentTolerance < count ? byCurrentTolerance : Infinity,
+        byEarlierTolerance >= 0 ? byEarlierTolerance : Infinity);
+    if (!Number.isFinite(attackIndex)) attackIndex = -1;
+
+    const index = Math.min(trailIndex >= 0 ? trailIndex : Infinity,
+        attackIndex >= 0 ? attackIndex : Infinity);
+    return Number.isFinite(index) ? opposite[index] : null;
+}
+
+function addGuidedReviewDependency(reviewDiff, unsafeCutDiff, left, right) {
+    const from = Math.min(left.firstCellIndex, right.firstCellIndex);
+    const to = Math.max(left.lastCellIndex, right.lastCellIndex);
+    if (from === to) return;
+    reviewDiff[from]++;
+    reviewDiff[to + 1]--;
+    unsafeCutDiff[from + 1]++;
+    unsafeCutDiff[to + 1]--;
+}
+
+function closeGuidedReviewBoundaries(cells, beats) {
+    const primary = guidedOccupancyRecords(cells, 'primary', beats);
+    const secondary = guidedOccupancyRecords(cells, 'secondary', beats);
+    const reviewDiff = new Int32Array(cells.length + 1);
+    const unsafeCutDiff = new Int32Array(cells.length + 1);
+    for (const record of primary) {
+        const dependency = earliestGuidedDependency(record, secondary);
+        if (dependency) addGuidedReviewDependency(
+            reviewDiff, unsafeCutDiff, record, dependency);
+    }
+    for (const record of secondary) {
+        const dependency = earliestGuidedDependency(record, primary);
+        if (dependency) addGuidedReviewDependency(
+            reviewDiff, unsafeCutDiff, record, dependency);
+    }
+
+    let reviewDepth = 0;
+    let unsafeCutDepth = 0;
+    for (let index = 0; index < cells.length; index++) {
+        reviewDepth += reviewDiff[index];
+        unsafeCutDepth += unsafeCutDiff[index];
+        if (reviewDepth > 0) {
+            cells[index].forcedReview = true;
+            cells[index].transitionReview = true;
+        }
+        if (unsafeCutDepth > 0) cells[index].unsafeSplitBefore = true;
+    }
+}
+
 function populateCells(cells, prepared) {
-    const cellByEntryId = new Map();
     for (const entry of prepared.primaryEntries) {
         const cell = cellForBeat(cells, entryDecisionBeat(entry));
         if (!cell) continue;
         if (compositeEntryHasSource(entry, 'secondary')) cell.commonEntries.push(entry);
         else cell.primaryEntries.push(entry);
-        cellByEntryId.set(entry.id, cell);
     }
     for (const entry of prepared.uniqueSecondaryEntries) {
         const cell = cellForBeat(cells, entryDecisionBeat(entry));
         if (!cell) continue;
         cell.secondaryEntries.push(entry);
-        cellByEntryId.set(entry.id, cell);
     }
     for (const cell of cells) cell.kind = classifyCell(cell);
-
-    // Primary-only followed by secondary-only (or the reverse) is normally an
-    // automatic handoff. If their complete gestures collide, promote the whole
-    // intervening span to review instead of clipping a trail silently.
-    const automaticEntries = [];
-    for (const cell of cells) {
-        automaticEntries.push(...cell.commonEntries);
-        if (cell.kind === 'primary-only') automaticEntries.push(...cell.primaryEntries);
-        if (cell.kind === 'secondary-only') automaticEntries.push(...cell.secondaryEntries);
-    }
-    forEachCompositeSelectionCollision(automaticEntries, prepared.beats, (left, right) => {
-        const leftCell = cellByEntryId.get(left.id);
-        const rightCell = cellByEntryId.get(right.id);
-        if (!leftCell || !rightCell) return;
-        const from = Math.min(leftCell.index, rightCell.index);
-        const to = Math.max(leftCell.index, rightCell.index);
-        for (let index = from; index <= to; index++) {
-            cells[index].forcedReview = true;
-            cells[index].transitionReview = true;
-        }
-    });
+    // A review choice must own every automatic opposite-source gesture touched
+    // by any of its complete trails.  Closing every cross-source dependency in
+    // one pass also makes neighbouring decisions independent of earlier picks.
+    closeGuidedReviewBoundaries(cells, prepared.beats);
     for (const cell of cells) cell.kind = classifyCell(cell);
 }
 
@@ -334,8 +463,13 @@ function decisionBlock(cells, id, beats = []) {
     const rangeEndBeat = cells.at(-1).endBeat;
     const endBeat = Math.max(rangeEndBeat,
         ...primaryEntries.map(entryEffectiveEnd), ...secondaryEntries.map(entryEffectiveEnd));
-    const hasNoteVariant = primaryEntries.some(primary => secondaryEntries.some(secondary =>
-        compositeCollisionReason(primary, secondary, beats) === 'note-variant'));
+    let hasNoteVariant = false;
+    forEachCompositeSelectionCollision([...primaryEntries, ...secondaryEntries], beats,
+        (left, right, reason) => {
+            if (reason !== 'note-variant') return;
+            hasNoteVariant = true;
+            return false;
+        });
     const reasons = cells.some(cell => cell.transitionReview)
         ? ['guided-choice', 'transition'] : ['guided-choice'];
     if (hasNoteVariant) reasons.push('note-variant');
@@ -360,7 +494,8 @@ function decisionBlock(cells, id, beats = []) {
         repeatDetached: false,
         repeatAppliedFromId: '',
         cells,
-        splitPoints: cells.slice(1).filter(cell => cell.barBoundary).map(cell => ({
+        splitPoints: cells.slice(1)
+            .filter(cell => cell.barBoundary && !cell.unsafeSplitBefore).map(cell => ({
             beat: cell.startBeat,
             label: `Split before bar ${cell.measure}`,
         })),
@@ -885,7 +1020,7 @@ function buildDecisionBlocks(cells, beats = []) {
         const crossesLandmark = run.length && (cell.hardStart || cell.softStart);
         const exceedsFourBars = first
             && cell.measureIndex - first.measureIndex >= GUIDED_MAX_REVIEW_BARS;
-        if (crossesLandmark || exceedsFourBars) flush();
+        if ((crossesLandmark || exceedsFourBars) && !cell.unsafeSplitBefore) flush();
         run.push(cell);
     }
     flush();
@@ -973,8 +1108,8 @@ function splitGuidedBlocks(plan, blocks, splitPoints, activeBlockId) {
         if (!leftCells.length || !rightCells.length) {
             return { ok: false, error: 'The split would create an empty block.' };
         }
-        const left = decisionBlock(leftCells, `guided:${plan.nextGuidedBlockId++}`);
-        const right = decisionBlock(rightCells, `guided:${plan.nextGuidedBlockId++}`);
+        const left = decisionBlock(leftCells, `guided:${plan.nextGuidedBlockId++}`, plan.beats);
+        const right = decisionBlock(rightCells, `guided:${plan.nextGuidedBlockId++}`, plan.beats);
         left.repeatDetached = !!block.repeatDetached;
         right.repeatDetached = !!block.repeatDetached;
         replacements.set(block.id, [left, right]);

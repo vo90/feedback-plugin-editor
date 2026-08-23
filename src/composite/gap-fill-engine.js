@@ -92,11 +92,16 @@ function eligibleWindows(primaryEntries, secondaryEntries, beats, options) {
         if (span.start > contentEnd - COMPOSITE_BEAT_EPS) break;
         const start = Math.max(contentStart, span.start);
         const end = Math.min(contentEnd, span.end);
-        if (start - cursor + COMPOSITE_BEAT_EPS >= minimumGap) windows.push({ start: cursor, end: start });
+        if (start - cursor + COMPOSITE_BEAT_EPS >= minimumGap) {
+            // The right edge is the attack of the next occupied Base span. A
+            // Fill trail may end there, but a zero-length Fill attack may not
+            // claim that same instant when the user chooses a zero margin.
+            windows.push({ start: cursor, end: start, endOccupied: true });
+        }
         cursor = Math.max(cursor, end);
     }
     if (contentEnd - cursor + COMPOSITE_BEAT_EPS >= minimumGap) {
-        windows.push({ start: cursor, end: contentEnd });
+        windows.push({ start: cursor, end: contentEnd, endOccupied: false });
     }
     return { windows, coordinate };
 }
@@ -115,8 +120,9 @@ export function compositeGroupFitsWindowPure(group, windows, coordinate = value 
         else high = middle;
     }
     const window = windows[low];
-    return !!window && start >= window.start - COMPOSITE_BEAT_EPS
-        && end <= window.end + COMPOSITE_BEAT_EPS;
+    if (!window || start < window.start - COMPOSITE_BEAT_EPS
+        || end > window.end + COMPOSITE_BEAT_EPS) return false;
+    return !(window.endOccupied && start >= window.end - 1e-12);
 }
 
 export function analyzeGapFillComposite({

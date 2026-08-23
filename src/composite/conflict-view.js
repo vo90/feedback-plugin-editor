@@ -206,7 +206,7 @@ function propertyDifferences(conflict) {
 function conflictExplanation(conflict, names, stringCount) {
     if ((conflict.reasons || []).includes('guided-choice')) {
         if ((conflict.reasons || []).includes('transition')) {
-            return `Notes or trails cross the edge of this section. Choose which track should play through the handoff; no trail will be cut off.`;
+            return `Nearby notes are included in this decision because a complete trail crosses the handoff. Choose which track should play through it; no trail will be cut off.`;
         }
         const common = Math.max(0, Math.trunc(finite(conflict.commonCount)));
         const commonText = common

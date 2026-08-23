@@ -236,6 +236,32 @@ test('gap fill treats coincident zero-sustain attacks as primary activity', () =
     assert.equal(plan.fixedEntries.length, 1);
 });
 
+test('zero-margin gap fill rejects coincident zero-sustain attacks on every string', () => {
+    for (const [label, string] of [['same string', 0], ['different string', 2]]) {
+        const plan = analyzeGapFillComposite({
+            primary: arr('Lead', [note(2, 0, 3, 1)]),
+            secondary: arr('Rhythm', [note(2, string, 7)]),
+            beats,
+            strategy: 'gap-fill',
+            gapFill: { unit: 'beats', minimumGap: 0, transitionMargin: 0 },
+        });
+        assert.equal(plan.stats.secondaryAddedCleanly, 0, label);
+        assert.equal(plan.stats.secondarySkippedByStrategy, 1, label);
+    }
+});
+
+test('zero-margin gap fill allows a fill trail to end exactly when base activity starts', () => {
+    const plan = analyzeGapFillComposite({
+        primary: arr('Lead', [note(4, 0, 3, 1)]),
+        secondary: arr('Rhythm', [note(2, 2, 7, 2)]),
+        beats,
+        strategy: 'gap-fill',
+        gapFill: { unit: 'beats', minimumGap: 0, transitionMargin: 0 },
+    });
+    assert.equal(plan.stats.secondaryAddedCleanly, 1);
+    assert.equal(plan.stats.secondarySkippedByStrategy, 0);
+});
+
 test('gap fill defaults are normalized and bounded', () => {
     assert.deepEqual(normalizeCompositeGapFillOptions(), COMPOSITE_GAP_FILL_DEFAULTS);
     assert.deepEqual(compositeGapFillDefaultsForUnit('seconds'), {

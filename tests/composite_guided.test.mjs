@@ -43,6 +43,19 @@ const arrangement = (name, notes, extra = {}) => ({
     ...extra,
 });
 
+function assertFreshWholeLaneChoicesResolve(makePlan, label) {
+    for (const resolution of ['primary', 'secondary']) {
+        const plan = makePlan();
+        for (const block of plan.conflicts) {
+            const result = resolveCompositeConflict(plan, block.id, resolution);
+            assert.equal(result.ok, true,
+                `${label}: Use ${resolution === 'primary' ? 'Base' : 'Fill'} should remain playable (${result.error || 'unknown error'})`);
+        }
+        assert.doesNotThrow(() => materializeCompositeArrangement(
+            plan, `${label} ${resolution}`));
+    }
+}
+
 function legacyGuidedReviewContext(plan, blockId) {
     const groups = guidedReviewGroups(plan);
     const block = plan.conflicts.find(candidate => candidate.id === blockId);
@@ -188,6 +201,299 @@ test('an unsafe automatic source handoff is promoted to a transition decision', 
     assert.deepEqual(materializeCompositeArrangement(plan, 'Safe handoff').notes.map(entry => entry.fret), [3]);
 });
 
+test('a review trail absorbs a later automatic opposite-source cell into the decision', () => {
+    const makePlan = () => analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 1, 12),
+            note(3, 0, 14, 2),
+        ]),
+        secondary: arrangement('Fill', [
+            note(1, 2, 0),
+            note(4.5, 0, 0),
+        ]),
+        beats,
+    });
+    const plan = makePlan();
+    assert.equal(plan.conflicts.length, 1);
+    const block = plan.conflicts[0];
+    assert.ok(block.primaryEntries.some(entry => entry.startBeat === 3));
+    assert.ok(block.secondaryEntries.some(entry => entry.startBeat === 4.5),
+        'the later Fill attack must be selectable, not pre-included in the Hybrid');
+    assert.ok(!plan.fixedEntries.some(entry => entry.startBeat === 4.5));
+    assertFreshWholeLaneChoicesResolve(makePlan, 'later automatic boundary');
+});
+
+test('an earlier automatic opposite-source trail is absorbed into the later decision', () => {
+    const makePlan = () => analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(3, 0, 14, 2),
+            note(5, 1, 12),
+        ]),
+        secondary: arrangement('Fill', [note(4.5, 0, 0)]),
+        beats,
+    });
+    const plan = makePlan();
+    assert.equal(plan.conflicts.length, 1);
+    const block = plan.conflicts[0];
+    assert.ok(block.primaryEntries.some(entry => entry.startBeat === 3),
+        'the earlier Lead trail must be selectable, not pre-included in the Hybrid');
+    assert.ok(block.secondaryEntries.some(entry => entry.startBeat === 4.5));
+    assert.ok(!plan.fixedEntries.some(entry => entry.startBeat === 3));
+    assertFreshWholeLaneChoicesResolve(makePlan, 'earlier automatic boundary');
+});
+
+test('dependent review candidates stay together across section and four-bar splits', () => {
+    const sectionPlan = () => analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(3, 0, 14, 2),
+            note(5, 1, 12),
+        ]),
+        secondary: arrangement('Fill', [
+            note(1, 2, 0),
+            note(4.5, 0, 0),
+        ]),
+        beats,
+        sections: [{ name: 'Verse', number: 1, start_time: 2 }],
+    });
+    const fourBarPlan = () => analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 1, 3), note(5, 1, 5), note(9, 1, 7),
+            note(15, 0, 14, 2), note(17, 1, 12),
+        ]),
+        secondary: arrangement('Fill', [
+            note(1, 2, 0), note(5, 2, 2), note(9, 2, 3),
+            note(13, 2, 5), note(16.5, 0, 0),
+        ]),
+        beats,
+    });
+
+    for (const [label, makePlan, boundary] of [
+        ['section boundary', sectionPlan, 4],
+        ['four-bar boundary', fourBarPlan, 16],
+    ]) {
+        const plan = makePlan();
+        assert.equal(plan.conflicts.length, 1,
+            `${label}: a nominal split must not separate colliding choice dependencies`);
+        const block = plan.conflicts[0];
+        assert.ok(block.startBeat < boundary && block.rangeEndBeat > boundary);
+        assertFreshWholeLaneChoicesResolve(makePlan, label);
+    }
+});
+
+test('different-string overlap enters review but remains a valid manual mix', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 1, 12),
+            note(3, 0, 14, 2),
+        ]),
+        secondary: arrangement('Fill', [
+            note(1, 2, 0),
+            note(4.5, 3, 7),
+        ]),
+        beats,
+    });
+    assert.equal(plan.conflicts.length, 1);
+    const block = plan.conflicts[0];
+    const baseTrail = block.primaryEntries.find(entry => entry.startBeat === 3);
+    const laterFill = block.secondaryEntries.find(entry => entry.startBeat === 4.5);
+    assert.ok(baseTrail && laterFill,
+        'global occupancy should make the later Fill note part of this decision');
+    assert.ok(!plan.fixedEntries.includes(laterFill));
+
+    const mixed = resolveCompositeConflict(
+        plan, block.id, 'custom', [baseTrail.id, laterFill.id]);
+    assert.equal(mixed.ok, true,
+        'notes that overlap in time on different strings remain physically playable');
+    assert.deepEqual(mixed.selected.map(entry => entry.id).sort(),
+        [baseTrail.id, laterFill.id].sort());
+    assert.doesNotThrow(() => materializeCompositeArrangement(plan, 'Different-string mix'));
+});
+
+test('an occupancy-locked bar boundary cannot be offered or forced as a split', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [
+            note(1, 1, 12),
+            note(3, 0, 14, 2),
+        ]),
+        secondary: arrangement('Fill', [
+            note(1, 2, 0),
+            note(4.5, 0, 0),
+        ]),
+        beats,
+    });
+    const block = plan.conflicts[0];
+    assert.ok(block.startBeat < 4 && block.rangeEndBeat > 4);
+    assert.ok(!block.splitPoints.some(point => point.beat === 4),
+        'the UI must not offer a bar line crossed by a dependency');
+    const split = splitGuidedDecisionBlock(plan, block.id, 4);
+    assert.equal(split.ok, false);
+    assert.match(split.error, /not a valid split point/i);
+    assert.equal(plan.conflicts.length, 1, 'a rejected split leaves the decision intact');
+});
+
+test('linked and pitched-slide gestures remain atomic across a review boundary', () => {
+    for (const [label, techniques] of [
+        ['linked', { link_next: true }],
+        ['pitched slide', { slide_to: 5 }],
+    ]) {
+        const plan = analyzeGuidedComposite({
+            primary: arrangement('Lead', [
+                note(3, 0, 3, 0, techniques),
+                note(5, 0, 5),
+            ]),
+            secondary: arrangement('Fill', [
+                note(1, 2, 7),
+                note(4.5, 2, 8),
+            ]),
+            beats,
+            sections: [{ name: 'Verse', number: 1, start_time: 2 }],
+        });
+        assert.equal(plan.conflicts.length, 1, label);
+        const block = plan.conflicts[0];
+        const gesture = block.primaryEntries.filter(entry => [3, 5].includes(entry.startBeat));
+        assert.deepEqual(gesture.map(entry => entry.startBeat), [3, 5], label);
+        assert.ok(block.secondaryEntries.some(entry => entry.startBeat === 4.5), label);
+        assert.ok(!block.splitPoints.some(point => point.beat === 4), label);
+        assert.equal(new Set(gesture.map(entry => entry.playableGroupId)).size, 1, label);
+        assert.ok(gesture[0].connectedToId === gesture[1].id, label);
+
+        const custom = resolveCompositeConflict(plan, block.id, 'custom', [gesture[0].id]);
+        assert.equal(custom.ok, true, label);
+        assert.deepEqual(custom.selected.map(entry => entry.id),
+            gesture.map(entry => entry.id), `${label} destination must follow its source`);
+    }
+});
+
+test('linked and slide destination attacks close a later near-simultaneous boundary', () => {
+    for (const [label, techniques] of [
+        ['linked', { link_next: true }],
+        ['pitched slide', { slide_to: 5 }],
+    ]) {
+        const makePlan = () => analyzeGuidedComposite({
+            primary: arrangement('Lead', [
+                note(1, 1, 9),
+                note(5.003, 0, 7),
+            ]),
+            secondary: arrangement('Fill', [
+                note(1, 2, 7),
+                note(3, 0, 3, 0, techniques),
+                note(5, 0, 5),
+            ]),
+            beats,
+        });
+        const plan = makePlan();
+        assert.equal(plan.conflicts.length, 1, label);
+        const block = plan.conflicts[0];
+        assert.ok(block.primaryEntries.some(entry => entry.startBeat === 5.003), label);
+        assert.ok(block.secondaryEntries.some(entry => entry.startBeat === 5), label);
+        assert.ok(!plan.fixedEntries.some(entry => entry.startBeat === 5.003), label);
+        assertFreshWholeLaneChoicesResolve(makePlan, `${label} destination attack`);
+    }
+});
+
+test('a deduplicated Base trail blocks later automatic Fill material', () => {
+    const common = note(3, 0, 0, 2, { tremolo: true });
+    const makePlan = () => analyzeGuidedComposite({
+        primary: arrangement('Lead', [common]),
+        secondary: arrangement('Fill', [
+            structuredClone(common),
+            note(4.5, 3, 7),
+        ]),
+        beats,
+    });
+    const plan = makePlan();
+    assert.equal(plan.stats.duplicatesRemoved, 1);
+    assert.equal(plan.conflicts.length, 1);
+    const block = plan.conflicts[0];
+    assert.equal(block.primaryEntries.length, 0,
+        'the common note remains fixed instead of becoming a selectable duplicate');
+    assert.ok(block.secondaryEntries.some(entry => entry.startBeat === 4.5));
+    assert.ok(!plan.fixedEntries.some(entry => entry.startBeat === 4.5));
+    assert.ok(plan.fixedEntries.some(entry => entry.startBeat === 3
+        && entry.sources.includes('primary') && entry.sources.includes('secondary')));
+    assertFreshWholeLaneChoicesResolve(makePlan, 'deduplicated Base trail');
+});
+
+test('open and technique-labelled trails use their full authored sustain at review edges', () => {
+    for (const [label, fret, techniques] of [
+        ['open note', 0, {}],
+        ['tremolo', 7, { tremolo: true }],
+        ['bend and vibrato', 9, { bend: 1, vibrato: true }],
+        ['unpitched slide', 12, { slide_unpitch_to: 5 }],
+    ]) {
+        const plan = analyzeGuidedComposite({
+            primary: arrangement('Lead', [
+                note(1, 1, 12),
+                note(3, 0, fret, 2, techniques),
+            ]),
+            secondary: arrangement('Fill', [
+                note(1, 2, 0),
+                note(4.5, 3, 7),
+            ]),
+            beats,
+        });
+        assert.equal(plan.conflicts.length, 1, label);
+        assert.ok(plan.conflicts[0].secondaryEntries.some(entry => entry.startBeat === 4.5),
+            `${label}: the Fill attack touched by the trail must enter review`);
+        assert.ok(!plan.fixedEntries.some(entry => entry.startBeat === 4.5), label);
+    }
+});
+
+test('chord-level sustain closes a Guided review boundary for every child note', () => {
+    const chord = {
+        time: 1.5,
+        sustain: 1,
+        chord_id: 0,
+        notes: [
+            { string: 0, fret: 0, techniques: { tremolo: true } },
+            { string: 1, fret: 5, techniques: {} },
+        ],
+    };
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 4, 12)], {
+            chords: [chord],
+            chord_templates: [{ name: 'Open chord', frets: [0, 5, -1, -1, -1, -1] }],
+        }),
+        secondary: arrangement('Fill', [
+            note(1, 3, 0),
+            note(4.5, 2, 7),
+        ]),
+        beats,
+    });
+    assert.equal(plan.conflicts.length, 1);
+    const block = plan.conflicts[0];
+    assert.equal(block.primaryEntries.filter(entry => entry.metadata.kind === 'chord-note').length, 2);
+    assert.ok(block.secondaryEntries.some(entry => entry.startBeat === 4.5));
+    assert.ok(!plan.fixedEntries.some(entry => entry.startBeat === 4.5));
+});
+
+test('mixed whole-lane Guided choices stay independent across randomized boundaries', () => {
+    for (let seed = 1; seed <= 40; seed++) {
+        const random = seededRandom(seed * 7919);
+        const makeNotes = offset => Array.from({ length: 14 }, (_, index) => {
+            const beat = 0.5 + index * 2.7 + offset + random() * 0.7;
+            return note(beat, Math.floor(random() * 6), Math.floor(random() * 16),
+                random() < 0.55 ? random() * 2.4 : 0,
+                random() < 0.15 ? { tremolo: true } : {});
+        });
+        const plan = analyzeGuidedComposite({
+            primary: arrangement('Lead', makeNotes(0)),
+            secondary: arrangement('Fill', makeNotes(0.2)),
+            beats,
+            sections: [8, 16, 24, 32].map((beat, index) => ({
+                name: 'Part', number: index + 1, start_time: beat * 0.5,
+            })),
+        });
+        for (let index = 0; index < plan.conflicts.length; index++) {
+            const resolution = (seed + index) % 2 ? 'primary' : 'secondary';
+            const result = resolveCompositeConflict(plan, plan.conflicts[index].id, resolution);
+            assert.equal(result.ok, true,
+                `seed ${seed}, decision ${index + 1}, ${resolution}: ${result.error || 'failed'}`);
+        }
+        assert.doesNotThrow(() => materializeCompositeArrangement(plan, `Random ${seed}`));
+    }
+});
+
 test('connected gestures stay in one block and custom selection expands atomically', () => {
     const plan = analyzeGuidedComposite({
         primary: arrangement('Lead', [
@@ -234,19 +540,17 @@ test('connected notes deduplicate only when their complete destination gesture a
     assert.equal(plan.conflicts[0].secondaryEntries.length, 2);
 });
 
-test('choices that collide across decision blocks become explicit transition errors', () => {
-    const plan = analyzeGuidedComposite({
+test('choices that cross a nominal decision boundary are merged before review', () => {
+    const makePlan = () => analyzeGuidedComposite({
         primary: arrangement('Lead', [note(3, 0, 3, 2), note(6, 1, 8)]),
         secondary: arrangement('Rhythm', [note(1, 1, 5), note(4, 0, 7)]),
         beats,
         sections: [{ name: 'chorus1', number: 1, start_time: 2 }],
     });
-    assert.equal(plan.conflicts.length, 2);
-    assert.equal(resolveCompositeConflict(plan, plan.conflicts[0].id, 'primary').ok, true);
-    const transition = resolveCompositeConflict(plan, plan.conflicts[1].id, 'secondary');
-    assert.equal(transition.ok, false);
-    assert.equal(plan.conflicts[1].validationKind, 'transition');
-    assert.match(plan.conflicts[1].validationError, /^Transition conflict:/);
+    const plan = makePlan();
+    assert.equal(plan.conflicts.length, 1);
+    assert.ok(plan.conflicts[0].reasons.includes('transition'));
+    assertFreshWholeLaneChoicesResolve(makePlan, 'cross-boundary choices');
 });
 
 test('matching Guided repetitions become one review decision and resolve together', () => {
@@ -610,7 +914,7 @@ test('custom selections map to occurrence-specific note ids', () => {
     ]);
 });
 
-test('an unsafe repeated occurrence falls back to individual transition review', () => {
+test('an unsafe repeated occurrence dependency becomes one boundary-safe review', () => {
     const plan = analyzeGuidedComposite({
         primary: arrangement('Lead', [note(1, 0, 3), note(9, 0, 3)]),
         secondary: arrangement('Rhythm', [
@@ -621,16 +925,15 @@ test('an unsafe repeated occurrence falls back to individual transition review',
         beats,
         repeatMode: GUIDED_REPEAT_MODE_MATCHING,
     });
+    assert.equal(plan.conflicts.length, 1);
     assert.equal(guidedReviewGroups(plan).length, 1);
     const result = resolveGuidedRepeatGroup(plan, plan.conflicts[0].id, 'primary');
-    assert.equal(result.partial, true);
+    assert.equal(result.ok, true);
+    assert.equal(result.partial, false);
     assert.equal(result.applied.length, 1);
-    assert.equal(result.failed.length, 1);
+    assert.equal(result.failed.length, 0);
     assert.equal(plan.conflicts[0].resolution, 'primary');
-    assert.equal(plan.conflicts[1].resolution, null);
-    assert.equal(plan.conflicts[1].repeatDetached, true);
-    assert.equal(plan.conflicts[1].validationKind, 'transition');
-    assert.equal(guidedReviewGroups(plan).length, 2);
+    assert.doesNotThrow(() => materializeCompositeArrangement(plan, 'Safe repeated boundary'));
 });
 
 test('grouped bar splitting mirrors the relative split across repetitions', () => {
