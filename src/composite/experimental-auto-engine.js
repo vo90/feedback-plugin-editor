@@ -13,6 +13,7 @@ import {
     COMPOSITE_BEAT_EPS,
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     compositeEntryHasSource,
+    compositePlanResolutionRevision,
     compositeResolvedEntries,
     compositeTimingToleranceSeconds,
     prepareCompositeSources,
@@ -47,6 +48,7 @@ const SEMANTIC_NOTE_FIELDS = new Set([
     'time', 'string', 'fret', 'sustain', 'sus', 'beat', 'beatEnd', 'techniques',
     '_fn', '_fromChord', '_chordId',
 ]);
+const EMPTY_COLLECTION = Object.freeze([]);
 
 const experimentalPlayabilityCache = new WeakMap();
 const experimentalConflictIndexCache = new WeakMap();
@@ -1062,42 +1064,26 @@ export function experimentalPassageOutcome(plan, passageOrId) {
     return outcome;
 }
 
-function sameMembers(collection, snapshot) {
-    if (!Array.isArray(collection) || collection.length !== snapshot?.length) return false;
-    for (let index = 0; index < collection.length; index++) {
-        if (collection[index] !== snapshot[index]) return false;
-    }
-    return true;
-}
-
-function experimentalPassageStateSignature(passages) {
-    return JSON.stringify((passages || []).map(passage => [
-        passage.id,
-        passage.status,
-        passage.noteCount,
-        (passage.entries || []).map(entry => entry.id),
-    ]));
-}
-
 function experimentalPassageOutcomeSet(plan) {
-    const passages = plan?.passages || [];
-    const conflicts = plan?.conflicts || [];
-    const resolutionSignature = experimentalResolutionSignature(plan);
-    const passageStateSignature = experimentalPassageStateSignature(passages);
+    const passages = plan?.passages || EMPTY_COLLECTION;
+    const conflicts = plan?.conflicts || EMPTY_COLLECTION;
+    const resolutionRevision = compositePlanResolutionRevision(plan);
     const cached = experimentalPassageOutcomeSetCache.get(plan);
-    if (cached && cached.resolutionSignature === resolutionSignature
-            && cached.passageStateSignature === passageStateSignature
-            && sameMembers(passages, cached.passages)
-            && sameMembers(conflicts, cached.conflicts)) return cached;
+    // Plans are immutable analysis snapshots apart from resolution edits,
+    // whose public APIs advance this revision. Array identity also makes a
+    // restored or deliberately replaced plan structure rebuild exactly once.
+    // In-place structural edits must use the merge engine's explicit
+    // invalidation API, as documented there.
+    if (cached && cached.resolutionRevision === resolutionRevision
+            && cached.passages === passages && cached.conflicts === conflicts) return cached;
     const outcomes = new Map();
     for (const passage of passages) {
         outcomes.set(passage.id, experimentalPassageOutcome(plan, passage));
     }
     const result = {
-        resolutionSignature,
-        passageStateSignature,
-        passages: passages.slice(),
-        conflicts: conflicts.slice(),
+        resolutionRevision,
+        passages,
+        conflicts,
         outcomes,
     };
     experimentalPassageOutcomeSetCache.set(plan, result);
@@ -1181,14 +1167,6 @@ export function experimentalComparisonReport(plan) {
     return report;
 }
 
-function experimentalResolutionSignature(plan) {
-    return JSON.stringify((plan.conflicts || []).map(conflict => [
-        conflict.id,
-        conflict.resolution || '',
-        ...(conflict.selectedEntryIds || []).slice().sort(),
-    ]));
-}
-
 function experimentalReviewOutcome(plan) {
     const acceptedIds = new Set();
     for (const conflict of plan.conflicts || []) {
@@ -1207,24 +1185,49 @@ function experimentalReviewOutcome(plan) {
 
 export function refreshExperimentalPlayability(plan) {
     if (!plan || !plan.ok || plan.strategy !== 'experimental') return null;
-    const resolutionSignature = experimentalResolutionSignature(plan);
+    const resolutionRevision = compositePlanResolutionRevision(plan);
+    const conflicts = plan.conflicts || EMPTY_COLLECTION;
+    const fixedEntries = plan.fixedEntries || EMPTY_COLLECTION;
+    const primaryEntries = plan.sourceEntries?.primary || EMPTY_COLLECTION;
+    const passages = plan.passages || EMPTY_COLLECTION;
+    const beats = plan.beats || EMPTY_COLLECTION;
+    const primaryAnchors = plan.primary?.anchors || EMPTY_COLLECTION;
+    const primaryUserAnchors = plan.primary?.anchors_user || EMPTY_COLLECTION;
+    const secondaryReviewable = Number(plan.stats?.secondaryReviewable) || 0;
     const cached = experimentalPlayabilityCache.get(plan);
-    if (cached?.resolutionSignature === resolutionSignature) {
+    // Keep the retained timeline-model hit path O(1). Resolution state is
+    // covered by the merge revision; every non-resolution input used below is
+    // represented by identity so deserialized/replaced snapshots warm safely.
+    if (cached?.resolutionRevision === resolutionRevision
+            && cached.conflicts === conflicts && cached.fixedEntries === fixedEntries
+            && cached.primaryEntries === primaryEntries && cached.passages === passages
+            && cached.beats === beats && cached.primaryAnchors === primaryAnchors
+            && cached.primaryUserAnchors === primaryUserAnchors
+            && cached.secondaryReviewable === secondaryReviewable) {
         plan.playability = cached.playability;
         plan.reviewOutcome = cached.reviewOutcome;
         return cached.playability;
     }
-    const anchors = plan.primary?.anchors_user?.length
-        ? plan.primary.anchors_user : plan.primary?.anchors || [];
-    const inherited = cached?.inherited || _playabilityLintPure(
-        entriesToNotes(plan.sourceEntries?.primary || [], plan.beats || []), anchors);
+    const anchors = primaryUserAnchors.length ? primaryUserAnchors : primaryAnchors;
+    const inheritedInputsMatch = cached?.primaryEntries === primaryEntries
+        && cached.beats === beats && cached.anchors === anchors;
+    const inherited = inheritedInputsMatch ? cached.inherited : _playabilityLintPure(
+        entriesToNotes(primaryEntries, beats), anchors);
     plan.playability = differentialPlayability(
-        plan.sourceEntries?.primary || [], compositeResolvedEntries(plan), plan.beats || [],
-        plan.passages || [], anchors, inherited,
+        primaryEntries, compositeResolvedEntries(plan), beats, passages, anchors, inherited,
     );
     plan.reviewOutcome = experimentalReviewOutcome(plan);
     experimentalPlayabilityCache.set(plan, {
-        resolutionSignature,
+        resolutionRevision,
+        conflicts,
+        fixedEntries,
+        primaryEntries,
+        passages,
+        beats,
+        primaryAnchors,
+        primaryUserAnchors,
+        anchors,
+        secondaryReviewable,
         inherited,
         playability: plan.playability,
         reviewOutcome: plan.reviewOutcome,

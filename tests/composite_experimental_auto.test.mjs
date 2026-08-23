@@ -16,6 +16,7 @@ import {
 import { analyzeGapFillComposite } from '../src/composite/gap-fill-engine.js';
 import {
     compositeExperimentalMetadataPreview,
+    invalidateCompositeConflictResolutionIndex,
     materializeCompositeArrangement,
     prepareCompositeSources,
     resolveCompositeConflict,
@@ -37,6 +38,21 @@ function arrangement(name, notes = [], extra = {}) {
         name, type: 'guitar', tuning: [0, 0, 0, 0, 0, 0], capo: 0,
         notes, chords: [], chord_templates: [], anchors: [], anchors_user: [],
         handshapes: [], phrases: [], ...extra,
+    };
+}
+
+function instrumentArrayReads(values) {
+    let numericReads = 0;
+    const array = new Proxy(values, {
+        get(target, property, receiver) {
+            if (typeof property === 'string' && /^\d+$/.test(property)) numericReads++;
+            return Reflect.get(target, property, receiver);
+        },
+    });
+    return {
+        array,
+        reset() { numericReads = 0; },
+        get numericReads() { return numericReads; },
     };
 }
 
@@ -336,9 +352,10 @@ test('passage outcome and report caches follow in-place resolutions and replaced
     assert.match(experimentalComparisonReport(plan), /Bar 2 — accepted,/);
 
     conflict.selectedEntryIds.splice(0);
+    invalidateCompositeConflictResolutionIndex(plan);
     const declined = experimentalPassageOutcomes(plan);
     assert.notStrictEqual(declined, accepted,
-        'mutating the selected-id array invalidates the resolution signature');
+        'the explicit invalidation hook covers deliberate in-place plan edits');
     assert.equal(declined.get(passage.id).state, 'declined');
     assert.match(experimentalComparisonReport(plan), /Bar 2 — declined,/,
         'the cached report follows the same resolution-sensitive outcome set');
@@ -347,9 +364,11 @@ test('passage outcome and report caches follow in-place resolutions and replaced
     assert.match(experimentalComparisonReport(plan), /Late fill — declined,/,
         'in-place report metadata edits cannot leave cached text behind');
     passage.status = 'automatic';
+    invalidateCompositeConflictResolutionIndex(plan);
     assert.equal(experimentalPassageOutcomes(plan).get(passage.id).state, 'automatic',
         'in-place passage state edits invalidate the bulk outcome structure');
     passage.status = 'review';
+    invalidateCompositeConflictResolutionIndex(plan);
 
     plan.conflicts[0] = {
         ...conflict, resolution: 'secondary', selectedEntryIds: [passageEntry.id],
@@ -359,6 +378,131 @@ test('passage outcome and report caches follow in-place resolutions and replaced
     plan.passages[0] = { ...passage, status: 'automatic' };
     assert.equal(experimentalPassageOutcome(plan, passage.id).state, 'automatic',
         'same-length passage replacement also rebuilds its id index');
+});
+
+test('experimental bulk outcome cache hits do constant work for 20k-plan snapshots', () => {
+    const count = 20_000;
+    const passages = instrumentArrayReads(Array.from({ length: count }, (_, index) => ({
+        id: `passage:${index}`,
+        status: 'automatic',
+        noteCount: 0,
+        entries: [],
+    })));
+    const conflicts = instrumentArrayReads(Array.from({ length: count }, (_, index) => ({
+        id: `conflict:${index}`,
+        resolution: null,
+        selectedEntryIds: [],
+    })));
+    const plan = { passages: passages.array, conflicts: conflicts.array };
+    const warmed = experimentalPassageOutcomes(plan);
+    assert.equal(warmed.size, count);
+
+    passages.reset();
+    conflicts.reset();
+    for (let index = 0; index < 32; index++) {
+        assert.strictEqual(experimentalPassageOutcomes(plan), warmed);
+    }
+    assert.equal(passages.numericReads, 0,
+        'cache hits do not traverse the 20k passage array');
+    assert.equal(conflicts.numericReads, 0,
+        'cache hits do not serialize or traverse the 20k conflict array');
+});
+
+test('experimental cache keys invalidate on supported resolution and structure changes', () => {
+    const beats = beatGrid();
+    const plan = analyzeExperimentalAutoComposite({
+        primary: arrangement('Lead', [note(0, 0, 3, 0.5), note(5, 0, 5, 0.5)]),
+        secondary: arrangement('Rhythm', [note(2, 1, 7, 0.25)]),
+        beats,
+        profile: 'balanced',
+    });
+    const originalOutcomes = experimentalPassageOutcomes(plan);
+    const originalPlayability = refreshExperimentalPlayability(plan);
+    assert.strictEqual(refreshExperimentalPlayability(plan), originalPlayability);
+
+    assert.equal(resolveCompositeConflict(plan, plan.conflicts[0].id, 'secondary').ok, true);
+    const resolvedOutcomes = experimentalPassageOutcomes(plan);
+    const resolvedPlayability = refreshExperimentalPlayability(plan);
+    assert.notStrictEqual(resolvedOutcomes, originalOutcomes,
+        'the merge revision invalidates derived passage outcomes');
+    assert.notStrictEqual(resolvedPlayability, originalPlayability,
+        'the merge revision invalidates differential playability');
+    assert.equal(resolvedOutcomes.get(plan.passages[0].id).state, 'accepted');
+
+    let priorOutcomes = resolvedOutcomes;
+    plan.passages = plan.passages.slice();
+    let nextOutcomes = experimentalPassageOutcomes(plan);
+    assert.notStrictEqual(nextOutcomes, priorOutcomes,
+        'replacing the passage snapshot invalidates without a revision change');
+    priorOutcomes = nextOutcomes;
+    plan.conflicts = plan.conflicts.slice();
+    nextOutcomes = experimentalPassageOutcomes(plan);
+    assert.notStrictEqual(nextOutcomes, priorOutcomes,
+        'replacing the conflict snapshot invalidates without a revision change');
+
+    let priorPlayability = resolvedPlayability;
+    for (const replaceInput of [
+        () => { plan.fixedEntries = plan.fixedEntries.slice(); },
+        () => { plan.sourceEntries.primary = plan.sourceEntries.primary.slice(); },
+        () => { plan.beats = plan.beats.slice(); },
+        () => { plan.primary.anchors = plan.primary.anchors.slice(); },
+        () => { plan.passages = plan.passages.slice(); },
+    ]) {
+        replaceInput();
+        const nextPlayability = refreshExperimentalPlayability(plan);
+        assert.notStrictEqual(nextPlayability, priorPlayability,
+            'every structural input identity participates in the playability key');
+        priorPlayability = nextPlayability;
+    }
+    plan.stats.secondaryReviewable += 1;
+    const statsRefreshed = refreshExperimentalPlayability(plan);
+    assert.notStrictEqual(statsRefreshed, priorPlayability,
+        'review totals participate in the O(1) playability key');
+    assert.equal(plan.reviewOutcome.offeredNotes, plan.stats.secondaryReviewable);
+});
+
+test('deserialized experimental plans safely establish fresh revision-zero caches', () => {
+    const plan = analyzeExperimentalAutoComposite({
+        primary: arrangement('Lead', [note(0, 0, 3, 0.5), note(5, 0, 5, 0.5)]),
+        secondary: arrangement('Rhythm', [note(2, 1, 7, 0.25)]),
+        beats: beatGrid(),
+        profile: 'balanced',
+    });
+    assert.equal(resolveCompositeConflict(plan, plan.conflicts[0].id, 'secondary').ok, true);
+    const restored = structuredClone(plan);
+    const serializedPlayability = restored.playability;
+    const refreshed = refreshExperimentalPlayability(restored);
+    assert.notStrictEqual(refreshed, serializedPlayability,
+        'a restored plan computes its own process-local cache on first use');
+    assert.strictEqual(refreshExperimentalPlayability(restored), refreshed,
+        'the restored plan then has a stable O(1) cache hit');
+    assert.equal(experimentalPassageOutcomes(restored).get(restored.passages[0].id).state,
+        'accepted');
+});
+
+test('experimental playability cache hits do not traverse 20k conflict snapshots', () => {
+    const plan = analyzeExperimentalAutoComposite({
+        primary: arrangement('Lead', [note(0, 0, 3, 0.5), note(5, 0, 5, 0.5)]),
+        secondary: arrangement('Rhythm'),
+        beats: beatGrid(),
+        profile: 'balanced',
+    });
+    const conflicts = instrumentArrayReads(Array.from({ length: 20_000 }, (_, index) => ({
+        id: `conflict:${index}`,
+        resolution: null,
+        selectedEntryIds: [],
+        primaryEntries: [],
+        secondaryEntries: [],
+    })));
+    plan.conflicts = conflicts.array;
+    const warmed = refreshExperimentalPlayability(plan);
+
+    conflicts.reset();
+    for (let index = 0; index < 32; index++) {
+        assert.strictEqual(refreshExperimentalPlayability(plan), warmed);
+    }
+    assert.equal(conflicts.numericReads, 0,
+        'cache hits avoid the old all-conflicts resolution signature');
 });
 
 test('differential playability refreshes after a reviewed passage is accepted', () => {
