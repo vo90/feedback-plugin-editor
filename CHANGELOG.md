@@ -98,6 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing behavior, so a bare scroll can never edit. Every other profile is untouched.
 ### Changed
 
+- **Hybrid review and preview stay responsive on dense songs.** Analysis and
+  materialization remain off the UI thread, while playback now reuses prepared
+  guide events and resolved-note revisions. Review navigation retains the
+  existing workspace, timeline cameras render only bounded visible strips, and
+  grouped overview markers still open the exact section under the pointer.
+  Opt-in, local-only diagnostics cover Play response, display cadence, input
+  latency, render work, and lifecycle growth for repeatable release checks.
 - **Composite Gap Fill now protects every complete playable trail.** The merge
   derives occupied spans from authored sustain regardless of technique or fret,
   inherits chord-level duration when needed, follows linked notes and connected

@@ -86,9 +86,12 @@ function measure(name, callback, describe = () => ({})) {
         lastResult = callback();
         samples.push(performance.now() - start);
     }
+    const warmSamples = samples.slice(1);
     return {
         name,
+        coldMs: Number(samples[0].toFixed(2)),
         ...summary(samples),
+        warm: warmSamples.length ? summary(warmSamples) : null,
         ...describe(lastResult),
     };
 }
