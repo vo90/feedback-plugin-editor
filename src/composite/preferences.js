@@ -229,6 +229,43 @@ export function saveHybridPreviewPreferences(preferences) {
     return normalized;
 }
 
+// Continuous range/zoom input should update the live preview immediately but
+// must not synchronously serialize localStorage for every pointer event. This
+// small writer is DOM-free so the resolver can debounce persistence and still
+// flush deterministically on change, close, or teardown.
+export function createHybridPreferenceWriter(save, {
+    delay = 160,
+    setTimer = (callback, ms) => setTimeout(callback, ms),
+    clearTimer = timer => clearTimeout(timer),
+} = {}) {
+    if (typeof save !== 'function') throw new TypeError('A Hybrid preference save function is required');
+    let timer = null;
+    let pending = null;
+    const flush = () => {
+        if (timer !== null) clearTimer(timer);
+        timer = null;
+        if (pending === null) return null;
+        const value = pending;
+        pending = null;
+        return save(value);
+    };
+    return {
+        schedule(value) {
+            pending = value;
+            if (timer !== null) clearTimer(timer);
+            timer = setTimer(flush, Math.max(0, Number(delay) || 0));
+            return value;
+        },
+        flush,
+        cancel() {
+            if (timer !== null) clearTimer(timer);
+            timer = null;
+            pending = null;
+        },
+        pending() { return pending !== null; },
+    };
+}
+
 export function hybridPreviewPreferencesMigrationPure(raw, version = 0) {
     if (Number(version) >= TIMELINE_PREF_VERSION) return hybridPreviewPreferencesPure(raw);
     let parsed = raw;

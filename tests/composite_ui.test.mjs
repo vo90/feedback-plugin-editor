@@ -21,11 +21,38 @@ import {
     markHybridViewChanged,
     resetHybridBuilderReview,
 } from '../src/composite/session.js';
+import { createHybridPreferenceWriter } from '../src/composite/preferences.js';
 
 const sources = [
     { index: 0, arrangement: { name: '<Lead>' } },
     { index: 1, arrangement: { name: 'Rhythm' } },
 ];
+
+test('continuous Hybrid preferences persist once with the latest live value', () => {
+    const saved = [];
+    const timers = new Map();
+    let nextTimer = 0;
+    const writer = createHybridPreferenceWriter(value => {
+        saved.push(value);
+        return value;
+    }, {
+        setTimer(callback) {
+            const id = ++nextTimer;
+            timers.set(id, callback);
+            return id;
+        },
+        clearTimer(id) { timers.delete(id); },
+    });
+    writer.schedule({ volume: 20 });
+    writer.schedule({ volume: 30 });
+    writer.schedule({ volume: 40 });
+    assert.equal(writer.pending(), true);
+    assert.equal(timers.size, 1);
+    writer.flush();
+    assert.deepEqual(saved, [{ volume: 40 }]);
+    assert.equal(writer.pending(), false);
+    assert.equal(timers.size, 0);
+});
 
 test('Hybrid review uses one responsive sticky toolbar instead of a side or below panel', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
