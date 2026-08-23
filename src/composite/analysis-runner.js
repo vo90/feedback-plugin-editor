@@ -2,6 +2,7 @@ import { runHybridWorkerTaskPure } from './analysis-worker.js';
 import { hybridPerfCount, hybridPerfEnd, hybridPerfStart } from './performance.js';
 
 let nextRequestId = 0;
+const LOCAL_FALLBACK = Symbol('hybrid-local-fallback');
 
 function abortError() {
     try { return new globalThis.DOMException('Hybrid task cancelled', 'AbortError'); }
@@ -31,39 +32,25 @@ async function runLocal(action, payload, signal, onProgress) {
     return runHybridWorkerTaskPure(action, payload);
 }
 
-export function runHybridBackgroundTask(action, payload, options = {}) {
-    const signal = options.signal || null;
-    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
-    const factory = options.workerFactory || defaultWorkerFactory;
-    if (signal?.aborted) return Promise.reject(abortError());
-
-    let worker = null;
-    try { worker = factory(); }
-    catch (_) { worker = null; }
-    const startedAt = hybridPerfStart();
-    if (!worker) {
-        return runLocal(action, payload, signal, onProgress)
-            .finally(() => hybridPerfEnd(`task.${action}.totalMs`, startedAt));
-    }
-    hybridPerfCount(`task.${action}.worker`);
-
-    const id = `hybrid:${Date.now()}:${++nextRequestId}`;
+function runWorker(worker, id, action, payload, signal, onProgress) {
     return new Promise((resolve, reject) => {
         let settled = false;
+        let requestStarted = false;
         const finish = (callback, value) => {
             if (settled) return;
             settled = true;
             signal?.removeEventListener?.('abort', onAbort);
             try { worker.terminate(); } catch (_) { /* already stopped */ }
-            hybridPerfEnd(`task.${action}.totalMs`, startedAt);
             callback(value);
         };
+        const fallBackLocally = () => finish(resolve, LOCAL_FALLBACK);
         const onAbort = () => finish(reject, abortError());
         signal?.addEventListener?.('abort', onAbort, { once: true });
         worker.onmessage = (event) => {
             const message = event?.data || {};
             if (message.id !== id || settled) return;
             if (message.kind === 'progress') {
+                requestStarted = true;
                 onProgress?.(message.phase);
                 return;
             }
@@ -79,11 +66,38 @@ export function runHybridBackgroundTask(action, payload, options = {}) {
             }
         };
         worker.onerror = (event) => {
-            finish(reject, new Error(event?.message || 'Hybrid worker failed to start'));
+            if (!requestStarted) {
+                event?.preventDefault?.();
+                fallBackLocally();
+                return;
+            }
+            finish(reject, new Error(event?.message || 'Hybrid worker failed'));
         };
         try { worker.postMessage({ id, action, payload }); }
-        catch (cause) { finish(reject, cause); }
+        catch (_) { fallBackLocally(); }
     });
+}
+
+export function runHybridBackgroundTask(action, payload, options = {}) {
+    const signal = options.signal || null;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const factory = options.workerFactory || defaultWorkerFactory;
+    if (signal?.aborted) return Promise.reject(abortError());
+
+    const startedAt = hybridPerfStart();
+    const execute = async () => {
+        let worker = null;
+        try { worker = factory(); }
+        catch (_) { worker = null; }
+        if (!worker) return runLocal(action, payload, signal, onProgress);
+
+        hybridPerfCount(`task.${action}.worker`);
+        const id = `hybrid:${Date.now()}:${++nextRequestId}`;
+        const result = await runWorker(worker, id, action, payload, signal, onProgress);
+        if (result === LOCAL_FALLBACK) return runLocal(action, payload, signal, onProgress);
+        return result;
+    };
+    return execute().finally(() => hybridPerfEnd(`task.${action}.totalMs`, startedAt));
 }
 
 export function runHybridAnalysisTask(payload, options = {}) {
