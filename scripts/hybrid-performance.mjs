@@ -132,6 +132,7 @@ for (const [strategy, plan] of plans) {
             primaryName: plan.primary?.name,
             secondaryName: plan.secondary?.name,
             resultEntries: resolved,
+            resultEntriesPrepared: true,
             durationSeconds: beats.at(-1)?.time || 0,
         });
         views.set(strategy, view);

@@ -130,6 +130,18 @@ test('source-lane preprocessing follows immutable analysis-array identity only',
     assert.strictEqual(afterSourceReplacement.lanes[1].entries,
         afterResultMutation.lanes[1].entries,
         'an unchanged source array retains its independently cached projection');
+
+    const resolvedSnapshot = [
+        entry('prepared:early', 1, 1.25),
+        entry('prepared:late', 8, 8.25),
+    ];
+    const preparedResult = buildCompositeTimelineViewModel({
+        plan,
+        resultEntries: resolvedSnapshot,
+        resultEntriesPrepared: true,
+    });
+    assert.strictEqual(preparedResult.lanes[2].entries, resolvedSnapshot,
+        'a controller-owned resolved revision skips duplicate sorting and retains identity');
 });
 
 test('display playhead beat always remains on a visible song edge', () => {

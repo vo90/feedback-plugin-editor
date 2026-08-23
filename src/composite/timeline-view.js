@@ -187,6 +187,7 @@ export function buildCompositeTimelineViewModel({
     primaryName = 'Base track',
     secondaryName = 'Fill track',
     resultEntries = [],
+    resultEntriesPrepared = false,
     durationSeconds = 0,
     review = null,
     passageFocusId = '',
@@ -194,7 +195,11 @@ export function buildCompositeTimelineViewModel({
     if (!plan) return null;
     const primary = immutableSourceEntries(plan.sourceEntries?.primary);
     const secondary = immutableSourceEntries(plan.sourceEntries?.secondary);
-    const result = uniqueSortedEntries(resultEntries);
+    // `compositeResolvedEntries()` already returns a unique, sorted immutable
+    // revision snapshot. Renderer controllers can pass that fact through and
+    // retain its identity; ad-hoc/mutable callers keep the defensive default.
+    const result = resultEntriesPrepared && Array.isArray(resultEntries)
+        ? resultEntries : uniqueSortedEntries(resultEntries);
     const hasFillAdditions = result.some(entry => entry.source === 'secondary'
         && !(entry.sources || []).includes('primary'));
     const all = [...primary, ...secondary, ...result];
