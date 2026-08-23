@@ -253,6 +253,26 @@ export function compositePreviewEventsPure(entries, arrangement, beats, stringCo
     return events.sort((a, b) => a.t - b.t || a.midi - b.midi || a.sus - b.sus);
 }
 
+// Preview lanes are immutable snapshots of one plan/review revision. Reusing
+// their converted events keeps transport controls on the gesture path even for
+// very dense songs. Weak keys let discarded timeline snapshots be collected;
+// identity checks on every other input prevent a stale tuning/tempo result.
+export function createCompositePreviewEventCache() {
+    const cache = new WeakMap();
+    return (entries, arrangement, beats, stringCount = 6) => {
+        if (!Array.isArray(entries)) {
+            return compositePreviewEventsPure(entries, arrangement, beats, stringCount);
+        }
+        const count = Math.max(1, Math.trunc(finite(stringCount, 6)));
+        const cached = cache.get(entries);
+        if (cached && cached.arrangement === arrangement && cached.beats === beats
+                && cached.stringCount === count) return cached.events;
+        const events = compositePreviewEventsPure(entries, arrangement, beats, count);
+        cache.set(entries, { arrangement, beats, stringCount: count, events });
+        return events;
+    };
+}
+
 export function compositePreviewRegionPure(context, beats) {
     const startBeat = finite(context && context.startBeat);
     const startTime = Math.max(0, timeOf(beats, startBeat));

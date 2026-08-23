@@ -2845,8 +2845,15 @@ export async function editorPrepareGuidePreview(kind = 'guitar', options = {}) {
 // resolver. It never mutates S.arrangements, the active part, or persisted
 // guide preferences. An empty list is significant: suppress all chart guides
 // while the policy decides whether the imported song audio is audible.
+export function _editorGuidePreviewEventsPure(events, preSanitized = false) {
+    // `preSanitized` is an internal fast path for immutable Hybrid preview
+    // snapshots produced by compositePreviewEventsPure. Other callers retain
+    // the defensive filtering/sorting contract.
+    return preSanitized && Array.isArray(events) ? events : _gmSanitizeEventsPure(events);
+}
+
 export function editorSetGuidePreview(events = [], kind = 'guitar', options = {}) {
-    const sanitized = _gmSanitizeEventsPure(events);
+    const sanitized = _editorGuidePreviewEventsPure(events, options.preSanitized === true);
     const requestedVoiceCap = Math.trunc(Number(options.voiceCap));
     _editorGuidePreview = {
         events: sanitized,

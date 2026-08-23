@@ -25,6 +25,7 @@ const { _cursorDrawTimePure, _transportChartTimePure } = await import('../src/tr
 const {
     _editorPlaybackPaintRequiredPure,
     _editorPlaybackViewWorkRequiredPure,
+    _editorGuidePreviewEventsPure,
     _guideChartToCtxPure,
     _guidePreviewSchedulerRequiredPure,
     _guideScheduleTelemetryPure,
@@ -159,6 +160,17 @@ t('Original Song preview needs no 25 ms guide scheduler when its metronome is of
         'a focused metronome still retains its scheduler');
     assert.equal(_guidePreviewSchedulerRequiredPure(null, false), false,
         'missing event data cannot start a no-op interval');
+});
+
+t('focused preview can retain a trusted pre-sanitized event snapshot', () => {
+    const events = [{ t: 1, midi: 60, sus: 0.25 }];
+    assert.strictEqual(_editorGuidePreviewEventsPure(events, true), events,
+        'the Hybrid cache reaches playback without another filter and sort');
+    assert.notStrictEqual(_editorGuidePreviewEventsPure(events, false), events,
+        'ordinary callers retain defensive sanitation');
+    assert.deepEqual(_editorGuidePreviewEventsPure([
+        { t: 2, midi: 61 }, { t: Number.NaN, midi: 60 }, { t: 1, midi: 62 },
+    ], false), [{ t: 1, midi: 62 }, { t: 2, midi: 61 }]);
 });
 
 t('the real Original Song preview path leaves the interval dormant', () => {

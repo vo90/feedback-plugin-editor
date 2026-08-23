@@ -5,6 +5,7 @@ import {
     COMPOSITE_PREVIEW_TARGET_RMS,
     compositePreviewAudioPolicyPure,
     compositePreviewEventsPure,
+    createCompositePreviewEventCache,
     compositePreviewMixPure,
     compositePreviewModesPure,
     compositePreviewRegionPure,
@@ -110,6 +111,21 @@ test('composite preview sorts chords and skips entries that cannot sound', () =>
         { t: 1, midi: 64, sus: 0.25 },
         { t: 2, midi: 47, sus: 0 },
     ]);
+});
+
+test('composite preview event cache reuses one immutable lane revision only', () => {
+    const entries = [{ startBeat: 2, endBeat: 2.5, string: 5, fret: 0 }];
+    const arrangement = { type: 'guitar', tuning: [0, 0, 0, 0, 0, 0], capo: 0 };
+    const cachedEvents = createCompositePreviewEventCache();
+    const first = cachedEvents(entries, arrangement, beats, 6);
+    assert.strictEqual(cachedEvents(entries, arrangement, beats, 6), first,
+        'replaying the same lane does no note conversion or sorting');
+    assert.notStrictEqual(cachedEvents(entries.slice(), arrangement, beats, 6), first,
+        'a new timeline lane revision cannot inherit stale events');
+    assert.notStrictEqual(cachedEvents(entries, { ...arrangement }, beats, 6), first,
+        'a changed arrangement invalidates tuning/capo-derived pitches');
+    assert.notStrictEqual(cachedEvents(entries, arrangement, beats.slice(), 6), first,
+        'a changed beat map invalidates event timing');
 });
 
 test('composite preview region follows the visible bar context', () => {
