@@ -65,6 +65,75 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
     assert.match(resolver, /dom\.playhead\.style\.transform\s*=\s*`translate3d/,
         'the moving playhead stays on the compositor instead of invalidating layout');
     assert.doesNotMatch(playheadBody, /playhead\.style\.left\s*=/);
+    assert.equal((resolver.match(/updateCompositeTimelinePlayhead\(\);/g) || []).length, 1,
+        'only the cancel-before-refresh helper invokes the self-rescheduling callback directly');
+    assert.match(resolver, /function refreshCompositeTimelinePlayheadNow\(\)[\s\S]*cancelAnimationFrame\(timelinePlayheadFrame\)[\s\S]*updateCompositeTimelinePlayhead\(\)/,
+        'seek, bind, and maximize cannot multiply the playback animation loop');
+});
+
+test('Hybrid follow uses bounded double-buffered cameras and compositor-only overview movers', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    assert.match(resolver, /compositeTimelineStripGeometryPure/);
+    assert.match(resolver, /primaryCamera\?\.cloneNode\(true\)/,
+        'one bounded standby camera is cloned from the active strip');
+    assert.match(resolver, /scheduleCompositeTimelineStandby/);
+    assert.match(resolver, /scheduleCompositeTimelineIdle/);
+    assert.match(resolver, /requestAnimationFrame\(\(\) =>\s*refreshCompositeTimelineViewport\(false\)\)/,
+        'the animation timestamp can never be mistaken for a forced synchronous rebuild');
+    assert.match(resolver, /setCompositeTimelineCameraSlotActive\(standby, true\)/);
+    assert.match(resolver, /setCompositeTimelineCameraSlotActive\(previous, false\)/,
+        'the prepared strip swaps atomically instead of replacing visible lane markup');
+    assert.match(resolver, /toggleAttribute\('inert', !active\)/,
+        'cloned controls in the hidden strip never enter keyboard navigation');
+    assert.match(resolver, /standby\.camera\.style\.opacity = '0\.001'/,
+        'the hidden strip receives one pre-paint frame before the atomic swap');
+    assert.match(resolver, /activeStillCoversViewport[\s\S]*refreshCompositeTimelineViewport\(true\)[\s\S]*if \(dom\.standbyPending\) return/,
+        'coverage is checked before pending render-ahead can expose a blank strip');
+    const cameraStart = resolver.indexOf('function applyCompositeTimelineCamera');
+    const cameraEnd = resolver.indexOf('function setCompositeTimelineNativeCamera', cameraStart);
+    const cameraBody = resolver.slice(cameraStart, cameraEnd);
+    assert.doesNotMatch(cameraBody, /clientWidth|scrollWidth|getBoundingClientRect|innerHTML/,
+        'the display-rate camera path uses cached geometry and compositor transforms only');
+    assert.match(cameraBody, /dom\.nativeScrollLeft/,
+        'the display-rate camera also uses cached native-scroll state');
+    assert.match(resolver, /data-composite-map-viewport-window/);
+    assert.match(resolver, /mapPlayhead\.style\.transform\s*=\s*`translate3d/);
+    assert.match(resolver, /mapViewport\.style\.transform\s*=\s*`translate3d/);
+    assert.doesNotMatch(resolver, /mapPlayhead\.setAttribute\('transform'/,
+        'the dense static overview SVG is never repainted to move its playhead');
+});
+
+test('Hybrid preview policy is cleared when its modal loses ownership of the Editor session', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const audio = fs.readFileSync(new URL('../src/audio.js', import.meta.url), 'utf8');
+    assert.match(resolver, /restorePreview\) \{[\s\S]*restoreCompositePreviewSession\(\)[\s\S]*\} else \{[\s\S]*editorClearGuidePreview\(\)/,
+        'a song switch drops Hybrid audio policy without seeking the new session');
+    const teardownStart = audio.indexOf('export function teardownAudio');
+    const teardownBody = audio.slice(teardownStart, audio.indexOf('\n}', teardownStart) + 2);
+    assert.match(teardownBody, /S\.playing = false;[\s\S]*editorClearGuidePreview\(\)/,
+        'full Editor teardown cannot leak focused preview ownership into the next screen');
+});
+
+test('Hybrid Follow is an explicit two-state preference and zoom keeps live playback centered', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const session = fs.readFileSync(new URL('../src/composite/session.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(resolver, /timelineFollowSuspended|Follow paused|suspendFollow/,
+        'scrolling, zooming, and stage changes cannot create a hidden third Follow state');
+    assert.doesNotMatch(session, /timelineFollowSuspended/,
+        'the builder session has no automatic Follow override');
+    assert.match(resolver, /followPlayhead:\s*!hybridPreviewPreferences\.followPlayhead/,
+        'only the Follow button toggles the remembered preference');
+    const zoomStart = resolver.indexOf('function applyCompositeTimelineZoom');
+    const zoomEnd = resolver.indexOf('function updateCompositeTimelineMapFrame', zoomStart);
+    const zoomBody = resolver.slice(zoomStart, zoomEnd);
+    assert.match(zoomBody, /followsLivePlayback/);
+    assert.match(zoomBody, /editorPlaybackVisualTime\(\)/,
+        'live zoom anchors against the audio clock, not the previous scrollbar position');
+    assert.match(zoomBody, /compositeTimelineCenteredScrollPure/);
+    assert.match(zoomBody, /timelinePendingZoom/);
+    assert.match(zoomBody, /requestAnimationFrame/,
+        'rapid slider and wheel requests are coalesced before rebuilding tracks');
+    assert.doesNotMatch(resolver, /setCompositeTimelineFollowSuspended/);
 });
 
 test('Hybrid setup presents the two player-facing workflows and escapes song data', () => {
@@ -133,7 +202,6 @@ test('Hybrid builder session reset clears review state without losing preview re
     session.timelineScrollLeft = 420;
     session.timelineFocusReview = true;
     session.timelineFocusPassage = true;
-    session.timelineFollowSuspended = true;
     session.inspectedPassageId = 'experimental:passage:2';
     session.passageFilter = 'review';
     session.previewLastMode = 'secondary';
@@ -154,7 +222,6 @@ test('Hybrid builder session reset clears review state without losing preview re
     assert.equal(session.timelineScrollLeft, 0);
     assert.equal(session.timelineFocusReview, false);
     assert.equal(session.timelineFocusPassage, false);
-    assert.equal(session.timelineFollowSuspended, false);
     assert.equal(session.inspectedPassageId, '');
     assert.equal(session.passageFilter, 'all');
     assert.equal(session.previewLastMode, 'song');

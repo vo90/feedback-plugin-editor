@@ -24,9 +24,13 @@ globalThis.window = globalThis.window || globalThis;
 const { _cursorDrawTimePure, _transportChartTimePure } = await import('../src/transport.js');
 const {
     _editorPlaybackPaintRequiredPure,
+    _editorPlaybackViewWorkRequiredPure,
     _guideChartToCtxPure,
+    _guidePreviewSchedulerRequiredPure,
     _guideScheduleWindowPure,
+    editorClearGuidePreview,
     editorPlaybackVisualTime,
+    editorSetGuidePreview,
 } = await import('../src/audio.js');
 const { S } = await import('../src/state.js');
 
@@ -91,11 +95,48 @@ t('focused look-ahead still stops exactly at a loop boundary', () => {
     assert.ok(focused.from < focused.to);
 });
 
-t('a focused Hybrid preview owns the visible frame and suppresses the hidden editor paint', () => {
+t('a focused Hybrid preview suppresses hidden editor paint, follow, and layout work', () => {
+    assert.equal(_editorPlaybackViewWorkRequiredPure(false), true,
+        'ordinary editor playback still updates its visible main view');
+    assert.equal(_editorPlaybackViewWorkRequiredPure(true), false,
+        'focused preview playback skips hidden main-view follow/layout work');
     assert.equal(_editorPlaybackPaintRequiredPure(false), true,
         'ordinary editor playback still paints the editor canvas');
     assert.equal(_editorPlaybackPaintRequiredPure(true), false,
-        'focused preview playback does not repaint the obscured editor canvas');
+        'the compatibility paint seam follows the shared view-work decision');
+});
+
+t('Original Song preview needs no 25 ms guide scheduler when its metronome is off', () => {
+    assert.equal(_guidePreviewSchedulerRequiredPure([], false), false,
+        'reference-only playback has neither guide events nor click work');
+    assert.equal(_guidePreviewSchedulerRequiredPure([{ t: 1 }], false), true,
+        'Lead/Rhythm/Hybrid guide events retain their scheduler');
+    assert.equal(_guidePreviewSchedulerRequiredPure([], true), true,
+        'a focused metronome still retains its scheduler');
+    assert.equal(_guidePreviewSchedulerRequiredPure(null, false), false,
+        'missing event data cannot start a no-op interval');
+});
+
+t('the real Original Song preview path leaves the interval dormant', () => {
+    const saved = { playing: S.playing, audioCtx: S.audioCtx };
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    let intervalsStarted = 0;
+    try {
+        globalThis.setInterval = () => { intervalsStarted++; return 1; };
+        globalThis.clearInterval = () => {};
+        S.playing = true;
+        S.audioCtx = null;
+        editorSetGuidePreview([], 'guitar', { metronome: false });
+        assert.equal(intervalsStarted, 0,
+            'reference-only focused playback must not create the guide timer');
+    } finally {
+        S.playing = false;
+        editorClearGuidePreview();
+        Object.assign(S, saved);
+        globalThis.setInterval = realSetInterval;
+        globalThis.clearInterval = realClearInterval;
+    }
 });
 
 t('the focused visual clock samples AudioContext directly between editor animation frames', () => {

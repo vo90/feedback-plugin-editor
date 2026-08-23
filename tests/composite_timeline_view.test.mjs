@@ -5,6 +5,7 @@ import {
     buildCompositeTimelineViewModel,
     COMPOSITE_TIMELINE_EDGE_PADDING,
     COMPOSITE_TIMELINE_GUTTER,
+    COMPOSITE_TIMELINE_STRIP_VIEWPORTS,
     compositeTimelineBeatForXPure,
     compositeTimelineCameraFramePure,
     compositeTimelineCameraOffsetPure,
@@ -12,13 +13,18 @@ import {
     compositeTimelineContentWidthPure,
     compositeTimelineEntriesInRangePure,
     compositeTimelineFitZoomPure,
+    compositeTimelineGlobalToLocalXPure,
+    compositeTimelineLocalToGlobalXPure,
     compositeTimelineMapViewportPure,
     compositeTimelineMapBeatPure,
     compositeTimelineRenderBufferPure,
     compositeTimelineRenderGuardPure,
+    compositeTimelineRenderOriginPure,
+    compositeTimelineRenderRangePure,
     compositeTimelineRenderWindowNeedsRefreshPure,
     compositeTimelineSongRangePure,
     compositeTimelineSteppedZoomPure,
+    compositeTimelineStripGeometryPure,
     compositeTimelineVisibleRangePure,
     compositeTimelineViewportRangePure,
     compositeTimelineXForBeatPure,
@@ -141,8 +147,91 @@ test('the virtual camera glides fractionally without native-scroll catch-up', ()
 test('render-ahead scales with the real viewport instead of a fixed song window', () => {
     assert.equal(compositeTimelineRenderBufferPure(600), 1800);
     assert.equal(compositeTimelineRenderBufferPure(1600), 3200);
-    assert.equal(compositeTimelineRenderGuardPure(600), 600);
-    assert.equal(compositeTimelineRenderGuardPure(1600), 1200);
+    assert.equal(compositeTimelineRenderGuardPure(600), 900);
+    assert.equal(compositeTimelineRenderGuardPure(1600), 2400);
+});
+
+test('bounded strip geometry keeps a viewport-centered local surface and clamps at song edges', () => {
+    const context = { startBeat: 0, endBeat: 100 };
+    const zoom = 120;
+    const viewportWidth = 1000;
+    const middle = compositeTimelineStripGeometryPure({
+        context, zoom, visualScrollLeft: 4000, viewportWidth,
+    });
+    assert.equal(COMPOSITE_TIMELINE_STRIP_VIEWPORTS, 5);
+    assert.equal(middle.surfaceWidth, 5000);
+    assert.equal(middle.renderOriginX, 2000);
+    assert.equal(middle.viewportLocalX, 2000);
+    assert.equal(middle.globalEndX, 7000);
+    assert.ok(middle.surfaceWidth < middle.contentWidth,
+        'the painted SVG is bounded instead of spanning the whole song');
+    assert.deepEqual(middle.renderRange, compositeTimelineRenderRangePure({
+        context, zoom, renderOriginX: 2000, surfaceWidth: 5000,
+    }));
+
+    const start = compositeTimelineStripGeometryPure({
+        context, zoom, visualScrollLeft: 0, viewportWidth,
+    });
+    assert.equal(start.renderOriginX, 0);
+    assert.equal(start.renderRange.startBeat, 0);
+    const end = compositeTimelineStripGeometryPure({
+        context, zoom, visualScrollLeft: 1_000_000, viewportWidth,
+    });
+    assert.equal(end.renderOriginX, end.contentWidth - end.surfaceWidth);
+    assert.equal(end.renderRange.endBeat, 100);
+
+    assert.equal(compositeTimelineRenderOriginPure({
+        visualScrollLeft: 4000, viewportWidth, contentWidth: middle.contentWidth,
+        surfaceWidth: middle.surfaceWidth,
+    }), middle.renderOriginX);
+});
+
+test('global and strip-local x coordinates round trip without changing musical time', () => {
+    const context = { startBeat: 0, endBeat: 100 };
+    const globalX = compositeTimelineXForBeatPure(37.125, context, 120);
+    const localX = compositeTimelineGlobalToLocalXPure(globalX, 2000.5);
+    assert.equal(compositeTimelineLocalToGlobalXPure(localX, 2000.5), globalX);
+    assert.ok(Math.abs(compositeTimelineBeatForXPure(
+        compositeTimelineLocalToGlobalXPure(localX, 2000.5), context, 120) - 37.125) < 1e-9);
+});
+
+test('lane and ruler renderers can paint the same global beats into a bounded local strip', () => {
+    const model = view();
+    const geometry = compositeTimelineStripGeometryPure({
+        context: model.context,
+        zoom: 32,
+        visualScrollLeft: 700,
+        viewportWidth: 400,
+        stripViewports: 3,
+    });
+    assert.equal(geometry.renderOriginX, 0,
+        'this short fixture fits inside its requested strip');
+
+    const forcedOrigin = 300;
+    const surfaceWidth = 400;
+    const visibleRange = compositeTimelineRenderRangePure({
+        context: model.context, zoom: 32,
+        renderOriginX: forcedOrigin, surfaceWidth,
+    });
+    const options = { renderOriginX: forcedOrigin, surfaceWidth };
+    const lane = renderCompositeTimelineLaneContents(
+        model, 'secondary', 158, visibleRange, 32, options);
+    const ruler = renderCompositeTimelineRulerContents(model, visibleRange, 32, options);
+    const expectedLocalX = compositeTimelineGlobalToLocalXPure(
+        compositeTimelineXForBeatPure(8, model.context, 32), forcedOrigin);
+    assert.equal(expectedLocalX, 152);
+    assert.match(lane, /<rect width="400" height="158" fill="#0f172a"/);
+    assert.match(lane, /<text x="152\.0"[^>]*>7<\/text>/);
+    assert.match(ruler, /<rect width="400" height="34"/);
+    assert.match(ruler, /x1="152\.0"/,
+        'bar and note geometry share the same local coordinate map');
+
+    const fullWidth = compositeTimelineContentWidthPure(model.context, 32);
+    assert.equal(renderCompositeTimelineLaneContents(
+        model, 'secondary', 158, visibleRange, 32),
+    renderCompositeTimelineLaneContents(model, 'secondary', 158, visibleRange, 32, {
+        renderOriginX: 0, surfaceWidth: fullWidth,
+    }), 'omitting strip options preserves the previous full-song markup');
 });
 
 test('cursor-anchored zoom preserves the beat beneath the pointer and clamps scrolling', () => {
@@ -202,9 +291,9 @@ test('lane and overview markup contain full-song notes without review controls',
     assert.doesNotMatch(lane, /data-composite-entry-id|>REVIEW</);
     const map = renderCompositeTimelineMapSvg(model, { startBeat: 2, endBeat: 8 });
     assert.match(map, /Whole-song Hybrid overview/);
-    assert.match(map, /stroke="#7dd3fc"/);
     assert.match(map, /fill="#c084fc"/, 'fill-track additions share the main song map');
-    assert.match(map, /id="editor-composite-map-viewport"/);
+    assert.doesNotMatch(map, /editor-composite-map-(viewport|playhead)/,
+        'the dense overview SVG stays static while HTML overlays move above it');
     assert.match(map, /data-composite-map-passage="experimental:passage:1"/);
 });
 
@@ -330,7 +419,7 @@ test('review timeline uses the shared lanes with selectable notes and one focus 
     assert.match(lane, /stroke="#fbbf24"/);
     assert.match(ruler, />REVIEW</);
     assert.match(map, /data-composite-map-decision="0"/);
-    assert.match(map, /id="editor-composite-map-playhead"/);
+    assert.doesNotMatch(map, /id="editor-composite-map-playhead"/);
 });
 
 test('review choice highlights only the matching fixed track header', () => {

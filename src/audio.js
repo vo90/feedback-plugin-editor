@@ -1044,12 +1044,11 @@ export function editorPlaybackVisualTime() {
 export function playbackTick() {
     if (!S.playing) return;
     // Focused tools such as the Hybrid Track reviewer paint their own visible
-    // timeline over the editor. Repainting the obscured editor canvas as well
-    // competes with that timeline for every animation frame (especially on a
-    // dense song) and makes its camera look as though it is advancing at only
-    // a handful of frames per second. The transport clock and audio scheduler
-    // keep running normally; only the invisible duplicate paint is suppressed.
-    const paintEditor = _editorPlaybackPaintRequiredPure(!!_editorGuidePreview);
+    // timeline over the editor. Repainting or follow-scrolling the obscured
+    // editor canvas as well competes with that timeline for every animation
+    // frame (especially on a dense song). The transport clock and audio
+    // scheduler keep running normally; only hidden main-view work is skipped.
+    const updateEditorView = _editorPlaybackViewWorkRequiredPure(!!_editorGuidePreview);
     // Clamped at the start position while a count-in pre-roll runs (the
     // anchor sits in the future, so the raw chart time would read negative).
     S.cursorTime = Math.max(S.playStartTime,
@@ -1079,7 +1078,7 @@ export function playbackTick() {
         // tick, so this is the only frame that can scroll — and the restart is
         // measured against the CURRENT scrollX, so it has to run before the
         // clamp writes a new one.
-        {
+        if (updateEditorView) {
             const viewW = canvas ? canvas.width / DPR : 800;
             const target = _scrollInPlayActive()
                 ? _scrollInPlayTargetPure(loopRestart, viewW, S.zoom, editorFollowEnabled())
@@ -1099,14 +1098,14 @@ export function playbackTick() {
             S.cursorTime = loopRestart;
             startPlayback();
             if (_abActive()) { _abPhase = abPhase; _abApplyRefGain(); }
-            if (paintEditor) {
+            if (updateEditorView) {
                 host.updateTimeDisplay();
                 host.drawNow();
             }
             return;   // startPlayback scheduled its own tick.
         }
         _restartPlaybackAt(loopRestart);
-        if (paintEditor) {
+        if (updateEditorView) {
             host.updateTimeDisplay();
             // playbackTick already runs once per animation frame — paint
             // synchronously rather than queueing a second rAF via host.draw().
@@ -1125,7 +1124,7 @@ export function playbackTick() {
             stopPlayback();
         }
         S.cursorTime = 0;
-        if (paintEditor) {
+        if (updateEditorView) {
             host.updateTimeDisplay(); // reflect the reset immediately before returning
             host.drawNow();
         }
@@ -1135,7 +1134,7 @@ export function playbackTick() {
     // Auto-scroll to follow the playhead — unless follow is toggled off
     // (Shift+L), which lets an author inspect/edit one spot while the
     // song plays on.
-    {
+    if (updateEditorView) {
         const cx = timeToX(S.cursorTime);
         const w = canvas ? canvas.width / DPR : 800;
         const target = _scrollInPlayActive()
@@ -1144,15 +1143,21 @@ export function playbackTick() {
         if (target !== null) S.scrollX = host.editorClampScrollX(target);
     }
 
-    if (paintEditor) {
+    if (updateEditorView) {
         host.updateTimeDisplay();
         host.drawNow();
     }
     rafId = requestAnimationFrame(playbackTick);
 }
 
-export function _editorPlaybackPaintRequiredPure(focusedPreviewActive) {
+export function _editorPlaybackViewWorkRequiredPure(focusedPreviewActive) {
     return !focusedPreviewActive;
+}
+
+// Compatibility seam for existing focused-preview tests and callers. Painting
+// and main-editor follow/layout now share the same ownership decision above.
+export function _editorPlaybackPaintRequiredPure(focusedPreviewActive) {
+    return _editorPlaybackViewWorkRequiredPure(focusedPreviewActive);
 }
 
 /* @pure:follow-scroll:start */
@@ -3119,12 +3124,23 @@ export function _editorToggleLoopAB() {
 
 // Start/stop the scheduler to match "playing AND enabled". Called from
 // startPlayback/stopPlayback and from the toggle (mid-play enable works).
+export function _guidePreviewSchedulerRequiredPure(events, metronome) {
+    return (Array.isArray(events) && events.length > 0) || !!metronome;
+}
+
 export function _guideTimerSync() {
     const previewActive = !!_editorGuidePreview;
     const bandLive = !previewActive && editorPlayAllTracksEnabled() && !S.drumEditMode
         && _bandPartsPure(S.arrangements, S.drumTab).length > 0;
+    // A focused preview owns the guide/metronome policy. Original Song passes
+    // an intentionally empty event lane with its metronome off, so reference
+    // audio can ride the transport without waking a no-op 25 ms interval.
+    const previewWork = previewActive && _guidePreviewSchedulerRequiredPure(
+        _editorGuidePreview.events, _editorGuidePreview.metronome);
     const want = S.playing
-        && (previewActive || editorGuideClapEnabled() || editorMetronomeEnabled() || _abActive() || bandLive);
+        && (previewActive
+            ? previewWork
+            : editorGuideClapEnabled() || editorMetronomeEnabled() || _abActive() || bandLive);
     if (want && !_guideTimer) {
         _guideScheduledUntil = _transportChartTimePure(
             S.playStartTime, S.playStartWall, S.audioCtx.currentTime, _auditionRate());
@@ -3246,6 +3262,10 @@ export function teardownAudio() {
     _stopRefMedia();
     try { if (rafId) { cancelAnimationFrame(rafId); rafId = null; } } catch (_) { /* no frame queued */ }
     S.playing = false;
+    // Focused preview policy is session-scoped. A replaced Editor screen must
+    // never inherit muted reference audio, stale guide events, or ownership of
+    // the hidden-main-view optimization from the previous song.
+    editorClearGuidePreview();
     _trainerDisarm();   // session-only: a replaced screen never comes back armed
     _guideTimerSync();
     _guideCancelVoices();

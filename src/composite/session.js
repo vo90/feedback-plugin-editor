@@ -25,7 +25,6 @@ export function createHybridBuilderSession() {
         timelineScrollLeft: 0,
         timelineFocusReview: false,
         timelineFocusPassage: false,
-        timelineFollowSuspended: false,
         inspectedPassageId: '',
         passageFilter: 'all',
         previewLastMode: 'song',
@@ -127,7 +126,6 @@ export function resetHybridBuilderReview(session) {
     session.timelineScrollLeft = 0;
     session.timelineFocusReview = false;
     session.timelineFocusPassage = false;
-    session.timelineFollowSuspended = false;
     session.inspectedPassageId = '';
     session.passageFilter = 'all';
     session.previewLastMode = 'song';
