@@ -16,10 +16,25 @@ import {
 import {
     analyzeGapFillComposite,
     COMPOSITE_GAP_FILL_DEFAULTS,
+    compositeGroupFitsWindowPure,
     compositeGapFillDefaultsForUnit,
     normalizeCompositeGapFillOptions,
 } from '../src/composite/gap-fill-engine.js';
 import { analyzeGuidedComposite } from '../src/composite/guided-engine.js';
+
+test('gap window lookup preserves exhaustive results without rescanning earlier gaps', () => {
+    const windows = Array.from({ length: 2000 }, (_, index) => ({
+        start: index * 3,
+        end: index * 3 + 2,
+    }));
+    const exhaustive = group => windows.some(window =>
+        group.startBeat >= window.start - 1e-4 && group.endBeat <= window.end + 1e-4);
+    for (let index = 0; index < 4000; index++) {
+        const startBeat = (index * 37) % 6000 + (index % 5) * 0.3;
+        const group = { startBeat, endBeat: startBeat + (index % 7) * 0.25 };
+        assert.equal(compositeGroupFitsWindowPure(group, windows), exhaustive(group));
+    }
+});
 
 const beats = Array.from({ length: 17 }, (_, i) => ({ time: i * 0.5, measure: i % 4 === 0 ? i / 4 + 1 : -1 }));
 const note = (beat, string, fret, sustainBeats = 0, techniques = {}) => ({

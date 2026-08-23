@@ -101,11 +101,22 @@ function eligibleWindows(primaryEntries, secondaryEntries, beats, options) {
     return { windows, coordinate };
 }
 
-function groupFitsWindow(group, windows, coordinate) {
+export function compositeGroupFitsWindowPure(group, windows, coordinate = value => value) {
     const start = coordinate(group.startBeat);
     const end = coordinate(group.endBeat);
-    return windows.some(window => start >= window.start - COMPOSITE_BEAT_EPS
-        && end <= window.end + COMPOSITE_BEAT_EPS);
+    // Windows are emitted in ascending, non-overlapping order. Find the first
+    // one whose end reaches the group start instead of rescanning every earlier
+    // gap for every secondary gesture (quadratic on alternating arrangements).
+    let low = 0;
+    let high = windows.length;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (windows[middle].end < start - COMPOSITE_BEAT_EPS) low = middle + 1;
+        else high = middle;
+    }
+    const window = windows[low];
+    return !!window && start >= window.start - COMPOSITE_BEAT_EPS
+        && end <= window.end + COMPOSITE_BEAT_EPS;
 }
 
 export function analyzeGapFillComposite({ primary, secondary, beats = [], gapFill = {} } = {}) {
@@ -122,7 +133,8 @@ export function analyzeGapFillComposite({ primary, secondary, beats = [], gapFil
     const skippedEntries = [];
     // A chord or connected gesture fits as a whole or is skipped as a whole.
     for (const group of compositePlayableGroups(secondaryEntries)) {
-        const target = groupFitsWindow(group, windows, coordinate) ? accepted : skippedEntries;
+        const target = compositeGroupFitsWindowPure(group, windows, coordinate)
+            ? accepted : skippedEntries;
         target.push(...group.entries);
     }
     const fixedEntries = [...primaryEntries, ...accepted].sort(compareEntries);
