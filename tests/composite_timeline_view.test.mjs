@@ -5,6 +5,7 @@ import {
     buildCompositeTimelineViewModel,
     COMPOSITE_TIMELINE_EDGE_PADDING,
     COMPOSITE_TIMELINE_GUTTER,
+    COMPOSITE_TIMELINE_STRIP_MAX_WIDTH,
     COMPOSITE_TIMELINE_STRIP_VIEWPORTS,
     compositeTimelineBeatForXPure,
     compositeTimelineCameraFramePure,
@@ -12,6 +13,7 @@ import {
     compositeTimelineCenteredScrollPure,
     compositeTimelineContentWidthPure,
     compositeTimelineDisplayBeatPure,
+    compositeTimelineDetailLevelPure,
     compositeTimelineEntriesInRangePure,
     compositeTimelineFitZoomPure,
     compositeTimelineGlobalToLocalXPure,
@@ -176,7 +178,18 @@ test('render-ahead scales with the real viewport instead of a fixed song window'
     assert.equal(compositeTimelineRenderBufferPure(600), 1800);
     assert.equal(compositeTimelineRenderBufferPure(1600), 3200);
     assert.equal(compositeTimelineRenderGuardPure(600), 900);
-    assert.equal(compositeTimelineRenderGuardPure(1600), 2400);
+    assert.equal(compositeTimelineRenderGuardPure(1600), 2280,
+        'the guard follows the capped strip runway rather than an impossible five screens');
+    assert.equal(compositeTimelineRenderGuardPure(3840), 1440,
+        'a 4K strip begins standby work with three quarters of its runway remaining');
+});
+
+test('timeline detail policy keeps 120 full and progressively simplifies 60 and Fit', () => {
+    assert.equal(compositeTimelineDetailLevelPure(120).id, 'full');
+    assert.equal(compositeTimelineDetailLevelPure(60).id, 'compact');
+    assert.equal(compositeTimelineDetailLevelPure(3).id, 'density');
+    assert.equal(compositeTimelineDetailLevelPure(89.99).id, 'compact');
+    assert.equal(compositeTimelineDetailLevelPure(90).id, 'full');
 });
 
 test('bounded strip geometry keeps a viewport-centered local surface and clamps at song edges', () => {
@@ -212,6 +225,32 @@ test('bounded strip geometry keeps a viewport-centered local surface and clamps 
         visualScrollLeft: 4000, viewportWidth, contentWidth: middle.contentWidth,
         surfaceWidth: middle.surfaceWidth,
     }), middle.renderOriginX);
+});
+
+test('4K strip surfaces obey a CSS-pixel cap without changing song coordinates', () => {
+    const context = { startBeat: 0, endBeat: 1_000 };
+    const viewportWidth = 3840;
+    const geometry = compositeTimelineStripGeometryPure({
+        context, zoom: 120, visualScrollLeft: 50_000, viewportWidth,
+    });
+    assert.equal(COMPOSITE_TIMELINE_STRIP_MAX_WIDTH, 7680);
+    assert.equal(geometry.surfaceWidth, COMPOSITE_TIMELINE_STRIP_MAX_WIDTH,
+        'the old five-viewport surface would have been 19,200 CSS pixels');
+    assert.ok(geometry.surfaceWidth >= viewportWidth);
+    assert.equal(geometry.viewportLocalX, (geometry.surfaceWidth - viewportWidth) / 2);
+    assert.equal(geometry.globalEndX,
+        geometry.renderOriginX + COMPOSITE_TIMELINE_STRIP_MAX_WIDTH);
+    assert.deepEqual(geometry.renderRange, compositeTimelineRenderRangePure({
+        context, zoom: 120,
+        renderOriginX: geometry.renderOriginX,
+        surfaceWidth: geometry.surfaceWidth,
+    }));
+
+    const widerThanCap = compositeTimelineStripGeometryPure({
+        context, zoom: 120, viewportWidth: 8_000,
+    });
+    assert.equal(widerThanCap.surfaceWidth, 8_000,
+        'an unusually wide viewport still receives one complete viewport');
 });
 
 test('global and strip-local x coordinates round trip without changing musical time', () => {
@@ -498,4 +537,84 @@ test('the ruler thins labels and beat ticks at whole-song fit zoom', () => {
     const detailed = renderCompositeTimelineRulerContents(model, visible, 32);
     assert.ok((fitted.match(/>Bar /g) || []).length < (detailed.match(/>Bar /g) || []).length);
     assert.ok((fitted.match(/<line /g) || []).length < (detailed.match(/<line /g) || []).length);
+});
+
+test('static timeline markup scales down at 60 and Fit while 120 stays fully labelled', () => {
+    const model = view();
+    model.lanes[2].entries = Array.from({ length: 96 }, (_, index) =>
+        entry(`dense:${index}`, index / 4, index / 4 + 0.25,
+            index % 6, index % 24, 'primary'));
+    const visible = { startBeat: 0, endBeat: model.context.endBeat };
+    const full = renderCompositeTimelineLaneContents(model, 'result', 158, visible, 120);
+    const compact = renderCompositeTimelineLaneContents(model, 'result', 158, visible, 60);
+    const fitted = renderCompositeTimelineLaneContents(model, 'result', 158, visible, 3);
+
+    assert.equal((full.match(/<g/g) || []).length, 96);
+    assert.equal((full.match(/<title>/g) || []).length, 96);
+    assert.equal((full.match(/data-composite-compact-note/g) || []).length, 0);
+    assert.equal((compact.match(/<g/g) || []).length, 0);
+    assert.equal((compact.match(/<title>/g) || []).length, 0);
+    assert.equal((compact.match(/data-composite-compact-note/g) || []).length, 96,
+        '60 px/beat retains one readable fret label per static attack');
+    assert.equal((compact.match(/data-composite-static-trails=/g) || []).length, 1,
+        'all ordinary compact trails share one SVG path');
+    assert.equal((fitted.match(/data-composite-density-notes=/g) || []).length, 1,
+        'Fit collapses all static attacks into one SVG path');
+    assert.equal((fitted.match(/data-composite-compact-note|<title>|<g/g) || []).length, 0);
+    assert.ok(compact.length < full.length * 0.55,
+        'compact markup is less than 55% of full detail for a dense static lane');
+    assert.ok(fitted.length < full.length * 0.15,
+        'Fit markup is less than 15% of full detail for a dense static lane');
+});
+
+test('Fit keeps manual-review notes fully selectable and preserves static trail endpoints', () => {
+    const model = view();
+    model.review = {
+        id: 'decision:fit', startBeat: 2, endBeat: 4,
+        contextStartBeat: 0, contextEndBeat: 8, state: 'unresolved',
+    };
+    const focused = {
+        ...entry('focused', 2, 4, 0, 11),
+        effectiveEndBeat: 6,
+        selectable: true,
+        selected: true,
+        inConflict: true,
+        note: { techniques: { tremolo: true } },
+    };
+    const longTrail = entry('background-trail', 8, 20, 1, 5);
+    model.lanes[0].entries = [focused, longTrail];
+    const visible = { startBeat: 0, endBeat: model.context.endBeat };
+    const fitted = renderCompositeTimelineLaneContents(
+        model, 'primary', 158, visible, 3);
+
+    assert.match(fitted, /data-composite-entry-id="focused"/);
+    assert.match(fitted, /role="checkbox"/);
+    assert.match(fitted, /<title>String 6, fret 11,/);
+    assert.match(fitted, /stroke-dasharray="3 3"/,
+        'the focused authored tremolo trail retains complete detail');
+    assert.match(fitted, /stroke-dasharray="5 4"/,
+        'the focused effective trail boundary remains distinct');
+    assert.match(fitted, /data-composite-static-trails="authored"/);
+    const expectedTrailEnd = compositeTimelineXForBeatPure(20, model.context, 3);
+    assert.match(fitted, new RegExp(`H${expectedTrailEnd.toFixed(1)}`),
+        'a simplified background trail still terminates at its exact musical beat');
+    assert.equal((fitted.match(/data-composite-density-notes=/g) || []).length, 1,
+        'only the non-review attack is density-rendered');
+});
+
+test('an inspected Experimental passage remains detailed below compact zoom', () => {
+    const model = view();
+    model.passageFocus = { id: 'passage:focus', startBeat: 8, endBeat: 9 };
+    model.lanes[1].entries = [
+        entry('context', 2, 2.25, 0, 3, 'secondary'),
+        entry('passage', 8, 9, 2, 7, 'secondary'),
+    ];
+    const fitted = renderCompositeTimelineLaneContents(model, 'secondary', 158,
+        { startBeat: 0, endBeat: model.context.endBeat }, 3);
+    assert.match(fitted, /<title>String 4, fret 7,/,
+        'the passage under inspection keeps its full note description');
+    assert.match(fitted, />7<\/text>/,
+        'the passage under inspection keeps its readable fret marker');
+    assert.equal((fitted.match(/data-composite-density-notes=/g) || []).length, 1,
+        'unfocused song context remains density-rendered');
 });

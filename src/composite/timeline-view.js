@@ -26,9 +26,28 @@ export const COMPOSITE_TIMELINE_RULER_HEIGHT = 34;
 // note/trail at the right edge.
 export const COMPOSITE_TIMELINE_EDGE_PADDING = 28;
 export const COMPOSITE_TIMELINE_STRIP_VIEWPORTS = 5;
+// Five complete viewports are useful on ordinary displays, but scale to a
+// wasteful 19,200 CSS pixels on a 4K window. Keep the renderer below a stable
+// CSS-pixel budget while allowing an unusually wide viewport to cover itself.
+export const COMPOSITE_TIMELINE_STRIP_MAX_WIDTH = 7680;
 const RANGE_BUFFER_PX = 900;
 const ENTRY_RANGE_INDEX = new WeakMap();
 const OVERVIEW_WIDTH = 1000;
+
+const TIMELINE_DETAIL_LEVELS = Object.freeze({
+    density: Object.freeze({
+        id: 'density', laneBeatStep: 0, rulerBeatStep: 0,
+        staticNoteStyle: 'density',
+    }),
+    compact: Object.freeze({
+        id: 'compact', laneBeatStep: 2, rulerBeatStep: 1,
+        staticNoteStyle: 'fret',
+    }),
+    full: Object.freeze({
+        id: 'full', laneBeatStep: 1, rulerBeatStep: 1,
+        staticNoteStyle: 'full',
+    }),
+});
 
 const COLORS = Object.freeze({
     primary: Object.freeze({ main: '#38bdf8', soft: '#082f49', text: '#bae6fd' }),
@@ -106,6 +125,17 @@ export function compositeTimelineSteppedZoomPure(value, direction = 0) {
 export function compositeTimelineLaneHeightPure(value) {
     return Math.max(HYBRID_TIMELINE_LANE_MIN,
         Math.min(HYBRID_TIMELINE_LANE_MAX, Math.round(finite(value, 158))));
+}
+
+// Rendering policy is intentionally based only on zoom, so the ruler and all
+// three lanes always choose the same level. The normal 120 px/beat view keeps
+// the existing complete notation; 60 px/beat removes decorative per-note SVG
+// nodes, and very small whole-song views collapse static attacks into paths.
+export function compositeTimelineDetailLevelPure(zoom) {
+    const value = compositeTimelineZoomPure(zoom);
+    if (value >= 90) return TIMELINE_DETAIL_LEVELS.full;
+    if (value >= 24) return TIMELINE_DETAIL_LEVELS.compact;
+    return TIMELINE_DETAIL_LEVELS.density;
 }
 
 export function compositeTimelineSongRangePure({ beats = [], durationSeconds = 0, entries = [] } = {}) {
@@ -345,8 +375,10 @@ export function compositeTimelineStripGeometryPure({
     const contentWidth = compositeTimelineContentWidthPure(context, zoom);
     const defaultSurfaceWidth = viewport
         * Math.max(1, finite(stripViewports, COMPOSITE_TIMELINE_STRIP_VIEWPORTS));
+    const cappedSurfaceWidth = Math.min(COMPOSITE_TIMELINE_STRIP_MAX_WIDTH,
+        finite(requestedSurfaceWidth, defaultSurfaceWidth));
     const surfaceWidth = Math.min(contentWidth, Math.max(viewport,
-        finite(requestedSurfaceWidth, defaultSurfaceWidth)));
+        cappedSurfaceWidth));
     const maxScroll = Math.max(0, contentWidth - viewport);
     const scrollLeft = Math.max(0, Math.min(maxScroll, finite(visualScrollLeft)));
     const renderOriginX = compositeTimelineRenderOriginPure({
@@ -461,10 +493,14 @@ export function compositeTimelineRenderBufferPure(viewportWidth = 1200) {
 }
 
 export function compositeTimelineRenderGuardPure(viewportWidth = 1200) {
-    // A five-viewport strip has roughly two screens of material on either
-    // side. Start preparing the standby after half a screen of travel, leaving
-    // about 1.5 screens for idle-sliced rendering even at maximum zoom.
-    return Math.max(600, Math.max(1, finite(viewportWidth, 1200)) * 1.5);
+    const viewport = Math.max(1, finite(viewportWidth, 1200));
+    const surface = Math.max(viewport, Math.min(COMPOSITE_TIMELINE_STRIP_MAX_WIDTH,
+        viewport * COMPOSITE_TIMELINE_STRIP_VIEWPORTS));
+    const offscreenPerSide = Math.max(0, (surface - viewport) / 2);
+    // Begin standby preparation after one quarter of the off-screen runway is
+    // consumed. Clamp the historical 600 px minimum to the runway available on
+    // tiny or capped surfaces so a guard can never be physically impossible.
+    return Math.min(offscreenPerSide, Math.max(600, offscreenPerSide * 0.75));
 }
 
 // The notes are rendered with a generous buffer on either side. Reuse that
@@ -582,7 +618,7 @@ export function compositeTimelineEntriesInRangePure(entries, range) {
     return visible;
 }
 
-function badgeSummary(entry) {
+function badgeSummary(techniqueLabels) {
     const aliases = {
         'Hammer-on': 'HO', 'Pull-off': 'PO', 'Palm mute': 'PM',
         'Fret-hand mute': 'FM', 'String mute': 'X', Harmonic: 'H',
@@ -592,7 +628,7 @@ function badgeSummary(entry) {
         'Bend curve': 'B', 'Bend intent': 'B',
     };
     const badges = [];
-    for (const technique of compositeTechniqueLabels(entry && entry.note)) {
+    for (const technique of techniqueLabels || []) {
         const badge = aliases[technique] || technique.slice(0, 4).toUpperCase();
         if (!badges.includes(badge)) badges.push(badge);
     }
@@ -601,19 +637,53 @@ function badgeSummary(entry) {
     return visible.join(' · ');
 }
 
-function noteTitle(entry, stringCount) {
+function entryDisplayMetadata(entry, stringCount, {
+    detailed = true,
+    includeTechniques = true,
+} = {}) {
+    // Technique extraction walks nested authored data. Compute it once for all
+    // title, badge, and trail decisions made while rendering this note.
+    const techniqueLabels = includeTechniques
+        ? compositeTechniqueLabels(entry && entry.note) : [];
+    if (!detailed) {
+        return {
+            tremolo: techniqueLabels.includes('Tremolo'),
+            badge: '',
+            title: '',
+        };
+    }
     const string = Math.max(1, stringCount - Math.trunc(finite(entry && entry.string)));
     const trail = Math.max(0, finite(entry && entry.endBeat) - finite(entry && entry.startBeat));
-    const techniques = compositeTechniqueLabels(entry && entry.note).join(', ') || 'No techniques';
-    return `String ${string}, fret ${finite(entry && entry.fret)}, beat ${finite(entry && entry.startBeat).toFixed(3)}, ${trail.toFixed(3)} beat trail. ${techniques}.`;
+    const techniques = techniqueLabels.join(', ') || 'No techniques';
+    return {
+        tremolo: techniqueLabels.includes('Tremolo'),
+        badge: badgeSummary(techniqueLabels),
+        title: `String ${string}, fret ${finite(entry && entry.fret)}, beat ${finite(entry && entry.startBeat).toFixed(3)}, ${trail.toFixed(3)} beat trail. ${techniques}.`,
+    };
+}
+
+function entryNeedsFullTimelineDetail(view, entry, detail) {
+    if (detail.id === 'full' || entry?.selectable || entry?.inConflict
+            || entry?.selected || entry?.invalid) return true;
+    const focus = view?.review || view?.passageFocus;
+    if (!focus) return false;
+    const start = finite(focus.startBeat);
+    const end = Math.max(start, finite(focus.endBeat, start));
+    return finite(entry?.startBeat) <= end + 1e-4
+        && entryEndBeat(entry) >= start - 1e-4;
 }
 
 function lineMarkup(view, height, visibleRange, zoom, renderOptions = {}) {
     const lines = [];
     const surface = timelineRenderSurface(view.context, zoom, renderOptions);
+    const detail = compositeTimelineDetailLevelPure(zoom);
+    const markerBeats = new Set((view.context.measureMarkers || [])
+        .map(marker => finite(marker.beat)));
     const firstBeat = Math.ceil(visibleRange.startBeat);
     const lastBeat = Math.floor(visibleRange.endBeat);
     for (let beat = firstBeat; beat <= lastBeat; beat++) {
+        if (!detail.laneBeatStep || beat % detail.laneBeatStep
+                || (detail.id !== 'full' && markerBeats.has(beat))) continue;
         const x = surface.xForBeat(beat);
         lines.push(`<line x1="${x.toFixed(1)}" y1="0" x2="${x.toFixed(1)}" y2="${height}" stroke="#334155" stroke-width="0.7" opacity="0.5"/>`);
     }
@@ -633,6 +703,7 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
     const z = compositeTimelineZoomPure(zoom);
     const surface = timelineRenderSurface(view.context, z, renderOptions);
     const contentWidth = surface.surfaceWidth;
+    const detail = compositeTimelineDetailLevelPure(z);
     const colors = COLORS[lane.id] || COLORS.result;
     const top = 28;
     const bottom = 22;
@@ -645,7 +716,13 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
             surface.localX(COMPOSITE_TIMELINE_GUTTER)));
         strings.push(`<line x1="${startX}" y1="${y.toFixed(1)}" x2="${contentWidth}" y2="${y.toFixed(1)}" stroke="#64748b" stroke-width="1" opacity="0.75"/>`);
     }
-    const notes = compositeTimelineEntriesInRangePure(lane.entries, visibleRange).map(entry => {
+    const detailedNotes = [];
+    const compactNotes = [];
+    const densityHeads = [];
+    const authoredTrails = [];
+    const tremoloTrails = [];
+    const effectiveTrails = [];
+    for (const entry of compositeTimelineEntriesInRangePure(lane.entries, visibleRange)) {
         const row = Math.max(0, Math.min(view.stringCount - 1,
             view.stringCount - 1 - Math.trunc(finite(entry.string))));
         const y = top + row * stringGap;
@@ -655,32 +732,61 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
         const effectiveEndX = surface.xForBeat(entryEndBeat(entry));
         const fret = String(finite(entry.fret));
         const width = Math.max(20, 10 + fret.length * 8);
-        const badge = z >= 22 ? badgeSummary(entry) : '';
+        const detailed = entryNeedsFullTimelineDetail(view, entry, detail);
+        const metadata = entryDisplayMetadata(entry, view.stringCount, {
+            detailed,
+            includeTechniques: detailed || detail.id === 'compact',
+        });
+        if (!detailed) {
+            if (authoredEndX > x + 2) {
+                (metadata.tremolo ? tremoloTrails : authoredTrails)
+                    .push(`M${x.toFixed(1)} ${y.toFixed(1)}H${authoredEndX.toFixed(1)}`);
+            }
+            if (effectiveEndX > authoredEndX + 2) {
+                effectiveTrails.push(`M${Math.max(x, authoredEndX).toFixed(1)} ${y.toFixed(1)}H${effectiveEndX.toFixed(1)}`);
+            }
+            if (detail.staticNoteStyle === 'fret') {
+                compactNotes.push(`<text x="${x.toFixed(1)}" data-composite-compact-note="true" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="${colors.main}" stroke="#0f172a" stroke-width="3" paint-order="stroke" font-size="10" font-weight="700">${escapeMarkup(fret)}</text>`);
+            } else {
+                densityHeads.push(`M${x.toFixed(1)} ${y.toFixed(1)}h0.1`);
+            }
+            continue;
+        }
+        const badge = metadata.badge;
         const colorsForEntry = entry.invalid
             ? { main: '#f87171', soft: '#7f1d1d' } : colors;
         const outline = entry.selected && entry.inConflict ? '#f8fafc' : colorsForEntry.main;
         const interaction = entry.selectable
-            ? ` data-composite-entry-id="${escapeMarkup(entry.id)}" tabindex="0" role="checkbox" aria-label="${escapeMarkup(noteTitle(entry, view.stringCount))}" aria-checked="${!!entry.selected}" style="cursor:pointer"`
+            ? ` data-composite-entry-id="${escapeMarkup(entry.id)}" tabindex="0" role="checkbox" aria-label="${escapeMarkup(metadata.title)}" aria-checked="${!!entry.selected}" style="cursor:pointer"`
             : '';
         let trails = '';
         if (authoredEndX > x + 2) {
-            const tremolo = compositeTechniqueLabels(entry.note).includes('Tremolo')
+            const tremolo = metadata.tremolo
                 ? ' stroke-dasharray="3 3"' : '';
             trails += `<line x1="${x.toFixed(1)}" y1="${y.toFixed(1)}" x2="${authoredEndX.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${colors.main}" stroke-width="5" stroke-linecap="round" opacity="0.68"${tremolo}/>`;
         }
         if (effectiveEndX > authoredEndX + 2) {
             trails += `<line x1="${Math.max(x, authoredEndX).toFixed(1)}" y1="${y.toFixed(1)}" x2="${effectiveEndX.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${colors.main}" stroke-width="3" stroke-dasharray="5 4" opacity="0.8"/>`;
         }
-        return `<g${interaction}><title>${escapeMarkup(noteTitle(entry, view.stringCount))}</title>${trails}`
+        detailedNotes.push(`<g${interaction}><title>${escapeMarkup(metadata.title)}</title>${trails}`
             + `<rect x="${(x - width / 2).toFixed(1)}" y="${(y - 9).toFixed(1)}" width="${width}" height="18" rx="7" fill="${colorsForEntry.soft}" stroke="${outline}" stroke-width="${entry.selected && entry.inConflict ? 2.5 : 1.5}"/>`
             + `<text x="${x.toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="#f8fafc" font-size="11" font-weight="700">${escapeMarkup(fret)}</text>`
             + (entry.selected && entry.inConflict ? `<circle cx="${(x + width / 2 - 1).toFixed(1)}" cy="${(y - 8).toFixed(1)}" r="4" fill="#f8fafc"/><path d="M${(x + width / 2 - 3).toFixed(1)} ${(y - 8).toFixed(1)}l1.5 1.5 3-3" fill="none" stroke="#065f46" stroke-width="1.5"/>` : '')
             + (badge ? `<text x="${x.toFixed(1)}" y="${(y - 12).toFixed(1)}" text-anchor="middle" fill="#fcd34d" font-size="8" font-weight="700">${escapeMarkup(badge)}</text>` : '')
-            + '</g>';
-    }).join('');
+            + '</g>');
+    }
+    const staticTrails = (authoredTrails.length
+        ? `<path data-composite-static-trails="authored" d="${authoredTrails.join('')}" fill="none" stroke="${colors.main}" stroke-width="5" stroke-linecap="round" opacity="0.68"/>` : '')
+        + (tremoloTrails.length
+            ? `<path data-composite-static-trails="tremolo" d="${tremoloTrails.join('')}" fill="none" stroke="${colors.main}" stroke-width="5" stroke-linecap="round" stroke-dasharray="3 3" opacity="0.68"/>` : '')
+        + (effectiveTrails.length
+            ? `<path data-composite-static-trails="effective" d="${effectiveTrails.join('')}" fill="none" stroke="${colors.main}" stroke-width="3" stroke-dasharray="5 4" opacity="0.8"/>` : '');
+    const density = densityHeads.length
+        ? `<path data-composite-density-notes="true" d="${densityHeads.join('')}" fill="none" stroke="${colors.main}" stroke-width="5" stroke-linecap="round"/>` : '';
     return `<rect width="${contentWidth}" height="${laneHeight}" fill="#0f172a"/>`
         + `<rect x="0" y="0" width="${contentWidth}" height="${laneHeight}" fill="${colors.soft}" opacity="0.18"/>`
-        + lineMarkup(view, laneHeight, visibleRange, z, renderOptions) + strings.join('') + notes
+        + lineMarkup(view, laneHeight, visibleRange, z, renderOptions) + strings.join('')
+        + staticTrails + density + compactNotes.join('') + detailedNotes.join('')
         + reviewBandMarkup(view, laneHeight, z, true, renderOptions);
 }
 
@@ -689,6 +795,7 @@ export function renderCompositeTimelineRulerContents(view, visibleRange, zoom,
     const z = compositeTimelineZoomPure(zoom);
     const surface = timelineRenderSurface(view.context, z, renderOptions);
     const width = surface.surfaceWidth;
+    const detail = compositeTimelineDetailLevelPure(z);
     const ticks = [];
     const markerByBeat = new Map((view.context.measureMarkers || [])
         .map(marker => [marker.beat, marker]));
@@ -699,12 +806,14 @@ export function renderCompositeTimelineRulerContents(view, visibleRange, zoom,
         // At whole-song fit zoom, individual beat ticks and every bar label
         // become a dark picket fence. Keep all bar boundaries, then restore
         // beat ticks and denser labels progressively as the user zooms in.
-        if (marker || z >= 6) ticks.push(`<line x1="${x.toFixed(1)}" y1="${marker ? 12 : 22}" x2="${x.toFixed(1)}" y2="34" stroke="${marker ? '#94a3b8' : '#475569'}" stroke-width="${marker ? 1.5 : 1}"/>`);
+        const showBeatTick = detail.rulerBeatStep
+            && beat % detail.rulerBeatStep === 0;
+        if (marker || showBeatTick) ticks.push(`<line x1="${x.toFixed(1)}" y1="${marker ? 12 : 22}" x2="${x.toFixed(1)}" y2="34" stroke="${marker ? '#94a3b8' : '#475569'}" stroke-width="${marker ? 1.5 : 1}"/>`);
         if (marker && x - lastBarLabelX >= (z >= 18 ? 0 : 44)) {
             ticks.push(`<text x="${(x + 4).toFixed(1)}" y="11" fill="#cbd5e1" font-size="10">Bar ${escapeMarkup(marker.measure)}</text>`);
             lastBarLabelX = x;
         }
-        else if (z >= 24) ticks.push(`<text x="${(x + 3).toFixed(1)}" y="20" fill="#64748b" font-size="8">${beat + 1}</text>`);
+        else if (detail.id === 'full') ticks.push(`<text x="${(x + 3).toFixed(1)}" y="20" fill="#64748b" font-size="8">${beat + 1}</text>`);
     }
     return `<rect width="${width}" height="34" fill="#111827"/>${ticks.join('')}`
         + reviewBandMarkup(view, 34, z, false, renderOptions)
