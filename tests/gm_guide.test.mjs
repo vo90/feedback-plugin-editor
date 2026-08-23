@@ -34,7 +34,7 @@ globalThis.window = globalThis.window || globalThis;
 const {
     GM_CDN_BASE, GM_CDN_PLAYER, GM_KIND_DEFAULTS, GM_PLAYER_FILE, GM_PLUGIN_BASE,
     GM_VOICE_CHOICES,
-    _gmChordVoiceGainPure, _gmEventsInWindowPure, _gmFilePure, _gmGuideModePure, _gmKindPure,
+    _gmEventsInWindowPure, _gmFilePure, _gmGuideModePure, _gmKindPure,
     _gmSanitizeEventsPure, _gmSourceOrderPure, _gmUrlForSourcePure, _gmVarPure,
     _gmVoiceDurationPure, _gmVoiceForKindPure,
     editorGmVoiceFor, editorSetGmVoice, gmPresetReady, gmVoiceAt,
@@ -204,22 +204,6 @@ t('voice duration: sustain honored, capped at 1.6 s, staccato floor 0.35 s', () 
     for (const junk of [0, -1, NaN, null, undefined, 'x']) {
         assert.strictEqual(_gmVoiceDurationPure(junk), 0.35, String(junk));
     }
-});
-
-t('focused fretted previews can retain a complete six-string chord', () => {
-    const evs = _gmSanitizeEventsPure(
-        [40, 45, 50, 55, 59, 64].map(m => ({ t: 1, midi: m, sus: 1 })));
-    const groups = _gmEventsInWindowPure(evs, 0.5, 1.5, 6);
-    assert.strictEqual(groups.length, 1);
-    assert.deepStrictEqual(groups[0].voices.map(v => v.midi), [40, 45, 50, 55, 59, 64]);
-});
-
-t('focused chord voices use constant-power scaling', () => {
-    assert.strictEqual(_gmChordVoiceGainPure(1), 0.5);
-    assert.ok(Math.abs(_gmChordVoiceGainPure(2) - 0.5 / Math.sqrt(2)) < 1e-12);
-    assert.strictEqual(_gmChordVoiceGainPure(4), 0.25);
-    assert.strictEqual(_gmChordVoiceGainPure(0), 0.5, 'invalid count degrades to one voice');
-    assert.strictEqual(_gmChordVoiceGainPure(4, 1), 0.5);
 });
 
 // ── Prefs + runtime degradation ───────────────────────────────────────

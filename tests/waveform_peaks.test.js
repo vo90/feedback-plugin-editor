@@ -51,7 +51,6 @@ t('captures signed asymmetric extremes per bin', () => {
     assert.strictEqual(r.bins, 2);
     approx(r.max[0], 0.8); approx(r.min[0], -0.2);
     approx(r.max[1], 0.1); approx(r.min[1], -0.9);
-    approx(r.peak, 0.9);
 });
 
 t('RMS is per-bin loudness', () => {

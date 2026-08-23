@@ -4,7 +4,6 @@
     "private": true,
     "scripts": {
         "test": "node --test",
-        "benchmark:hybrid": "node scripts/hybrid-performance.mjs",
         "lint": "npx --yes eslint@9.39.4 src tests"
     }
 }

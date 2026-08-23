@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, statSync } from 'node:fs';
 
 import {
     CompositeSoundfontLoader,
+    COMPOSITE_SOUNDFONT_PROGRAMS,
     compositeSoundfontFilePure,
     compositeSoundfontGlobalPure,
     compositeVoiceDurationPure,
@@ -20,6 +22,16 @@ test('Hybrid SoundFont names only its three bundled audition programs', () => {
     }
     assert.equal(compositeVoiceDurationPure(0), 0.35);
     assert.equal(compositeVoiceDurationPure(4), 1.6);
+});
+
+test('all three Hybrid audition tones are bundled for offline comparison', () => {
+    const assets = new URL('../assets/wafonts/', import.meta.url);
+    for (const program of COMPOSITE_SOUNDFONT_PROGRAMS) {
+        const file = compositeSoundfontFilePure(program);
+        const asset = new URL(file, assets);
+        assert.equal(existsSync(asset), true, `GM ${program}: ${file} is bundled`);
+        assert.ok(statSync(asset).size > 50_000, `GM ${program}: ${file} is a real render`);
+    }
 });
 
 test('Hybrid SoundFont readiness waits for every cloned compressed zone', async () => {
