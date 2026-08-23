@@ -63,6 +63,11 @@ const {
 } = await import('../src/gm-guide.js');
 const { editorPrepareGuidePreview } = await import('../src/audio.js');
 const { S } = await import('../src/state.js');
+const {
+    _resetHybridPerformanceForTest,
+    hybridPerformanceSnapshot,
+    setHybridPerformanceEnabled,
+} = await import('../src/composite/performance.js');
 
 function deferred() {
     let resolve, reject;
@@ -148,6 +153,8 @@ test('focused preparation waits for a genuinely running AudioContext', async () 
     let resumes = 0;
     ctx.resume = async () => { resumes++; ctx.state = 'running'; };
     const saved = S.audioCtx;
+    _resetHybridPerformanceForTest();
+    setHybridPerformanceEnabled(true);
     S.audioCtx = ctx;
     try {
         const preparing = editorPrepareGuidePreview('guitar', { gm });
@@ -161,5 +168,16 @@ test('focused preparation waits for a genuinely running AudioContext', async () 
         ctx.resume = async () => { throw new Error('autoplay blocked'); };
         assert.equal(await editorPrepareGuidePreview('guitar', { gm }), false,
             'a decoded preset is not reported playable through a suspended context');
-    } finally { S.audioCtx = saved; }
+        const telemetry = hybridPerformanceSnapshot();
+        assert.equal(telemetry.counters['audio.preview.gmPrepare'], 2);
+        assert.equal(telemetry.counters['audio.preview.gmReady'], 1);
+        assert.equal(telemetry.counters['audio.preview.gmNotReady'], 1);
+        assert.equal(telemetry.timings['audio.preview.gmPrepareMs'].count, 2);
+        assert.equal(telemetry.gauges['audio.preview.lastGmReady'], 0);
+        assert.equal(telemetry.gauges['audio.preview.lastGmProgram'], gm);
+    } finally {
+        S.audioCtx = saved;
+        setHybridPerformanceEnabled(false);
+        _resetHybridPerformanceForTest();
+    }
 });

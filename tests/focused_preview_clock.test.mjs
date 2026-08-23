@@ -33,7 +33,7 @@ function extractFunction(name) {
     throw new Error('unbalanced source for ' + name);
 }
 
-function startHarness(preview) {
+function startHarness(preview, telemetryEnabled = false) {
     const calls = {
         anchor: 0,
         sourceStart: 0,
@@ -44,6 +44,7 @@ function startHarness(preview) {
         icon: 0,
         abGain: 0,
     };
+    const telemetry = { starts: 0, counters: {}, timings: [] };
     const S = {
         audioBuffer: { duration: 180 },
         masterAudioDuration: 180,
@@ -62,7 +63,8 @@ function startHarness(preview) {
         '_composeSongDuration', 'host', 'editorCountInBars', '_countInPlanPure',
         '_anchorTransportAtCursor', '_abApplyRefGain', '_startAudioSourceAtCursor',
         '_stopStemSources', '_stopRefMedia', '_metroClickVoiceAt', 'updatePlayIcon',
-        'playbackTick', '_guideTimerSync',
+        'playbackTick', '_guideTimerSync', 'hybridPerformanceEnabled',
+        'hybridPerfStart', 'hybridPerfCount', 'hybridPerfEnd',
         'let _editorGuidePreview = preview; let _abPhase = "guide";\n'
         + extractFunction('startPlayback')
         + '\nreturn startPlayback;'
@@ -92,8 +94,52 @@ function startHarness(preview) {
                 S.playStartTime, S.playStartWall, S.audioCtx.currentTime);
         },
         () => { calls.scheduler++; },
+        () => telemetryEnabled,
+        () => { telemetry.starts++; return 10; },
+        (name, amount = 1) => {
+            telemetry.counters[name] = (telemetry.counters[name] || 0) + amount;
+        },
+        (name, startedAt) => { telemetry.timings.push([name, startedAt]); },
     );
-    return { S, calls, start };
+    return { S, calls, start, telemetry };
+}
+
+function stopHarness(preview, telemetryEnabled = false) {
+    const calls = {
+        sourceStop: 0, stemStop: 0, referenceStop: 0, icon: 0,
+        frameCancel: 0, scheduler: 0, voicesCancel: 0, abGain: 0,
+    };
+    const telemetry = { starts: 0, counters: {}, timings: [] };
+    const S = {
+        audioSource: { stop() { calls.sourceStop++; } },
+        playing: true,
+    };
+    const stop = new Function(
+        'S', 'preview', '_stopStemSources', '_stopRefMedia', 'updatePlayIcon',
+        'cancelAnimationFrame', '_guideTimerSync', '_guideCancelVoices',
+        '_abApplyRefGain', 'hybridPerformanceEnabled', 'hybridPerfStart',
+        'hybridPerfCount', 'hybridPerfEnd',
+        'let _editorGuidePreview = preview; let rafId = 7;\n'
+        + extractFunction('stopPlayback')
+        + '\nreturn stopPlayback;'
+    )(
+        S,
+        preview,
+        () => { calls.stemStop++; },
+        () => { calls.referenceStop++; },
+        () => { calls.icon++; },
+        () => { calls.frameCancel++; },
+        () => { calls.scheduler++; },
+        () => { calls.voicesCancel++; },
+        () => { calls.abGain++; },
+        () => telemetryEnabled,
+        () => { telemetry.starts++; return 20; },
+        (name, amount = 1) => {
+            telemetry.counters[name] = (telemetry.counters[name] || 0) + amount;
+        },
+        (name, startedAt) => { telemetry.timings.push([name, startedAt]); },
+    );
+    return { S, calls, stop, telemetry };
 }
 
 function restartHarness(preview) {
@@ -186,4 +232,26 @@ test('focused seeks and loop restarts remain source-free', () => {
     assert.equal(original.calls.sourceStart, 1,
         'Original Song restart still rebuilds its recording/stem source path');
     assert.equal(original.calls.anchor, 0);
+});
+
+test('opt-in telemetry times focused preview start and stop without touching ordinary playback', () => {
+    const focusedStart = startHarness({ referenceAudio: 'muted', events: [] }, true);
+    focusedStart.start();
+    assert.equal(focusedStart.telemetry.starts, 1);
+    assert.equal(focusedStart.telemetry.counters['audio.preview.start'], 1);
+    assert.deepEqual(focusedStart.telemetry.timings, [['audio.preview.startMs', 10]]);
+
+    const focusedStop = stopHarness({ referenceAudio: 'muted', events: [] }, true);
+    focusedStop.stop();
+    assert.equal(focusedStop.telemetry.starts, 1);
+    assert.equal(focusedStop.telemetry.counters['audio.preview.stop'], 1);
+    assert.deepEqual(focusedStop.telemetry.timings, [['audio.preview.stopMs', 20]]);
+
+    const ordinaryStart = startHarness(null, true);
+    ordinaryStart.start();
+    assert.equal(ordinaryStart.telemetry.starts, 0,
+        'ordinary Editor playback bypasses focused-preview telemetry entirely');
+    const ordinaryStop = stopHarness(null, true);
+    ordinaryStop.stop();
+    assert.equal(ordinaryStop.telemetry.starts, 0);
 });

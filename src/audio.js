@@ -43,6 +43,10 @@ import {
     _normalizeLoopRegionPure, _countInPlanPure, _transportChartTimePure,
 } from './transport.js';
 import { setStatus } from './ui.js';
+import {
+    hybridPerfCount, hybridPerfEnd, hybridPerfGauge, hybridPerfSample,
+    hybridPerfStart, hybridPerformanceEnabled,
+} from './composite/performance.js';
 
 // The rAF handle for the playback loop. Module-scope so playbackTick and
 // teardownAudio share it; main.js reaches the cancel through teardownAudio().
@@ -966,6 +970,10 @@ export function _restartPlaybackAt(t) {
 }
 
 export function startPlayback() {
+    // Focused-preview telemetry is entirely opt-in. Ordinary Editor playback
+    // short-circuits before even consulting the cached telemetry flag.
+    const previewPerfStartedAt = _editorGuidePreview && hybridPerformanceEnabled()
+        ? hybridPerfStart() : null;
     // Compose mode (no recording) still needs a context — for the transport
     // clock and the metronome/guide voices that are its only sound. Make one
     // on the play gesture; the decode path is the only other creation site.
@@ -1038,8 +1046,14 @@ export function startPlayback() {
     updatePlayIcon();
     playbackTick();
     _guideTimerSync();
+    if (previewPerfStartedAt !== null) {
+        hybridPerfCount('audio.preview.start');
+        hybridPerfEnd('audio.preview.startMs', previewPerfStartedAt);
+    }
 }
 export function stopPlayback() {
+    const previewPerfStartedAt = _editorGuidePreview && hybridPerformanceEnabled()
+        ? hybridPerfStart() : null;
     if (S.audioSource) {
         try { S.audioSource.stop(); } catch (_) {}
         S.audioSource = null;
@@ -1054,6 +1068,10 @@ export function stopPlayback() {
     // Restore the reference to its fader level (a stop mid-guide-pass must
     // never leave the recording silently muted).
     _abApplyRefGain();
+    if (previewPerfStartedAt !== null) {
+        hybridPerfCount('audio.preview.stop');
+        hybridPerfEnd('audio.preview.stopMs', previewPerfStartedAt);
+    }
 }
 
 // Focused workspaces paint on their own animation frame. Sampling the live
@@ -1823,6 +1841,7 @@ function _cancelGuideVoiceList(voices) {
 function _retirePreviewVoiceGeneration() {
     const generation = _previewVoiceGeneration;
     if (!generation) return false;
+    const perfStartedAt = hybridPerformanceEnabled() ? hybridPerfStart() : null;
     _previewVoiceGeneration = null;
     const ctx = S.audioCtx;
     const param = generation.gain && generation.gain.gain;
@@ -1836,6 +1855,11 @@ function _retirePreviewVoiceGeneration() {
         } catch (_) {
             try { param.value = 0; } catch (_) {}
         }
+    }
+    if (perfStartedAt !== null) {
+        hybridPerfCount('audio.preview.muteScheduled');
+        hybridPerfSample('audio.preview.muteRampMs', PREVIEW_GENERATION_FADE * 1000);
+        hybridPerfEnd('audio.preview.muteScheduleMs', perfStartedAt);
     }
     const cleanup = () => {
         _cancelGuideVoiceList(generation.voices);
@@ -2771,28 +2795,42 @@ export function editorWarmGuidePreview(kind = 'guitar', options = {}) {
 // only after the requested instrument is available; callers can refuse
 // to start rather than misrepresenting a clap fallback as a guitar/bass part.
 export async function editorPrepareGuidePreview(kind = 'guitar', options = {}) {
+    const perfStartedAt = hybridPerformanceEnabled() ? hybridPerfStart() : null;
     const gm = _guidePreviewProgram(kind, options);
-    const ctx = _ensureAudioCtx();
-    if (gm === null || !ctx) return false;
-    const loading = ensureGmPreset(gm, ctx);
-    if (ctx.state === 'suspended' && typeof ctx.resume === 'function') {
-        try { await ctx.resume(); } catch (_) { return false; }
+    let ready = false;
+    try {
+        const ctx = _ensureAudioCtx();
+        if (gm === null || !ctx) return false;
+        const loading = ensureGmPreset(gm, ctx);
+        if (ctx.state === 'suspended' && typeof ctx.resume === 'function') {
+            try { await ctx.resume(); } catch (_) { return false; }
+        }
+        // A resolved resume() is normally accompanied by `state === "running"`.
+        // Treat a context that remained suspended/closed as unprepared rather than
+        // returning a loaded instrument which cannot actually produce audio.
+        if (ctx.state === 'suspended' || ctx.state === 'closed') return false;
+        // Script-tag loads have no browser-level timeout. Bound this focused UI
+        // wait so an offline/CDN stall returns a useful error instead of disabling
+        // every audition button forever; the underlying load may still populate
+        // the cache later, so a retry can succeed.
+        let timeoutId = null;
+        await Promise.race([
+            loading,
+            new Promise(resolve => { timeoutId = setTimeout(resolve, 10000); }),
+        ]);
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        ready = gmPresetReady(gm) && ctx.state !== 'suspended' && ctx.state !== 'closed';
+        return ready;
+    } finally {
+        if (perfStartedAt !== null) {
+            hybridPerfCount('audio.preview.gmPrepare');
+            hybridPerfCount(ready
+                ? 'audio.preview.gmReady' : 'audio.preview.gmNotReady');
+            hybridPerfGauge('audio.preview.lastGmReady', ready ? 1 : 0);
+            if (gm !== null) hybridPerfGauge('audio.preview.lastGmProgram', gm);
+            hybridPerfEnd('audio.preview.gmPrepareMs', perfStartedAt);
+        }
     }
-    // A resolved resume() is normally accompanied by `state === "running"`.
-    // Treat a context that remained suspended/closed as unprepared rather than
-    // returning a loaded instrument which cannot actually produce audio.
-    if (ctx.state === 'suspended' || ctx.state === 'closed') return false;
-    // Script-tag loads have no browser-level timeout. Bound this focused UI
-    // wait so an offline/CDN stall returns a useful error instead of disabling
-    // every audition button forever; the underlying load may still populate
-    // the cache later, so a retry can succeed.
-    let timeoutId = null;
-    await Promise.race([
-        loading,
-        new Promise(resolve => { timeoutId = setTimeout(resolve, 10000); }),
-    ]);
-    if (timeoutId !== null) clearTimeout(timeoutId);
-    return gmPresetReady(gm) && ctx.state !== 'suspended' && ctx.state !== 'closed';
 }
 
 // Temporary pitched source used by focused tools such as the composite
@@ -2848,6 +2886,53 @@ export function editorClearGuidePreview() {
     _guideTimerSync();
 }
 
+// Diagnostic-only skipped-window accounting. Focused preview events are
+// already sorted, so two binary searches give an exact raw-note count without
+// scanning a dense song. The caller invokes this only after the opt-in flag is
+// true; normal playback pays just that cached boolean branch.
+export function _guideScheduleTelemetryPure(events, scheduledUntil, nowChart, scheduledFrom) {
+    const scheduled = Number.isFinite(Number(scheduledUntil))
+        ? Number(scheduledUntil) : 0;
+    const now = Number.isFinite(Number(nowChart)) ? Number(nowChart) : scheduled;
+    const from = Number.isFinite(Number(scheduledFrom))
+        ? Number(scheduledFrom) : scheduled;
+    const skippedTo = Math.max(scheduled, from);
+    let droppedEvents = 0;
+    if (Array.isArray(events) && events.length && skippedTo > scheduled) {
+        const lowerBound = (time) => {
+            let lo = 0, hi = events.length;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (Number(events[mid]?.t) < time) lo = mid + 1;
+                else hi = mid;
+            }
+            return lo;
+        };
+        droppedEvents = Math.max(0, lowerBound(skippedTo) - lowerBound(scheduled));
+    }
+    return {
+        latenessMs: Math.max(0, now - scheduled) * 1000,
+        skippedMs: Math.max(0, skippedTo - scheduled) * 1000,
+        droppedEvents,
+    };
+}
+
+function _recordGuideScheduleTelemetry(events, scheduledUntil, nowChart, scheduledFrom) {
+    const sample = _guideScheduleTelemetryPure(
+        events, scheduledUntil, nowChart, scheduledFrom);
+    if (sample.latenessMs > 0) {
+        hybridPerfCount('audio.preview.schedulerLateWindow');
+        hybridPerfSample('audio.preview.schedulerLatenessMs', sample.latenessMs);
+    }
+    if (sample.skippedMs > 0) {
+        hybridPerfCount('audio.preview.schedulerSkippedWindow');
+        hybridPerfSample('audio.preview.schedulerSkippedMs', sample.skippedMs);
+        if (sample.droppedEvents > 0) {
+            hybridPerfCount('audio.preview.schedulerDroppedEvents', sample.droppedEvents);
+        }
+    }
+}
+
 function _guideTick() {
     const previewActive = !!_editorGuidePreview;
     // A/B overrides the claps pref while active: guide passes clap even
@@ -2865,6 +2950,8 @@ function _guideTick() {
         && (!_abActive() || claps)) ? _bandPartsPure(S.arrangements, S.drumTab) : null;
     const bandLive = !!(bandParts && bandParts.length);
     if (!S.playing || !S.audioCtx || (!claps && !metro && !bandLive)) return;
+    const firstPreviewWindowStartedAt = previewActive && _guideIncludeStartBoundary
+        && hybridPerformanceEnabled() ? hybridPerfStart() : null;
     const nowChart = _transportChartTimePure(S.playStartTime, S.playStartWall, S.audioCtx.currentTime, _auditionRate());
     // Clamp the lookahead end to the loop-region end while looping, so no clap
     // is scheduled past the boundary before the rAF wrap cancels the window.
@@ -2873,7 +2960,17 @@ function _guideTick() {
         nowChart, _guideScheduledUntil, previewActive,
         !!loopRegion, loopRegion ? loopRegion.endTime : Number.NaN);
     const { from, to } = scheduleWindow;
-    if (to <= from) return;
+    if (previewActive && hybridPerformanceEnabled()) {
+        _recordGuideScheduleTelemetry(
+            _editorGuidePreview.events, _guideScheduledUntil, nowChart, from);
+    }
+    if (to <= from) {
+        if (firstPreviewWindowStartedAt !== null) {
+            hybridPerfCount('audio.preview.firstSchedule');
+            hybridPerfEnd('audio.preview.firstScheduleMs', firstPreviewWindowStartedAt);
+        }
+        return;
+    }
     // Per-part mute/solo (mixer panel, B6): the active surface's part gates
     // its own guide here (only the guide — the reference audio rides its own
     // per-source strips: any solo reaches it through applyStemMix and the
@@ -3047,6 +3144,10 @@ function _guideTick() {
     // drum-edit guide (#282). The window only advances, so old keys are dead;
     // bound the scratch set here so it covers both (safe: never re-fires).
     if (_bandFiredKeys.size > 4096) _bandFiredKeys.clear();
+    if (firstPreviewWindowStartedAt !== null) {
+        hybridPerfCount('audio.preview.firstSchedule');
+        hybridPerfEnd('audio.preview.firstScheduleMs', firstPreviewWindowStartedAt);
+    }
 }
 
 // ── Audition trainer — loop-and-step-up (P2-10) ──────────────────────

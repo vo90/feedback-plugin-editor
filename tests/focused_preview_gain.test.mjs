@@ -16,10 +16,13 @@ function extractFunction(name) {
     throw new Error('unbalanced source for ' + name);
 }
 
-function harness() {
+function harness(telemetryEnabled = false) {
     const timers = [];
+    const telemetry = { starts: 0, counters: {}, samples: [], timings: [] };
     const S = { audioCtx: { currentTime: 20 } };
-    const api = new Function('S', 'defer',
+    const api = new Function(
+        'S', 'defer', 'hybridPerformanceEnabled', 'hybridPerfStart',
+        'hybridPerfCount', 'hybridPerfSample', 'hybridPerfEnd',
         'const PREVIEW_GENERATION_FADE = 0.004;\n'
         + 'let _previewVoiceGeneration = null;\n'
         + extractFunction('_cancelGuideVoiceList') + '\n'
@@ -29,13 +32,24 @@ function harness() {
         + ' current() { return _previewVoiceGeneration; },'
         + ' retire: _retirePreviewVoiceGeneration'
         + ' };'
-    )(S, (fn) => { timers.push(fn); });
+    )(
+        S,
+        (fn) => { timers.push(fn); },
+        () => telemetryEnabled,
+        () => { telemetry.starts++; return 30; },
+        (name, amount = 1) => {
+            telemetry.counters[name] = (telemetry.counters[name] || 0) + amount;
+        },
+        (name, value) => { telemetry.samples.push([name, value]); },
+        (name, startedAt) => { telemetry.timings.push([name, startedAt]); },
+    );
     // The extracted implementation resolves the global binding by name.
     const previous = globalThis.setTimeout;
     globalThis.setTimeout = (fn) => { timers.push(fn); return timers.length; };
     return {
         api,
         timers,
+        telemetry,
         restore() { globalThis.setTimeout = previous; },
     };
 }
@@ -88,5 +102,20 @@ test('retiring a focused pass schedules one four-millisecond mute before deferre
         });
         assert.strictEqual(h.api.current(), next.value);
         assert.deepEqual(next.counts(), { stopped: 0, disconnected: 0, gainDisconnected: 0 });
+    } finally { h.restore(); }
+});
+
+test('opt-in mute telemetry measures the one-write gate, not deferred voice cleanup', () => {
+    const h = harness(true);
+    try {
+        const old = generation(1000);
+        h.api.setGeneration(old.value);
+        h.api.retire();
+        assert.equal(h.telemetry.starts, 1);
+        assert.equal(h.telemetry.counters['audio.preview.muteScheduled'], 1);
+        assert.deepEqual(h.telemetry.samples, [['audio.preview.muteRampMs', 4]]);
+        assert.deepEqual(h.telemetry.timings, [['audio.preview.muteScheduleMs', 30]]);
+        assert.deepEqual(old.counts(), { stopped: 0, disconnected: 0, gainDisconnected: 0 },
+            'diagnostics do not pull deferred cleanup into the input-critical path');
     } finally { h.restore(); }
 });

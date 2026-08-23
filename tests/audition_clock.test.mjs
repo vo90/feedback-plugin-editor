@@ -27,6 +27,7 @@ const {
     _editorPlaybackViewWorkRequiredPure,
     _guideChartToCtxPure,
     _guidePreviewSchedulerRequiredPure,
+    _guideScheduleTelemetryPure,
     _guideScheduleWindowPure,
     _guideScheduleWatermarkPure,
     editorClearGuidePreview,
@@ -117,6 +118,25 @@ t('the first post-seek window includes the exact cursor onset once', () => {
     assert.ok(near(
         _guideScheduleWatermarkPure(cursor, nowAfterSetup, false),
         nowAfterSetup), 'enabling guide mid-pass starts at now and does not replay history');
+});
+
+t('focused scheduler diagnostics count exact notes abandoned by a late window', () => {
+    const events = [
+        { t: 9.91, midi: 60 },
+        { t: 9.96, midi: 62 },
+        { t: 9.99, midi: 64 },
+        { t: 10.2, midi: 65 },
+    ];
+    const late = _guideScheduleTelemetryPure(events, 9.9, 10, 9.96);
+    assert.ok(near(late.latenessMs, 100));
+    assert.ok(near(late.skippedMs, 60));
+    assert.equal(late.droppedEvents, 1,
+        'the half-open skipped range counts 9.91 but leaves the recoverable 9.96 note');
+    assert.deepEqual(_guideScheduleTelemetryPure(events, 10.3, 10, 10.3), {
+        latenessMs: 0,
+        skippedMs: 0,
+        droppedEvents: 0,
+    });
 });
 
 t('a focused Hybrid preview suppresses hidden editor paint, follow, and layout work', () => {

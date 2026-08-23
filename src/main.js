@@ -112,6 +112,7 @@ import {
     editorHideCompositeArrangementModal, editorShowCompositeArrangementModal,
     editorTeardownCompositeArrangementUi
 } from './composite/resolver-ui.js';
+import { installHybridPerformanceTools } from './composite/performance.js';
 import {
     _editorTogglePartsView, _partsViewDraw, _partsViewOnDblClick, _partsViewOnMouseDown,
     _partsViewRegionDelete, _partsViewRegionDrag, _partsViewRegionDrop, _refreshPartsViewButton
@@ -2287,6 +2288,10 @@ function init() {
     // this only blocks a stray double-invocation (e.g. a late boot-poll tick).
     if (_editorInited) return;
     _editorInited = true;
+    // Opt-in, local-only Hybrid diagnostics. The installer is inert unless a
+    // developer enabled it before Editor startup, so the normal player UI and
+    // runtime do not gain an observer or a window-level diagnostics surface.
+    installHybridPerformanceTools();
     _applyV3Layout();
     S.history = new EditHistory();
 
