@@ -277,6 +277,7 @@ let _player = null;              // WebAudioFontPlayer instance
 let _playerLoading = null;       // in-flight player promise
 const _presets = new Map();      // gm program -> adjusted preset
 const _presetLoading = new Map();// gm program -> in-flight promise
+let _zoneLoading = new WeakMap();// preset zone -> its one in-flight decode
 let _presetError = '';           // last failure, surfaced once in the status
 
 function _loadScript(url) {
@@ -328,6 +329,105 @@ async function _ensurePlayer() {
 
 export function gmPresetReady(gm) { return _presets.has(gm); }
 
+// WebAudioFontPlayer.adjustPreset() is intentionally fire-and-forget: zones
+// backed by a compressed `file` call decodeAudioData with a callback and the
+// method returns before those callbacks run. That is fine for the player's
+// original polling loader, but it is not a readiness boundary for focused
+// previews — marking the preset ready there makes whichever pitch zones have
+// not decoded yet silently disappear.
+//
+// Own the async boundary here instead of patching the vendored player. A zone
+// has one shared promise, completed zones keep their AudioBuffer, and a failed
+// zone drops its promise so the next explicit preparation can retry it. The
+// preset enters `_presets` only after EVERY zone is usable.
+function _normalizeZone(player, zone) {
+    const num = player && typeof player.numValue === 'function'
+        ? (v, fallback) => player.numValue(v, fallback)
+        : (v, fallback) => Number.isFinite(Number(v)) ? Number(v) : fallback;
+    zone.delay = 0;
+    zone.loopStart = num(zone.loopStart, 0);
+    zone.loopEnd = num(zone.loopEnd, 0);
+    zone.coarseTune = num(zone.coarseTune, 0);
+    zone.fineTune = num(zone.fineTune, 0);
+    zone.originalPitch = num(zone.originalPitch, 6000);
+    zone.sampleRate = num(zone.sampleRate, 44100);
+    // Preserve the vendored player's established field normalization (it
+    // intentionally derives sustain from originalPitch in v3.0.04).
+    zone.sustain = num(zone.originalPitch, 0);
+}
+
+function _base64Bytes(raw) {
+    if (typeof atob !== 'function') throw new Error('base64 decoder unavailable');
+    const decoded = atob(raw);
+    const bytes = new Uint8Array(decoded.length);
+    for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+    return bytes.buffer;
+}
+
+function _decodeZoneFile(ctx, arrayBuffer) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const ok = (buffer) => {
+            if (settled) return;
+            settled = true;
+            if (buffer) resolve(buffer);
+            else reject(new Error('soundfont zone decoded without an audio buffer'));
+        };
+        const fail = (error) => {
+            if (settled) return;
+            settled = true;
+            reject(error instanceof Error ? error : new Error('soundfont zone decode failed'));
+        };
+        try {
+            // Passing callbacks keeps compatibility with the Chromium version
+            // embedded by Feedback. Newer implementations also return a
+            // Promise; accepting both is safe because `settled` is idempotent.
+            const result = ctx.decodeAudioData(arrayBuffer, ok, fail);
+            if (result && typeof result.then === 'function') result.then(ok, fail);
+        } catch (error) { fail(error); }
+    });
+}
+
+function _prepareZone(player, ctx, zone) {
+    if (!zone || typeof zone !== 'object') {
+        return Promise.reject(new Error('invalid soundfont zone'));
+    }
+    _normalizeZone(player, zone);
+    if (zone.buffer) return Promise.resolve(zone.buffer);
+    const existing = _zoneLoading.get(zone);
+    if (existing) return existing;
+
+    const loading = (async () => {
+        if (zone.sample) {
+            // PCM `sample` zones are decoded synchronously by the player.
+            player.adjustZone(ctx, zone);
+            if (!zone.buffer) throw new Error('soundfont PCM zone did not decode');
+            return zone.buffer;
+        }
+        if (!zone.file) throw new Error('soundfont zone has no audio data');
+        const buffer = await _decodeZoneFile(ctx, _base64Bytes(zone.file));
+        zone.buffer = buffer;
+        return buffer;
+    })();
+    _zoneLoading.set(zone, loading);
+    loading.then(() => {
+        if (_zoneLoading.get(zone) === loading) _zoneLoading.delete(zone);
+    }, () => {
+        if (_zoneLoading.get(zone) === loading) _zoneLoading.delete(zone);
+    });
+    return loading;
+}
+
+async function _preparePreset(player, ctx, preset) {
+    const zones = preset && Array.isArray(preset.zones) ? preset.zones : [];
+    if (!zones.length) throw new Error('soundfont preset has no zones');
+    await Promise.all(zones.map(zone => _prepareZone(player, ctx, zone)));
+    if (zones.some(zone => !zone.buffer)) {
+        throw new Error('soundfont preset is only partially decoded');
+    }
+    return preset;
+}
+
 // Kick (or await) the load of one GM program. Fire-and-forget from the
 // scheduler tick — the tick claps until gmPresetReady flips, so a slow or
 // failed load is audible as claps, never as silence.
@@ -341,7 +441,7 @@ export function ensureGmPreset(gm, ctx) {
             if (!player) throw new Error('WebAudioFontPlayer unavailable');
             const preset = await _loadFromChain(file, varName);
             if (!preset) throw new Error('no source served ' + file);
-            player.adjustPreset(ctx, preset);
+            await _preparePreset(player, ctx, preset);
             _presets.set(gm, preset);
             setStatus('Guide instrument ready');
         } catch (e) {
@@ -372,7 +472,7 @@ export function ensureGmDrum(note, ctx) {
             if (!player) throw new Error('WebAudioFontPlayer unavailable');
             const preset = await _loadFromChain(file, varName);
             if (!preset) throw new Error('no source served ' + file);
-            player.adjustPreset(ctx, preset);
+            await _preparePreset(player, ctx, preset);
             _presets.set(key, preset);
         } catch (e) {
             if (!_presetError) {
@@ -428,5 +528,6 @@ export function gmVoiceAt(ctx, target, gm, when, midi, durSec, volume = 0.5) {
 export function _resetGmGuideForTest() {
     _player = null; _playerLoading = null;
     _presets.clear(); _presetLoading.clear();
+    _zoneLoading = new WeakMap();
     _presetError = '';
 }

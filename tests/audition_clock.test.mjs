@@ -28,10 +28,12 @@ const {
     _guideChartToCtxPure,
     _guidePreviewSchedulerRequiredPure,
     _guideScheduleWindowPure,
+    _guideScheduleWatermarkPure,
     editorClearGuidePreview,
     editorPlaybackVisualTime,
     editorSetGuidePreview,
 } = await import('../src/audio.js');
+const { _gmEventsInWindowPure, _gmSanitizeEventsPure } = await import('../src/gm-guide.js');
 const { S } = await import('../src/state.js');
 
 let pass = 0, fail = 0;
@@ -93,6 +95,28 @@ t('focused look-ahead still stops exactly at a loop boundary', () => {
     const focused = _guideScheduleWindowPure(4.9, 4.8, true, true, 5);
     assert.ok(near(focused.to, 5));
     assert.ok(focused.from < focused.to);
+});
+
+t('the first post-seek window includes the exact cursor onset once', () => {
+    const cursor = 12;
+    const nowAfterSetup = 12.0004;
+    const firstWatermark = _guideScheduleWatermarkPure(cursor, nowAfterSetup, true);
+    assert.ok(near(firstWatermark, cursor),
+        'AudioContext time advancing during setup cannot move the first window past the cursor');
+    const first = _guideScheduleWindowPure(nowAfterSetup, firstWatermark, true, false, NaN);
+    const events = _gmSanitizeEventsPure([
+        { t: cursor, midi: 40 },
+        { t: cursor, midi: 45 },
+    ]);
+    assert.strictEqual(_gmEventsInWindowPure(events, first.from, first.to, 6).length, 1,
+        'the exact-onset chord is one grouped scheduler event');
+
+    const second = _guideScheduleWindowPure(first.to, first.to, true, false, NaN);
+    assert.strictEqual(_gmEventsInWindowPure(events, second.from, second.to, 6).length, 0,
+        'the half-open watermark prevents the next tick from firing it again');
+    assert.ok(near(
+        _guideScheduleWatermarkPure(cursor, nowAfterSetup, false),
+        nowAfterSetup), 'enabling guide mid-pass starts at now and does not replay history');
 });
 
 t('a focused Hybrid preview suppresses hidden editor paint, follow, and layout work', () => {

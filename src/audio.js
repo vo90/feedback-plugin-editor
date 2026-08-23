@@ -1471,6 +1471,7 @@ const GUIDE_PREVIEW_LATE_GRACE = 0.04;
 const GUIDE_TICK_MS = 25;      // scheduler cadence
 let _guideTimer = null;
 let _guideScheduledUntil = 0;  // chart-seconds watermark (exclusive)
+let _guideIncludeStartBoundary = false; // first post-seek window owns cursor onset
 let _guideVoices = [];         // queued {osc, gain, until} for cancel-on-seek
 let _bandFiredKeys = new Set();   // band-mode cross-tick dedupe (part-scoped)
 let _guideLastFiredKey = null; // last-fired 1 ms bucket key, PERSISTED across
@@ -1494,6 +1495,17 @@ export function _guideScheduleWindowPure(nowChart, scheduledUntil,
         from: Math.max(scheduled, now - grace),
         to: _guideWindowEndPure(now + lookahead, !!loopEnabled, loopEndTime),
     };
+}
+
+// Starting or seeking is different from enabling a guide half-way through an
+// already-running pass. The first case must retain the exact logical cursor as
+// the inclusive window start even though a few AudioContext microseconds have
+// elapsed before the scheduler runs; the second should start at "now" and must
+// not replay history. Kept pure so the exact-onset contract is testable.
+export function _guideScheduleWatermarkPure(cursorTime, nowChart, includeStartBoundary) {
+    const now = Number.isFinite(Number(nowChart)) ? Number(nowChart) : 0;
+    if (!includeStartBoundary) return now;
+    return Number.isFinite(Number(cursorTime)) ? Number(cursorTime) : now;
 }
 
 export function editorGuideClapEnabled() {
@@ -1743,6 +1755,75 @@ function _applyPreviewGuideGain(immediate = false) {
     } else {
         gain.setTargetAtTime(target, S.audioCtx.currentTime, 0.02);
     }
+}
+
+// Each focused-preview pass gets a disposable sub-bus beneath the shared
+// preview fader. Replacing/stopping a dense guide pass can therefore mute every
+// scheduled WebAudioFont voice with ONE AudioParam write, instead of walking
+// hundreds of envelopes on the input-critical path. Envelope cancellation and
+// node disconnection happen after the short de-click ramp.
+const PREVIEW_GENERATION_FADE = 0.004;
+let _previewVoiceGeneration = null;
+let _previewVoiceGenerationId = 0;
+
+function _ensurePreviewVoiceGeneration() {
+    if (!_editorGuidePreview || !S.audioCtx) return null;
+    if (_previewVoiceGeneration) return _previewVoiceGeneration;
+    const bus = _ensureMasterBus();
+    if (!bus || !bus.previewGuideGain) return null;
+    const gain = S.audioCtx.createGain();
+    gain.gain.value = 1;
+    gain.connect(bus.previewGuideGain);
+    _previewVoiceGeneration = {
+        id: ++_previewVoiceGenerationId,
+        gain,
+        voices: [],
+    };
+    return _previewVoiceGeneration;
+}
+
+function _cancelGuideVoiceList(voices) {
+    for (const voice of voices || []) {
+        try { voice.osc.stop(); } catch (_) {}
+        try { voice.gain.disconnect(); } catch (_) {}
+    }
+}
+
+function _retirePreviewVoiceGeneration() {
+    const generation = _previewVoiceGeneration;
+    if (!generation) return false;
+    _previewVoiceGeneration = null;
+    const ctx = S.audioCtx;
+    const param = generation.gain && generation.gain.gain;
+    if (ctx && param) {
+        const now = ctx.currentTime;
+        try {
+            if (typeof param.cancelScheduledValues === 'function') param.cancelScheduledValues(now);
+            const current = Number.isFinite(Number(param.value)) ? Math.max(0, Number(param.value)) : 1;
+            param.setValueAtTime(current, now);
+            param.linearRampToValueAtTime(0, now + PREVIEW_GENERATION_FADE);
+        } catch (_) {
+            try { param.value = 0; } catch (_) {}
+        }
+    }
+    const cleanup = () => {
+        _cancelGuideVoiceList(generation.voices);
+        generation.voices.length = 0;
+        try { generation.gain.disconnect(); } catch (_) {}
+    };
+    // Give the four-millisecond ramp time to reach silence. `setTimeout` is
+    // deliberately outside the audio correctness boundary: even if a busy UI
+    // delays cleanup, the already-scheduled gain ramp still mutes on time.
+    if (typeof setTimeout === 'function') setTimeout(cleanup, 16);
+    else cleanup();
+    return true;
+}
+
+function _trackGuideVoice(voice, target = null) {
+    if (!voice) return;
+    const generation = _previewVoiceGeneration;
+    if (generation && target === generation.gain) generation.voices.push(voice);
+    else _guideVoices.push(voice);
 }
 
 // Fader percents, cached so audio paths never read localStorage
@@ -2568,7 +2649,7 @@ function _guideClapVoiceAt(when, target, scale) {
     g.connect(target || bus.guideGain);
     osc.start(when);
     osc.stop(when + 0.06);
-    _guideVoices.push({ osc, gain: g, until: when + 0.06 });
+    _trackGuideVoice({ osc, gain: g, until: when + 0.06 }, target);
 }
 
 // Count-in pref (D-T-count-in): 0 = off, else bars of pre-roll clicks
@@ -2620,16 +2701,17 @@ function _metroClickVoiceAt(when, accent) {
 // Cancel every queued-but-unfinished clap — stale voices would otherwise
 // fire at their pre-seek positions after a loop wrap or scrub.
 function _guideCancelVoices() {
-    for (const v of _guideVoices) {
-        try { v.osc.stop(); } catch (_) {}
-        try { v.gain.disconnect(); } catch (_) {}
-    }
+    // The preview sub-bus is silenced in O(1) before any envelope cleanup.
+    // Its potentially large voice list is retired asynchronously.
+    _retirePreviewVoiceGeneration();
+    _cancelGuideVoiceList(_guideVoices);
     _guideVoices = [];
 }
 
 function _guideResetSchedule() {
     _guideCancelVoices();
     _guideScheduledUntil = S.cursorTime || 0;
+    _guideIncludeStartBoundary = true;
     _guideLastFiredKey = null;  // a seek/wrap breaks cross-tick dedupe continuity
     // Same rule for the band's part-scoped keys (typeof-guarded: the sliced
     // compose_transport suite extracts this function without module state).
@@ -2663,8 +2745,12 @@ export async function editorPrepareGuidePreview(kind = 'guitar', options = {}) {
     if (gm === null || !ctx) return false;
     const loading = ensureGmPreset(gm, ctx);
     if (ctx.state === 'suspended' && typeof ctx.resume === 'function') {
-        try { await ctx.resume(); } catch (_) { /* readiness check below owns the result */ }
+        try { await ctx.resume(); } catch (_) { return false; }
     }
+    // A resolved resume() is normally accompanied by `state === "running"`.
+    // Treat a context that remained suspended/closed as unprepared rather than
+    // returning a loaded instrument which cannot actually produce audio.
+    if (ctx.state === 'suspended' || ctx.state === 'closed') return false;
     // Script-tag loads have no browser-level timeout. Bound this focused UI
     // wait so an offline/CDN stall returns a useful error instead of disabling
     // every audition button forever; the underlying load may still populate
@@ -2675,7 +2761,7 @@ export async function editorPrepareGuidePreview(kind = 'guitar', options = {}) {
         new Promise(resolve => { timeoutId = setTimeout(resolve, 10000); }),
     ]);
     if (timeoutId !== null) clearTimeout(timeoutId);
-    return gmPresetReady(gm);
+    return gmPresetReady(gm) && ctx.state !== 'suspended' && ctx.state !== 'closed';
 }
 
 // Temporary pitched source used by focused tools such as the composite
@@ -2834,6 +2920,7 @@ function _guideTick() {
         const gm = (previewActive || editorGuideVoiceMode() === 'gm') ? _guideGmProgram() : null;
         if (gm !== null && gmPresetReady(gm)) {
             const bus = _ensureMasterBus();
+            const previewGeneration = previewActive ? _ensurePreviewVoiceGeneration() : null;
             const voiceCap = previewActive ? _editorGuidePreview.voiceCap : 4;
             const groups = _gmEventsInWindowPure(
                 _guidePitchedEvents(), from, to, voiceCap);
@@ -2843,7 +2930,9 @@ function _guideTick() {
                 if (gp.key === _guideLastFiredKey) continue;
                 _guideLastFiredKey = gp.key;
                 const when = _guideChartToCtxPure(gp.t, S.playStartWall, S.playStartTime, _auditionRate());
-                const target = bus && (previewActive ? bus.previewGuideGain : bus.guideGain);
+                const target = previewActive
+                    ? (previewGeneration && previewGeneration.gain)
+                    : (bus && bus.guideGain);
                 const voiceGain = previewActive
                     ? _gmChordVoiceGainPure(gp.voices.length, 0.5) : 0.5;
                 for (const v of gp.voices) {
@@ -2854,10 +2943,12 @@ function _guideTick() {
                     const voice = target && gmVoiceAt(
                         S.audioCtx, target, gm, when, v.midi,
                         _gmVoiceDurationPure(v.sus) / _auditionRate(), voiceGain);
-                    if (voice) { _guideVoices.push(voice); continue; }
+                    if (voice) { _trackGuideVoice(voice, target); continue; }
                     // Race: preset dropped mid-tick — ONE clap for the whole
                     // bucket (never a stacked clap per chord note), then on.
-                    _guideClapVoiceAt(when);
+                    if (!previewActive || _editorGuidePreview.allowClapFallback) {
+                        _guideClapVoiceAt(when, target);
+                    }
                     break;
                 }
             }
@@ -2875,6 +2966,8 @@ function _guideTick() {
                 // plays its one-shot; still gated by the drum strip above).
                 _drumKitVoicesInWindow(from, to, null, host.partClapState().vol);
             } else {
+                const previewGeneration = previewActive ? _ensurePreviewVoiceGeneration() : null;
+                const previewTarget = previewGeneration && previewGeneration.gain;
                 const times = _guideClapTimesInWindowPure(_guideSourceTimes(), from, to);
                 for (const t of times) {
                     // Cross-tick dedupe: skip an event in the same 1 ms bucket as the last
@@ -2882,7 +2975,9 @@ function _guideTick() {
                     const key = Math.round(t * 1000);
                     if (key === _guideLastFiredKey) continue;
                     _guideLastFiredKey = key;
-                    _guideClapVoiceAt(_guideChartToCtxPure(t, S.playStartWall, S.playStartTime, _auditionRate()));
+                    _guideClapVoiceAt(
+                        _guideChartToCtxPure(t, S.playStartWall, S.playStartTime, _auditionRate()),
+                        previewTarget);
                 }
             }
         }
@@ -2906,10 +3001,16 @@ function _guideTick() {
         }
     }
     _guideScheduledUntil = to;
+    _guideIncludeStartBoundary = false;
     // Drop bookkeeping for voices that already finished (bounded memory).
     if (_guideVoices.length > 64) {
         const nowCtx = S.audioCtx.currentTime;
         _guideVoices = _guideVoices.filter(v => v.until > nowCtx);
+    }
+    if (_previewVoiceGeneration && _previewVoiceGeneration.voices.length > 64) {
+        const nowCtx = S.audioCtx.currentTime;
+        _previewVoiceGeneration.voices = _previewVoiceGeneration.voices
+            .filter(voice => voice.until > nowCtx);
     }
     // Cross-tick dedupe keys accrue on every voiced path — band parts AND the
     // drum-edit guide (#282). The window only advances, so old keys are dead;
@@ -3142,8 +3243,10 @@ export function _guideTimerSync() {
             ? previewWork
             : editorGuideClapEnabled() || editorMetronomeEnabled() || _abActive() || bandLive);
     if (want && !_guideTimer) {
-        _guideScheduledUntil = _transportChartTimePure(
+        const nowChart = _transportChartTimePure(
             S.playStartTime, S.playStartWall, S.audioCtx.currentTime, _auditionRate());
+        _guideScheduledUntil = _guideScheduleWatermarkPure(
+            _guideScheduledUntil, nowChart, _guideIncludeStartBoundary);
         _guideTimer = setInterval(_guideTick, GUIDE_TICK_MS);
         _guideTick(); // fill the first window now, not one tick late
     } else if (!want && _guideTimer) {
