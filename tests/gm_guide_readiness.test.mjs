@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 
 const scripts = new Map();
@@ -92,6 +93,16 @@ function decodeContext() {
         createBuffer() { return { pcm: true }; },
     };
 }
+
+test('focused GM preparation clears its fallback timer on every race outcome', () => {
+    const source = fs.readFileSync(new URL('../src/audio.js', import.meta.url), 'utf8');
+    const start = source.indexOf('export async function editorPrepareGuidePreview');
+    const end = source.indexOf('export function editorSetGuidePreview', start);
+    const body = source.slice(start, end);
+    assert.match(body,
+        /try\s*\{\s*await Promise\.race\([\s\S]*?\)\s*;?\s*\}\s*finally\s*\{[\s\S]*?clearTimeout\(timeoutId\)/,
+        'rejected preset loads must not leave the ten-second timer pending');
+});
 
 async function waitFor(predicate) {
     for (let i = 0; i < 20 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 0));

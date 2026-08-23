@@ -2816,11 +2816,17 @@ export async function editorPrepareGuidePreview(kind = 'guitar', options = {}) {
         // every audition button forever; the underlying load may still populate
         // the cache later, so a retry can succeed.
         let timeoutId = null;
-        await Promise.race([
-            loading,
-            new Promise(resolve => { timeoutId = setTimeout(resolve, 10000); }),
-        ]);
-        if (timeoutId !== null) clearTimeout(timeoutId);
+        try {
+            await Promise.race([
+                loading,
+                new Promise(resolve => { timeoutId = setTimeout(resolve, 10000); }),
+            ]);
+        } finally {
+            // A script/decode failure can reject the loading branch. Never
+            // leave its ten-second fallback timer alive after this request has
+            // already settled or the modal has moved on.
+            if (timeoutId !== null) clearTimeout(timeoutId);
+        }
         ready = gmPresetReady(gm) && ctx.state !== 'suspended' && ctx.state !== 'closed';
         return ready;
     } finally {
