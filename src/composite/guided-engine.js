@@ -12,6 +12,7 @@ import {
     clearCompositeConflictResolution,
     compositeCollisionReason,
     compositeEntryHasSource,
+    compositePlanResolutionRevision,
     compositeTimingToleranceSeconds,
     forEachCompositeSelectionCollision,
     prepareCompositeSources,
@@ -26,6 +27,29 @@ const repeatEntrySemanticKeyCache = new WeakMap();
 const repeatBlockFingerprintCache = new WeakMap();
 const repeatBlockEquivalenceCache = new WeakMap();
 const guidedRepeatGroupCache = new WeakMap();
+const guidedPlanMutationState = new WeakMap();
+
+function guidedMutationState(plan) {
+    let state = guidedPlanMutationState.get(plan);
+    if (!state) {
+        state = { structureRevision: 0, resolutionRevision: 0 };
+        guidedPlanMutationState.set(plan, state);
+    }
+    return state;
+}
+
+function invalidateGuidedResolutionCache(plan) {
+    if (!plan || typeof plan !== 'object') return;
+    guidedMutationState(plan).resolutionRevision++;
+}
+
+function invalidateGuidedStructureCache(plan) {
+    if (!plan || typeof plan !== 'object') return;
+    const state = guidedMutationState(plan);
+    state.structureRevision++;
+    state.resolutionRevision++;
+    guidedRepeatGroupCache.delete(plan);
+}
 
 export function normalizeGuidedRepeatMode(value) {
     return value === GUIDED_REPEAT_MODE_MATCHING
@@ -507,40 +531,86 @@ function repeatBlocksEquivalentCached(left, right, beats) {
     return equivalent;
 }
 
-function repeatDetachedSignature(conflicts) {
-    return conflicts.map(block => `${block.id}:${block.repeatDetached ? 1 : 0}`).join('|');
+function resolutionSummarySignature(plan) {
+    const mutation = guidedMutationState(plan);
+    // The shared revision covers direct merge-engine calls too. A count alone
+    // is insufficient: one unresolved group can become resolved while another
+    // is cleared before the next render, leaving the same total but different
+    // next-decision navigation.
+    return `${mutation.resolutionRevision}:${compositePlanResolutionRevision(plan)}`;
 }
 
-function updateGuidedRepeatStats(plan, groups, blockById) {
-    const unresolvedGroups = groups.filter(group => group.memberIds.some(id => {
-        const block = blockById.get(id);
-        return block && !block.resolution;
-    })).length;
-    plan.stats.reviewDecisions = groups.length;
-    plan.stats.repeatedOccurrences = Math.max(0, (plan.conflicts || []).length - groups.length);
-    plan.stats.unresolvedReviewDecisions = unresolvedGroups;
-    plan.stats.unresolvedConflicts = (plan.conflicts || []).filter(block => !block.resolution).length;
+function guidedResolutionSummary(plan, cache) {
+    const signature = resolutionSummarySignature(plan);
+    if (cache.resolutionSummary?.signature === signature) return cache.resolutionSummary;
+    let unresolvedConflicts = 0;
+    const unresolvedGroupIds = new Set();
+    const unresolvedMembersByGroupId = new Map();
+    for (const block of cache.conflicts) {
+        if (block.resolution) continue;
+        unresolvedConflicts++;
+        const group = cache.blockGroupById.get(block.id);
+        if (!group) continue;
+        unresolvedGroupIds.add(group.id);
+        unresolvedMembersByGroupId.set(group.id,
+            (unresolvedMembersByGroupId.get(group.id) || 0) + 1);
+    }
+    const unresolvedGroupIndexes = [];
+    for (let index = 0; index < cache.groups.length; index++) {
+        if (unresolvedGroupIds.has(cache.groups[index].id)) unresolvedGroupIndexes.push(index);
+    }
+    cache.resolutionSummary = {
+        signature,
+        unresolvedConflicts,
+        unresolvedGroupIds,
+        unresolvedGroupIndexes,
+        unresolvedMembersByGroupId,
+    };
+    cache.contextByBlockId.clear();
+    return cache.resolutionSummary;
+}
+
+function applyGuidedRepeatStats(plan, cache) {
+    const summary = guidedResolutionSummary(plan, cache);
+    if (!plan.stats || typeof plan.stats !== 'object') plan.stats = {};
+    plan.stats.reviewDecisions = cache.groups.length;
+    plan.stats.repeatedOccurrences = Math.max(0, cache.conflicts.length - cache.groups.length);
+    plan.stats.unresolvedReviewDecisions = summary.unresolvedGroupIndexes.length;
+    plan.stats.unresolvedConflicts = summary.unresolvedConflicts;
+    // A deserialized/hand-authored plan can arrive without the derived count.
+    // Adopt the now-canonical counter without forcing a redundant second scan.
+    summary.signature = resolutionSummarySignature(plan);
 }
 
 export function refreshGuidedRepeatGroups(plan) {
     if (!plan || plan.strategy !== 'guided') return [];
     const conflicts = plan.conflicts || [];
     const repeatMode = normalizeGuidedRepeatMode(plan.repeatMode);
-    const detachedSignature = repeatDetachedSignature(conflicts);
+    const mutation = guidedMutationState(plan);
     const cached = guidedRepeatGroupCache.get(plan);
+    // repeatDetached changes only through the Guided APIs below; those bump the
+    // structural revision. Avoid rebuilding an O(n) detached-state string on
+    // every render-time lookup.
     if (cached && cached.conflicts === conflicts && cached.repeatMode === repeatMode
-        && cached.detachedSignature === detachedSignature) {
+        && cached.structureRevision === mutation.structureRevision) {
         plan.repeatGroups = cached.groups;
-        updateGuidedRepeatStats(plan, cached.groups, cached.blockById);
+        applyGuidedRepeatStats(plan, cached);
         return cached.groups;
     }
     const matching = repeatMode === GUIDED_REPEAT_MODE_MATCHING;
     const groups = [];
-    const blockById = new Map(conflicts.map(block => [block.id, block]));
+    const blockById = new Map();
+    const blockIndexById = new Map();
     const blockGroupById = new Map();
+    const groupIndexById = new Map();
+    const memberPositionByBlockId = new Map();
+    const membersByGroupId = new Map();
     const groupsByFingerprint = new Map();
     const representativeByGroupId = new Map();
-    for (const block of conflicts) {
+    for (let blockIndex = 0; blockIndex < conflicts.length; blockIndex++) {
+        const block = conflicts[blockIndex];
+        blockById.set(block.id, block);
+        blockIndexById.set(block.id, blockIndex);
         block.repeatFingerprint = blockRepeatFingerprint(block);
         let group = null;
         if (matching && !block.repeatDetached) {
@@ -558,6 +628,8 @@ export function refreshGuidedRepeatGroups(plan) {
                 detached: !!block.repeatDetached,
             };
             groups.push(group);
+            groupIndexById.set(group.id, groups.length - 1);
+            membersByGroupId.set(group.id, []);
             representativeByGroupId.set(group.id, block);
             if (!groupsByFingerprint.has(group.fingerprint)) {
                 groupsByFingerprint.set(group.fingerprint, []);
@@ -565,6 +637,9 @@ export function refreshGuidedRepeatGroups(plan) {
             groupsByFingerprint.get(group.fingerprint).push(group);
         }
         group.memberIds.push(block.id);
+        const members = membersByGroupId.get(group.id);
+        memberPositionByBlockId.set(block.id, members.length);
+        members.push({ block, index: blockIndex });
         block.repeatGroupId = group.id;
         blockGroupById.set(block.id, group);
     }
@@ -572,12 +647,18 @@ export function refreshGuidedRepeatGroups(plan) {
     guidedRepeatGroupCache.set(plan, {
         conflicts,
         repeatMode,
-        detachedSignature,
+        structureRevision: mutation.structureRevision,
         groups,
         blockById,
+        blockIndexById,
         blockGroupById,
+        groupIndexById,
+        memberPositionByBlockId,
+        membersByGroupId,
+        contextByBlockId: new Map(),
+        resolutionSummary: null,
     });
-    updateGuidedRepeatStats(plan, groups, blockById);
+    applyGuidedRepeatStats(plan, guidedRepeatGroupCache.get(plan));
     return groups;
 }
 
@@ -586,16 +667,76 @@ export function guidedReviewGroups(plan) {
         ? refreshGuidedRepeatGroups(plan) : [];
 }
 
-export function guidedRepeatGroupForBlock(plan, blockOrId) {
+function nextUnresolvedGroupIndex(indexes, currentIndex, groupCount) {
+    if (!indexes.length || groupCount < 2) return -1;
+    let low = 0;
+    let high = indexes.length;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (indexes[middle] <= currentIndex) low = middle + 1;
+        else high = middle;
+    }
+    const candidate = low < indexes.length ? indexes[low] : indexes[0];
+    return candidate === currentIndex ? -1 : candidate;
+}
+
+/**
+ * Return the render/navigation context for one Guided decision block.
+ *
+ * The result contains only ordinary objects and arrays, so it remains safe to
+ * structured-clone with a worker-produced plan. `members` keeps conflict-array
+ * order and uses the UI-friendly `{ block, index }` shape. Repeated calls are
+ * O(1) until the plan structure or a Guided resolution changes.
+ */
+export function guidedReviewContext(plan, blockOrId) {
     if (!plan || plan.strategy !== 'guided') return null;
-    const blockId = typeof blockOrId === 'string' ? blockOrId : blockOrId && blockOrId.id;
+    const blockId = typeof blockOrId === 'string' ? blockOrId : blockOrId?.id;
+    if (!blockId) return null;
     refreshGuidedRepeatGroups(plan);
-    return guidedRepeatGroupCache.get(plan)?.blockGroupById.get(blockId) || null;
+    const cache = guidedRepeatGroupCache.get(plan);
+    const block = cache?.blockById.get(blockId);
+    const group = cache?.blockGroupById.get(blockId);
+    if (!cache || !block || !group) return null;
+    const summary = guidedResolutionSummary(plan, cache);
+    const cached = cache.contextByBlockId.get(blockId);
+    if (cached?.signature === summary.signature) return cached.value;
+    const groupIndex = cache.groupIndexById.get(group.id) ?? -1;
+    const members = cache.membersByGroupId.get(group.id) || [];
+    const occurrenceIndex = cache.memberPositionByBlockId.get(blockId) ?? -1;
+    const nextIndex = nextUnresolvedGroupIndex(summary.unresolvedGroupIndexes,
+        groupIndex, cache.groups.length);
+    const value = {
+        block,
+        blockIndex: cache.blockIndexById.get(blockId) ?? -1,
+        group,
+        groups: cache.groups,
+        groupIndex,
+        groupNumber: groupIndex + 1,
+        decisionCount: cache.groups.length,
+        members,
+        occurrenceIndex,
+        occurrenceNumber: occurrenceIndex + 1,
+        grouped: members.length > 1,
+        allResolved: !summary.unresolvedGroupIds.has(group.id),
+        unresolvedOccurrences: summary.unresolvedMembersByGroupId.get(group.id) || 0,
+        unresolvedDecisions: summary.unresolvedGroupIndexes.length,
+        unresolvedConflicts: summary.unresolvedConflicts,
+        nextUnresolvedGroupIndex: nextIndex,
+        nextUnresolvedGroup: nextIndex >= 0 ? cache.groups[nextIndex] : null,
+    };
+    cache.contextByBlockId.set(blockId, { signature: summary.signature, value });
+    return value;
+}
+
+export function guidedRepeatGroupForBlock(plan, blockOrId) {
+    return guidedReviewContext(plan, blockOrId)?.group || null;
 }
 
 function blocksForRepeatGroup(plan, group) {
-    const ids = new Set(group && group.memberIds || []);
-    return (plan.conflicts || []).filter(block => ids.has(block.id));
+    if (!plan || plan.strategy !== 'guided' || !group) return [];
+    refreshGuidedRepeatGroups(plan);
+    const cache = guidedRepeatGroupCache.get(plan);
+    return (cache?.membersByGroupId.get(group.id) || []).map(member => member.block);
 }
 
 function mapCustomSelection(fromBlock, toBlock, selectedEntryIds, beats) {
@@ -614,18 +755,19 @@ function mapCustomSelection(fromBlock, toBlock, selectedEntryIds, beats) {
 }
 
 export function resolveGuidedRepeatGroup(plan, blockId, resolution, selectedEntryIds = []) {
-    const sourceBlock = plan && plan.conflicts && plan.conflicts.find(block => block.id === blockId);
-    if (!sourceBlock || plan.strategy !== 'guided') {
+    const context = guidedReviewContext(plan, blockId);
+    const sourceBlock = context?.block;
+    if (!sourceBlock) {
         return { ok: false, error: 'Guided decision block not found.', applied: [], failed: [] };
     }
-    const group = guidedRepeatGroupForBlock(plan, sourceBlock);
-    const members = blocksForRepeatGroup(plan, group);
+    const members = blocksForRepeatGroup(plan, context.group);
     for (const block of members) {
         clearCompositeConflictResolution(plan, block.id);
         block.repeatAppliedFromId = '';
     }
     const applied = [];
     const failed = [];
+    let structureChanged = false;
     for (const block of members) {
         const mappedIds = resolution === 'custom'
             ? mapCustomSelection(sourceBlock, block, selectedEntryIds, plan.beats)
@@ -635,6 +777,7 @@ export function resolveGuidedRepeatGroup(plan, blockId, resolution, selectedEntr
             block.validationError = 'This occurrence no longer matches the repeated custom selection.';
             failed.push({ id: block.id, label: block.label, error: block.validationError });
             block.repeatDetached = true;
+            structureChanged = true;
             continue;
         }
         const result = resolveCompositeConflict(plan, block.id, resolution, mappedIds);
@@ -644,6 +787,7 @@ export function resolveGuidedRepeatGroup(plan, blockId, resolution, selectedEntr
         } else {
             failed.push({ id: block.id, label: block.label, error: block.validationError || result.error });
             block.repeatDetached = true;
+            structureChanged = true;
         }
     }
     plan.repeatNotice = {
@@ -652,6 +796,8 @@ export function resolveGuidedRepeatGroup(plan, blockId, resolution, selectedEntr
         applied: applied.length,
         failed,
     };
+    if (structureChanged) invalidateGuidedStructureCache(plan);
+    else invalidateGuidedResolutionCache(plan);
     refreshGuidedRepeatGroups(plan);
     return {
         ok: failed.length === 0,
@@ -663,23 +809,23 @@ export function resolveGuidedRepeatGroup(plan, blockId, resolution, selectedEntr
 }
 
 export function clearGuidedRepeatGroup(plan, blockId) {
-    const block = plan && plan.conflicts && plan.conflicts.find(candidate => candidate.id === blockId);
-    if (!block || plan.strategy !== 'guided') return { ok: false, error: 'Guided decision block not found.' };
-    const group = guidedRepeatGroupForBlock(plan, block);
-    const members = blocksForRepeatGroup(plan, group);
+    const context = guidedReviewContext(plan, blockId);
+    if (!context) return { ok: false, error: 'Guided decision block not found.' };
+    const members = blocksForRepeatGroup(plan, context.group);
     for (const member of members) {
         clearCompositeConflictResolution(plan, member.id);
         member.repeatAppliedFromId = '';
     }
     plan.repeatNotice = null;
+    invalidateGuidedResolutionCache(plan);
     refreshGuidedRepeatGroups(plan);
     return { ok: true, cleared: members.map(member => member.id) };
 }
 
 export function detachGuidedRepeatOccurrence(plan, blockId) {
-    const block = plan && plan.conflicts && plan.conflicts.find(candidate => candidate.id === blockId);
-    if (!block || plan.strategy !== 'guided') return { ok: false, error: 'Guided decision block not found.' };
-    const group = guidedRepeatGroupForBlock(plan, block);
+    const context = guidedReviewContext(plan, blockId);
+    if (!context) return { ok: false, error: 'Guided decision block not found.' };
+    const { block, group } = context;
     if (!group || group.memberIds.length < 2) {
         return { ok: false, error: 'This occurrence is already reviewed separately.' };
     }
@@ -693,6 +839,7 @@ export function detachGuidedRepeatOccurrence(plan, blockId) {
         failed: [],
         label: block.label,
     };
+    invalidateGuidedStructureCache(plan);
     refreshGuidedRepeatGroups(plan);
     return { ok: true, blockId: block.id };
 }
@@ -839,7 +986,8 @@ function splitGuidedBlocks(plan, blocks, splitPoints, activeBlockId) {
     plan.repeatNotice = null;
     refreshGuidedRepeatGroups(plan);
     const activeBlocks = replacements.get(activeBlockId);
-    const activeIndex = activeBlocks ? plan.conflicts.findIndex(block => block.id === activeBlocks[0].id) : 0;
+    const activeIndex = activeBlocks
+        ? guidedReviewContext(plan, activeBlocks[0].id)?.blockIndex ?? 0 : 0;
     return {
         ok: true,
         index: activeIndex,
@@ -851,7 +999,7 @@ function splitGuidedBlocks(plan, blocks, splitPoints, activeBlockId) {
 
 export function splitGuidedDecisionBlock(plan, blockId, splitBeat) {
     if (!plan || plan.strategy !== 'guided') return { ok: false, error: 'A Guided Hybrid plan is required.' };
-    const block = plan.conflicts.find(candidate => candidate.id === blockId);
+    const block = guidedReviewContext(plan, blockId)?.block;
     if (!block) return { ok: false, error: 'Decision block not found.' };
     const point = (block.splitPoints || []).find(candidate => near(candidate.beat, finite(splitBeat, NaN)));
     if (!point) return { ok: false, error: 'That bar is not a valid split point.' };
@@ -860,13 +1008,13 @@ export function splitGuidedDecisionBlock(plan, blockId, splitBeat) {
 
 export function splitGuidedRepeatGroup(plan, blockId, splitBeat) {
     if (!plan || plan.strategy !== 'guided') return { ok: false, error: 'A Guided Hybrid plan is required.' };
-    const block = plan.conflicts.find(candidate => candidate.id === blockId);
-    if (!block) return { ok: false, error: 'Decision block not found.' };
+    const context = guidedReviewContext(plan, blockId);
+    const block = context?.block;
+    if (!context) return { ok: false, error: 'Decision block not found.' };
     const activePoint = (block.splitPoints || []).find(candidate => near(candidate.beat, finite(splitBeat, NaN)));
     if (!activePoint) return { ok: false, error: 'That bar is not a valid split point.' };
     const relativeBeat = activePoint.beat - block.startBeat;
-    const group = guidedRepeatGroupForBlock(plan, block);
-    const members = blocksForRepeatGroup(plan, group);
+    const members = blocksForRepeatGroup(plan, context.group);
     const points = members.map(member => (member.splitPoints || []).find(candidate => near(
         candidate.beat - member.startBeat,
         relativeBeat,

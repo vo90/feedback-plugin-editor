@@ -13,6 +13,22 @@ export const COMPOSITE_BEAT_EPS = 1e-4;
 export const COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS = 0.001;
 export const COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS = 0.005;
 export const COMPOSITE_TIMING_TOLERANCE_BEAT_FRACTION = 0.01;
+const compositePlanResolutionRevisions = new WeakMap();
+
+// Resolution state is intentionally kept outside the plan: plans cross the
+// analysis Worker boundary and must remain structured-clone-safe. Consumers
+// with derived indexes can use this O(1) revision to invalidate exact caches
+// even when the unresolved count happens to stay unchanged.
+export function compositePlanResolutionRevision(plan) {
+    return plan && typeof plan === 'object'
+        ? compositePlanResolutionRevisions.get(plan) || 0 : 0;
+}
+
+function markCompositePlanResolutionChanged(plan) {
+    if (!plan || typeof plan !== 'object') return;
+    compositePlanResolutionRevisions.set(plan, compositePlanResolutionRevision(plan) + 1);
+}
+
 function clone(value) {
     if (value == null) return value;
     if (typeof structuredClone === 'function') return structuredClone(value);
@@ -622,11 +638,13 @@ export function resolveCompositeConflict(plan, conflictId, resolution, selectedE
         group.resolution = null;
         group.selectedEntryIds = [];
         plan.stats.unresolvedConflicts = plan.conflicts.filter(c => !c.resolution).length;
+        markCompositePlanResolutionChanged(plan);
         return validation;
     }
     group.resolution = resolution;
     group.selectedEntryIds = selected.map(e => e.id);
     plan.stats.unresolvedConflicts = plan.conflicts.filter(c => !c.resolution).length;
+    markCompositePlanResolutionChanged(plan);
     return { ok: true, selected };
 }
 
@@ -638,6 +656,7 @@ export function clearCompositeConflictResolution(plan, conflictId) {
     group.validationError = '';
     group.validationKind = '';
     plan.stats.unresolvedConflicts = plan.conflicts.filter(c => !c.resolution).length;
+    markCompositePlanResolutionChanged(plan);
     return { ok: true };
 }
 

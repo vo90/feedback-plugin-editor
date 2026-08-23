@@ -7,12 +7,14 @@ import {
     detachGuidedRepeatOccurrence,
     GUIDED_REPEAT_MODE_EVERY,
     GUIDED_REPEAT_MODE_MATCHING,
+    guidedReviewContext,
     guidedReviewGroups,
     resolveGuidedRepeatGroup,
     splitGuidedDecisionBlock,
     splitGuidedRepeatGroup,
 } from '../src/composite/guided-engine.js';
 import {
+    clearCompositeConflictResolution,
     materializeCompositeArrangement,
     resolveCompositeConflict,
 } from '../src/composite/merge-engine.js';
@@ -40,6 +42,49 @@ const arrangement = (name, notes, extra = {}) => ({
     chord_templates: [],
     ...extra,
 });
+
+function legacyGuidedReviewContext(plan, blockId) {
+    const groups = guidedReviewGroups(plan);
+    const block = plan.conflicts.find(candidate => candidate.id === blockId);
+    const group = groups.find(candidate => candidate.memberIds.includes(blockId));
+    if (!block || !group) return null;
+    const memberIds = new Set(group.memberIds);
+    const members = plan.conflicts.map((candidate, index) => ({ block: candidate, index }))
+        .filter(candidate => memberIds.has(candidate.block.id));
+    const groupIndex = groups.findIndex(candidate => candidate.id === group.id);
+    const unresolved = candidate => candidate.memberIds.some(id => {
+        const candidateBlock = plan.conflicts.find(item => item.id === id);
+        return candidateBlock && !candidateBlock.resolution;
+    });
+    let nextIndex = -1;
+    for (let offset = 1; offset < groups.length; offset++) {
+        const candidateIndex = (groupIndex + offset) % groups.length;
+        if (unresolved(groups[candidateIndex])) {
+            nextIndex = candidateIndex;
+            break;
+        }
+    }
+    return {
+        blockIndex: plan.conflicts.findIndex(candidate => candidate.id === blockId),
+        groupId: group.id,
+        groupIndex,
+        memberIndexes: members.map(member => member.index),
+        occurrenceIndex: members.findIndex(member => member.block.id === blockId),
+        grouped: members.length > 1,
+        allResolved: members.every(member => !!member.block.resolution),
+        unresolvedDecisions: groups.filter(unresolved).length,
+        unresolvedConflicts: plan.conflicts.filter(candidate => !candidate.resolution).length,
+        nextIndex,
+    };
+}
+
+function seededRandom(seed) {
+    let state = seed >>> 0;
+    return () => {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        return state / 0x100000000;
+    };
+}
 
 test('identical Guided material is included once and never enters review', () => {
     const plan = analyzeGuidedComposite({
@@ -249,6 +294,201 @@ test('Guided repetition groups are reused until their structure changes', () => 
     assert.notStrictEqual(separated, grouped);
     assert.equal(separated.length, 2);
     assert.strictEqual(guidedReviewGroups(plan), separated);
+});
+
+test('Guided review context is clone-safe and invalidates after resolution and structure APIs', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 0, 3), note(9, 0, 3)]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9, 1, 5)]),
+        beats,
+        sections: [{ name: 'Riff', number: 2, start_time: 4 }],
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    const blockId = plan.conflicts[0].id;
+    const initial = guidedReviewContext(plan, blockId);
+    assert.strictEqual(guidedReviewContext(plan, blockId), initial,
+        'an unchanged render reuses its complete context');
+    assert.deepEqual({
+        blockIndex: initial.blockIndex,
+        groupIndex: initial.groupIndex,
+        groupNumber: initial.groupNumber,
+        decisionCount: initial.decisionCount,
+        occurrenceIndex: initial.occurrenceIndex,
+        grouped: initial.grouped,
+        unresolvedOccurrences: initial.unresolvedOccurrences,
+        unresolvedDecisions: initial.unresolvedDecisions,
+        nextUnresolvedGroup: initial.nextUnresolvedGroup,
+    }, {
+        blockIndex: 0,
+        groupIndex: 0,
+        groupNumber: 1,
+        decisionCount: 1,
+        occurrenceIndex: 0,
+        grouped: true,
+        unresolvedOccurrences: 2,
+        unresolvedDecisions: 1,
+        nextUnresolvedGroup: null,
+    });
+    assert.doesNotThrow(() => structuredClone(initial),
+        'the public context contains no private Map/WeakMap state or functions');
+
+    assert.equal(resolveGuidedRepeatGroup(plan, blockId, 'primary').ok, true);
+    const resolved = guidedReviewContext(plan, blockId);
+    assert.notStrictEqual(resolved, initial);
+    assert.equal(resolved.allResolved, true);
+    assert.equal(resolved.unresolvedOccurrences, 0);
+    assert.equal(resolved.unresolvedDecisions, 0);
+    assert.equal(clearGuidedRepeatGroup(plan, blockId).ok, true);
+    const cleared = guidedReviewContext(plan, blockId);
+    assert.notStrictEqual(cleared, resolved);
+    assert.equal(cleared.allResolved, false);
+    assert.equal(cleared.unresolvedDecisions, 1);
+
+    assert.equal(detachGuidedRepeatOccurrence(plan, plan.conflicts[1].id).ok, true);
+    const detached = guidedReviewContext(plan, blockId);
+    assert.equal(detached.decisionCount, 2);
+    assert.equal(detached.grouped, false);
+    assert.equal(detached.nextUnresolvedGroupIndex, 1);
+
+    const clonedPlan = structuredClone(plan);
+    const cloned = guidedReviewContext(clonedPlan, blockId);
+    assert.equal(cloned.group.id, detached.group.id);
+    assert.deepEqual(cloned.members.map(member => member.index), [0]);
+});
+
+test('Guided review cache follows direct resolutions when the unresolved count is unchanged', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 0, 3), note(9, 0, 4)]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9, 1, 7)]),
+        beats,
+        sections: [{ name: 'Second', number: 2, start_time: 4 }],
+        repeatMode: GUIDED_REPEAT_MODE_EVERY,
+    });
+    assert.equal(guidedReviewGroups(plan).length, 2);
+    const [first, second] = plan.conflicts;
+    assert.equal(resolveGuidedRepeatGroup(plan, first.id, 'primary').ok, true);
+    const cached = guidedReviewContext(plan, first.id);
+    assert.equal(cached.allResolved, true);
+    assert.equal(cached.nextUnresolvedGroup.id,
+        guidedReviewContext(plan, second.id).group.id);
+
+    assert.equal(clearCompositeConflictResolution(plan, first.id).ok, true);
+    assert.equal(resolveCompositeConflict(plan, second.id, 'primary').ok, true);
+    assert.equal(plan.stats.unresolvedConflicts, 1,
+        'the total returns to its cached value while the unresolved group moves');
+
+    const refreshed = guidedReviewContext(plan, first.id);
+    assert.notStrictEqual(refreshed, cached);
+    assert.equal(refreshed.allResolved, false);
+    assert.equal(refreshed.nextUnresolvedGroup, null);
+    assert.equal(guidedReviewContext(plan, second.id).allResolved, true);
+});
+
+test('indexed Guided review context matches the legacy scans across randomized plans', () => {
+    const random = seededRandom(0x5eed1234);
+    for (let trial = 0; trial < 80; trial++) {
+        const occurrenceCount = 3 + Math.floor(random() * 8);
+        const localBeats = Array.from({ length: occurrenceCount * 8 + 9 }, (_, index) => ({
+            time: index * 0.5,
+            measure: index % 4 === 0 ? index / 4 + 1 : -1,
+        }));
+        const primaryNotes = [];
+        const secondaryNotes = [];
+        const sections = [];
+        for (let occurrence = 0; occurrence < occurrenceCount; occurrence++) {
+            const start = occurrence * 8;
+            const variant = Math.floor(random() * 3);
+            primaryNotes.push(note(start + 1, 0, 3 + variant));
+            secondaryNotes.push(note(start + 1, 1, 7 + variant));
+            if (occurrence) sections.push({
+                name: 'Part', number: occurrence + 1, start_time: start * 0.5,
+            });
+        }
+        const plan = analyzeGuidedComposite({
+            primary: arrangement('Lead', primaryNotes),
+            secondary: arrangement('Rhythm', secondaryNotes),
+            beats: localBeats,
+            sections,
+            repeatMode: random() < 0.75
+                ? GUIDED_REPEAT_MODE_MATCHING : GUIDED_REPEAT_MODE_EVERY,
+        });
+        for (const group of [...guidedReviewGroups(plan)]) {
+            if (random() < 0.45) {
+                assert.equal(resolveGuidedRepeatGroup(plan, group.representativeId, 'primary').ok, true);
+            }
+        }
+        const detachable = guidedReviewGroups(plan).filter(group => group.memberIds.length > 1);
+        if (detachable.length && random() < 0.35) {
+            const group = detachable[Math.floor(random() * detachable.length)];
+            const memberId = group.memberIds[1 + Math.floor(random() * (group.memberIds.length - 1))];
+            assert.equal(detachGuidedRepeatOccurrence(plan, memberId).ok, true);
+        }
+        for (const block of plan.conflicts) {
+            const expected = legacyGuidedReviewContext(plan, block.id);
+            const actual = guidedReviewContext(plan, block.id);
+            assert.deepEqual({
+                blockIndex: actual.blockIndex,
+                groupId: actual.group.id,
+                groupIndex: actual.groupIndex,
+                memberIndexes: actual.members.map(member => member.index),
+                occurrenceIndex: actual.occurrenceIndex,
+                grouped: actual.grouped,
+                allResolved: actual.allResolved,
+                unresolvedDecisions: actual.unresolvedDecisions,
+                unresolvedConflicts: actual.unresolvedConflicts,
+                nextIndex: actual.nextUnresolvedGroupIndex,
+            }, expected, `trial ${trial}, block ${block.id}`);
+        }
+    }
+});
+
+test('Guided review context remains bounded on a 20k-decision plan', () => {
+    const count = 20_000;
+    const conflicts = Array.from({ length: count }, (_, index) => {
+        const startBeat = index * 2;
+        const entry = {
+            id: `primary:${index}`,
+            string: 0,
+            fret: index,
+            techniqueSignature: `unique:${index}`,
+            startBeat,
+            endBeat: startBeat,
+            effectiveEndBeat: startBeat,
+            playableStartBeat: startBeat,
+            playableEndBeat: startBeat,
+        };
+        return {
+            id: `guided:${index + 1}`,
+            startBeat,
+            repeatDetached: false,
+            resolution: null,
+            primaryEntries: [entry],
+            secondaryEntries: [],
+            cells: [{ barBoundary: true, startBeat, endBeat: startBeat + 1 }],
+        };
+    });
+    const plan = {
+        strategy: 'guided',
+        repeatMode: GUIDED_REPEAT_MODE_EVERY,
+        conflicts,
+        beats: [],
+        stats: { unresolvedConflicts: count },
+    };
+    const coldStart = performance.now();
+    const middle = guidedReviewContext(plan, 'guided:10001');
+    const coldElapsed = performance.now() - coldStart;
+    assert.equal(middle.blockIndex, 10_000);
+    assert.equal(middle.decisionCount, count);
+    assert.ok(coldElapsed < 5_000, `20k index construction took ${coldElapsed.toFixed(1)} ms`);
+
+    const cachedStart = performance.now();
+    for (let index = 0; index < count; index++) {
+        const context = guidedReviewContext(plan, `guided:${index + 1}`);
+        assert.equal(context.blockIndex, index);
+    }
+    const cachedElapsed = performance.now() - cachedStart;
+    assert.ok(cachedElapsed < 2_000,
+        `20k cached context reads took ${cachedElapsed.toFixed(1)} ms`);
 });
 
 test('shared automatic notes may differ without creating a second review decision', () => {
