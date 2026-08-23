@@ -418,6 +418,12 @@ test('fit-song still fits a long song instead of stopping at an editor-style zoo
     const zoom = compositeTimelineFitZoomPure(longContext, 1200);
     assert.ok(zoom >= 1 && zoom < 2);
     assert.ok(compositeTimelineContentWidthPure(longContext, zoom) <= 1202);
+    const veryLongContext = { ...model.context, endBeat: 2000 };
+    const subPixelZoom = compositeTimelineFitZoomPure(veryLongContext, 1200);
+    assert.ok(subPixelZoom > 0 && subPixelZoom < 1,
+        'explicit Overview may use sub-pixel beat spacing');
+    assert.ok(compositeTimelineContentWidthPure(veryLongContext, subPixelZoom) <= 1202,
+        'even an unusually long song still fits the Overview viewport');
 });
 
 test('lane and overview markup contain full-song notes without review controls', () => {
@@ -899,6 +905,52 @@ test('static timeline notation stays canonical at every normal zoom and batches 
     assert.equal((overview.match(/data-composite-static-note(?:-heads)?=/g) || []).length, 0);
 });
 
+test('20k-note Overview is pixel-bounded, omits ordinary notation, and represents the tail', () => {
+    const model = view();
+    const ordinaryCount = 19_999;
+    const entries = Array.from({ length: ordinaryCount }, (_, index) => {
+        const startBeat = index / ordinaryCount * 490;
+        return {
+            ...entry(`overview:${index}`, startBeat, startBeat + 1.5,
+                index % 5, index % 24, 'primary'),
+            effectiveEndBeat: startBeat + 2,
+            note: { techniques: { bend: true, tremolo: true } },
+        };
+    });
+    entries.push({
+        ...entry('overview:tail', 499.5, 500, 5, 22, 'secondary'),
+        note: { techniques: { palm_mute: true } },
+    });
+    model.context.endBeat = 500;
+    model.lanes[2].entries = entries;
+
+    const zoom = 1;
+    const markup = renderCompositeTimelineLaneContents(model, 'result', 158,
+        { startBeat: 0, endBeat: 500 }, zoom, { overviewDensity: true });
+    const densityPath = markup.match(
+        /<path data-composite-density-notes="true" data-composite-density-bin-count="(\d+)"[^>]* d="([^"]+)"/);
+    assert.ok(densityPath, 'Overview emits one aggregated attack path');
+    const binCount = Number(densityPath[1]);
+    const commands = (densityPath[2].match(/M/g) || []).length;
+    const surfaceWidth = compositeTimelineContentWidthPure(model.context, zoom);
+    assert.equal(commands, binCount);
+    assert.ok(commands <= Math.ceil(surfaceWidth) * model.stringCount,
+        'ordinary path commands are bounded by surface pixels times strings');
+    assert.ok(commands < entries.length / 2,
+        'the dense fixture collapses substantially instead of scaling by note count');
+    assert.doesNotMatch(markup, /data-composite-static-note/);
+    assert.doesNotMatch(markup, /data-composite-static-technique/);
+    assert.doesNotMatch(markup, /data-composite-static-trails/);
+    assert.doesNotMatch(markup, /<title>/);
+    assert.doesNotMatch(markup, /<g(?:\s|>)/);
+
+    const tailX = compositeTimelineXForBeatPure(499.5, model.context, zoom);
+    const tailBinCenter = Math.floor(tailX) + 0.5;
+    assert.match(densityPath[2], new RegExp(
+        `M${tailBinCenter.toFixed(1)} 28\\.0h0\\.1`),
+    'the final note remains represented in its own string/pixel bin');
+});
+
 test('canonical head geometry is zoom-invariant for static, focused, and interactive notes', () => {
     const model = view();
     const authored = {
@@ -947,7 +999,7 @@ test('canonical head geometry is zoom-invariant for static, focused, and interac
     }
 });
 
-test('explicit density overview keeps manual-review notes fully selectable and preserves static trail endpoints', () => {
+test('explicit density overview keeps manual-review detail and omits ordinary trails', () => {
     const model = view();
     model.review = {
         id: 'decision:fit', startBeat: 2, endBeat: 4,
@@ -974,10 +1026,11 @@ test('explicit density overview keeps manual-review notes fully selectable and p
         'the focused authored tremolo trail retains complete detail');
     assert.match(fitted, /stroke-dasharray="5 4"/,
         'the focused effective trail boundary remains distinct');
-    assert.match(fitted, /data-composite-static-trails="authored"/);
+    assert.doesNotMatch(fitted, /data-composite-static-trails=/,
+        'ordinary background trails are not miniature notation in Overview');
     const expectedTrailEnd = compositeTimelineXForBeatPure(20, model.context, 3);
-    assert.match(fitted, new RegExp(`H${expectedTrailEnd.toFixed(1)}`),
-        'a simplified background trail still terminates at its exact musical beat');
+    assert.doesNotMatch(fitted, new RegExp(`H${expectedTrailEnd.toFixed(1)}`),
+        'the ordinary background trail is omitted even when it crosses the view');
     assert.equal((fitted.match(/data-composite-density-notes=/g) || []).length, 1,
         'only the non-review attack is density-rendered');
 });

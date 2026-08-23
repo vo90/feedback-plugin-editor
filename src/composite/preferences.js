@@ -22,7 +22,9 @@ export const HYBRID_EXPERIMENTAL_DEFAULTS = Object.freeze({
     version: HYBRID_EXPERIMENTAL_PREF_VERSION,
 });
 
-export const HYBRID_TIMELINE_ZOOM_MIN = 1;
+// Display-only Overview may need well below one pixel per beat for unusually
+// long charts. Persisted/readable Notes zoom still has its separate 5 px floor.
+export const HYBRID_TIMELINE_ZOOM_MIN = 0.01;
 export const HYBRID_TIMELINE_ZOOM_MAX = 480;
 export const HYBRID_TIMELINE_ZOOM_CONTROL_MIN = 5;
 export const HYBRID_TIMELINE_ZOOM_STEP = 5;

@@ -161,6 +161,66 @@ for (const [strategy, plan] of plans) {
             .join(''), markup => ({ bytes: markup.length })));
 }
 
+// Overview has a different performance contract from readable note view: its
+// ordinary attacks must be bounded by display pixels, not source-note count.
+// Keep the musical span fixed so `--notes=20000` is a genuinely dense stress
+// case and report both the output size and the number of emitted path commands.
+const overviewSourceView = views.get('standard');
+if (overviewSourceView) {
+    const overviewSpanBeats = 500;
+    const denseEntries = Array.from({ length: noteCount }, (_, index) => {
+        const tail = index === noteCount - 1;
+        const startBeat = tail
+            ? 499.5 : index / Math.max(1, noteCount - 1) * 490;
+        return {
+            id: `benchmark:overview:${index}`,
+            startBeat,
+            endBeat: Math.min(overviewSpanBeats, startBeat + 1.5),
+            effectiveEndBeat: Math.min(overviewSpanBeats, startBeat + 2),
+            string: tail ? 5 : index % 5,
+            fret: index % 24,
+            source: tail ? 'secondary' : 'primary',
+            sources: [tail ? 'secondary' : 'primary'],
+            note: { techniques: { bend: true, tremolo: true } },
+        };
+    });
+    const denseView = {
+        ...overviewSourceView,
+        context: {
+            ...overviewSourceView.context,
+            startBeat: 0,
+            endBeat: overviewSpanBeats,
+            measureMarkers: (overviewSourceView.context.measureMarkers || [])
+                .filter(marker => marker.beat <= overviewSpanBeats),
+        },
+        review: null,
+        passageFocus: null,
+        lanes: [{
+            ...overviewSourceView.lanes.find(lane => lane.id === 'result'),
+            entries: denseEntries,
+        }],
+    };
+    const overviewZoom = 1;
+    const overviewSurfaceWidth = compositeTimelineContentWidthPure(
+        denseView.context, overviewZoom);
+    phases.push(measure('overview:dense-lane-svg', () =>
+        renderCompositeTimelineLaneContents(denseView, 'result', 180,
+            { startBeat: 0, endBeat: overviewSpanBeats }, overviewZoom,
+            { overviewDensity: true }), markup => {
+        const densityPath = markup.match(
+            /data-composite-density-bin-count="(\d+)"[^>]* d="([^"]+)"/);
+        return {
+            entries: denseEntries.length,
+            surfaceWidth: overviewSurfaceWidth,
+            bytes: markup.length,
+            densityBins: Number(densityPath?.[1] || 0),
+            pathCommands: (densityPath?.[2].match(/M/g) || []).length,
+            staticNoteLabels: (markup.match(/data-composite-static-note=/g) || []).length,
+            ordinaryTrailPaths: (markup.match(/data-composite-static-trails=/g) || []).length,
+        };
+    }));
+}
+
 const experimentalPlan = plans.get('experimental');
 if (experimentalPlan?.ok) {
     phases.push(measure('experimental:comparison-report', () =>

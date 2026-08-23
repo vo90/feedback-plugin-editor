@@ -443,6 +443,38 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
         'the dense static overview SVG is never repainted to move its playhead');
 });
 
+test('Hybrid Overview is an explicit shared display mode with bounded production rendering', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const planStart = resolver.indexOf('function compositeTimelineCameraRenderPlan');
+    const planEnd = resolver.indexOf('\nfunction renderCompositeTimelineCameraSlot', planStart);
+    assert.match(resolver.slice(planStart, planEnd),
+        /overviewDensity: compositeTimelineOverviewActive\(\)/,
+        'every review/final camera uses the bounded density renderer only in explicit Overview');
+    const signatureStart = resolver.indexOf('function compositeTimelineRenderSignature');
+    const signatureEnd = resolver.indexOf('\nfunction setCompositeTimelineCameraSlotActive', signatureStart);
+    assert.match(resolver.slice(signatureStart, signatureEnd),
+        /compositeTimelineDisplayMode\(\)/,
+        'a Notes camera can never be reused as an Overview camera at the same numeric zoom');
+    assert.match(resolver,
+        /id="editor-composite-time-overview" aria-pressed=/,
+        'the shared timeline exposes its display mode directly beside Zoom');
+    assert.doesNotMatch(resolver, /editor-composite-time-fit/,
+        'Fit is no longer disguised as an extreme numeric note zoom');
+    const modeStart = resolver.indexOf('function commitCompositeTimelineDisplayMode');
+    const modeEnd = resolver.indexOf('\nfunction scheduleCompositeTimelineDisplayMode', modeStart);
+    const modeBody = resolver.slice(modeStart, modeEnd);
+    assert.match(modeBody,
+        /timelineNotesScrollLeft = currentVisual[\s\S]*timelineDisplayMode: normalizedMode/,
+        'entering Overview preserves the Notes position before switching mode');
+    assert.doesNotMatch(modeBody, /timelineZoom:/,
+        'computed fit never replaces the remembered numeric Notes zoom');
+    const bindStart = resolver.indexOf('function bindCompositeTimelineEvents');
+    const bindEnd = resolver.indexOf('function renderFinalPreviewResult', bindStart);
+    assert.match(resolver.slice(bindStart, bindEnd),
+        /overviewButton\?\.addEventListener\('click'[\s\S]*scheduleCompositeTimelineDisplayMode/,
+        'the shared Review and full-song workspace use the same mode switch');
+});
+
 test('Hybrid overview drag previews visually and commits transport once on release', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
     const bindStart = resolver.indexOf('function bindCompositeTimelineEvents');
@@ -528,8 +560,8 @@ test('continuous Hybrid preview preferences update live and persist off the inpu
     assert.match(resolver, /timelinePendingZoom\?\.id > requestId/,
         'an older zoom timer refuses to overtake newer raw input');
     assert.match(resolver,
-        /const unsettledZoom = timelinePendingZoom \|\| timelineRequestedZoom[\s\S]*timelineZoom: unsettledZoom\.zoom/,
-        'teardown persists the newest visible zoom request even before its exact render');
+        /function settleCompositeTimelineZoomPreference[\s\S]*compositeTimelineZoomAtPure[\s\S]*timelineZoom: normalizedZoom[\s\S]*timelineNotesScrollLeft = settledScroll/,
+        'teardown persists the newest zoom and its anchor-derived Notes position before rendering');
     const centerStart = resolver.indexOf('function centerCurrentReviewInTimeline');
     const centerEnd = resolver.indexOf('\nfunction refreshCompositeTimelineFollowButton', centerStart);
     assert.doesNotMatch(resolver.slice(centerStart, centerEnd),

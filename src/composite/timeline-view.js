@@ -808,7 +808,14 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
     const staticHeadPaths = [];
     const staticFretLabels = [];
     const staticTechniqueLabels = [];
-    const densityHeads = [];
+    // Full-song Overview is a visual density summary, not miniature notation.
+    // Collapse ordinary attacks into at most one mark per display pixel and
+    // string. A Set keeps memory proportional to occupied bins (rather than a
+    // potentially huge song surface), while the emitted path remains bounded
+    // by surfaceWidth * stringCount regardless of source-note count.
+    const densityPixelCount = Math.max(1, Math.ceil(contentWidth));
+    const densityAttackBins = overviewDensity
+        ? Array.from({ length: view.stringCount }, () => new Set()) : [];
     const authoredTrails = [];
     const tremoloTrails = [];
     const effectiveTrails = [];
@@ -817,15 +824,27 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
             view.stringCount - 1 - Math.trunc(finite(entry.string))));
         const y = top + row * stringGap;
         const x = surface.xForBeat(entry.startBeat);
+        const detailed = entryNeedsDetailedTimelineMarkup(view, entry);
+        if (overviewDensity && !detailed) {
+            // A trail-only range hit may begin outside this SVG surface. Do
+            // not pin that off-screen attack to an edge: Overview deliberately
+            // omits ordinary trails and represents only attacks actually on
+            // this surface.
+            if (x >= 0 && x <= contentWidth) {
+                const pixel = Math.max(0, Math.min(densityPixelCount - 1,
+                    Math.floor(x)));
+                densityAttackBins[row].add(pixel);
+            }
+            continue;
+        }
         const authoredEndX = surface.xForBeat(
             Math.max(finite(entry.startBeat), finite(entry.endBeat)));
         const effectiveEndX = surface.xForBeat(entryEndBeat(entry));
         const glyph = compositeTimelineNoteGlyphMetricsPure(entry.fret);
         const fret = glyph.label;
-        const detailed = entryNeedsDetailedTimelineMarkup(view, entry);
         const metadata = entryDisplayMetadata(entry, view.stringCount, {
             detailed,
-            includeTechniques: detailed || !overviewDensity,
+            includeTechniques: true,
         });
         if (!detailed) {
             if (authoredEndX > x + 2) {
@@ -835,14 +854,10 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
             if (effectiveEndX > authoredEndX + 2) {
                 effectiveTrails.push(`M${Math.max(x, authoredEndX).toFixed(1)} ${y.toFixed(1)}H${effectiveEndX.toFixed(1)}`);
             }
-            if (overviewDensity) {
-                densityHeads.push(`M${x.toFixed(1)} ${y.toFixed(1)}h0.1`);
-            } else {
-                staticHeadPaths.push(roundedTimelineNoteHeadPath(x, y, glyph));
-                staticFretLabels.push(`<text x="${x.toFixed(1)}" data-composite-static-note="true" aria-hidden="true" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="#f8fafc" font-size="${glyph.fretFontSize}" font-weight="700">${escapeMarkup(fret)}</text>`);
-                if (metadata.badge) {
-                    staticTechniqueLabels.push(`<text x="${x.toFixed(1)}" data-composite-static-technique="true" aria-hidden="true" y="${(y - 12).toFixed(1)}" text-anchor="middle" fill="#fcd34d" font-size="${glyph.badgeFontSize}" font-weight="700">${escapeMarkup(metadata.badge)}</text>`);
-                }
+            staticHeadPaths.push(roundedTimelineNoteHeadPath(x, y, glyph));
+            staticFretLabels.push(`<text x="${x.toFixed(1)}" data-composite-static-note="true" aria-hidden="true" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="#f8fafc" font-size="${glyph.fretFontSize}" font-weight="700">${escapeMarkup(fret)}</text>`);
+            if (metadata.badge) {
+                staticTechniqueLabels.push(`<text x="${x.toFixed(1)}" data-composite-static-technique="true" aria-hidden="true" y="${(y - 12).toFixed(1)}" text-anchor="middle" fill="#fcd34d" font-size="${glyph.badgeFontSize}" font-weight="700">${escapeMarkup(metadata.badge)}</text>`);
             }
             continue;
         }
@@ -875,8 +890,19 @@ export function renderCompositeTimelineLaneContents(view, laneId, height, visibl
             ? `<path data-composite-static-trails="tremolo" d="${tremoloTrails.join('')}" fill="none" stroke="${colors.main}" stroke-width="5" stroke-linecap="round" stroke-dasharray="3 3" opacity="0.68"/>` : '')
         + (effectiveTrails.length
             ? `<path data-composite-static-trails="effective" d="${effectiveTrails.join('')}" fill="none" stroke="${colors.main}" stroke-width="3" stroke-dasharray="5 4" opacity="0.8"/>` : '');
+    const densityHeads = [];
+    if (overviewDensity) {
+        for (let row = 0; row < densityAttackBins.length; row++) {
+            const y = top + row * stringGap;
+            const pixels = [...densityAttackBins[row]].sort((a, b) => a - b);
+            for (const pixel of pixels) {
+                const x = Math.min(contentWidth, pixel + 0.5);
+                densityHeads.push(`M${x.toFixed(1)} ${y.toFixed(1)}h0.1`);
+            }
+        }
+    }
     const density = densityHeads.length
-        ? `<path data-composite-density-notes="true" aria-hidden="true" d="${densityHeads.join('')}" fill="none" stroke="${colors.main}" stroke-width="5" stroke-linecap="round"/>` : '';
+        ? `<path data-composite-density-notes="true" data-composite-density-bin-count="${densityHeads.length}" aria-hidden="true" d="${densityHeads.join('')}" fill="none" stroke="${colors.main}" stroke-width="5" stroke-linecap="round"/>` : '';
     const staticHeads = staticHeadPaths.length
         ? `<path data-composite-static-note-heads="true" aria-hidden="true" d="${staticHeadPaths.join('')}" fill="${colors.soft}" stroke="${colors.main}" stroke-width="${TIMELINE_NOTE_GLYPH.outlineWidth}"/>` : '';
     return `<rect width="${contentWidth}" height="${laneHeight}" fill="#0f172a"/>`

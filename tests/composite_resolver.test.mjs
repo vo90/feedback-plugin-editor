@@ -17,6 +17,7 @@ import {
     _compositeReviewContinueLabelPure,
     _compositeSourcePairStatePure,
     _compositeTimelineStageActivePure,
+    _compositeTimelineEffectiveZoomPure,
     _compositeTimelineZoomControlsPure,
     _compositeUniqueNamePure,
     CreateCompositeArrangementCmd,
@@ -299,11 +300,45 @@ test('Escape stops one active Hybrid preview before a separate press may close',
 });
 
 test('shared review and final-preview zoom controls restore five-pixel fine zoom', () => {
-    const html = _compositeTimelineZoomControlsPure(120);
+    const html = _compositeTimelineZoomControlsPure(
+        120, HYBRID_TIMELINE_DISPLAY_NOTES);
     assert.match(html, /id="editor-composite-time-zoom" type="range"/);
     assert.match(html, /min="5" max="480" step="5" value="120"/);
     assert.match(html, /Fine zoom in 5 px\/beat steps/);
     assert.match(html, /Normal — 120 px\/beat/);
+    assert.match(html, /id="editor-composite-time-overview" aria-pressed="false"/);
+    assert.match(html, />Whole-song overview<\/button>/);
+
+    const overview = _compositeTimelineZoomControlsPure(
+        120, HYBRID_TIMELINE_DISPLAY_OVERVIEW);
+    assert.match(overview, /id="editor-composite-time-overview" aria-pressed="true"/);
+    assert.match(overview, />Whole-song overview<\/button>/);
+    assert.match(overview, />Whole song · details hidden<\/output>/);
+    assert.match(overview, /data-composite-note-zoom-controls[^>]* hidden/);
+    assert.match(overview, /id="editor-composite-time-preset"[^>]* disabled/);
+    assert.match(overview, /id="editor-composite-time-zoom"[^>]* disabled/);
+    assert.match(overview, /data-composite-time-zoom="out"[^>]* disabled/);
+    assert.match(overview, /data-composite-time-zoom="in"[^>]* disabled/);
+    assert.doesNotMatch(overview, /aria-disabled/,
+        'native disabled state cannot become stale after leaving Overview');
+});
+
+test('explicit Overview computes fit without changing the saved note zoom', () => {
+    const context = { startBeat: 0, endBeat: 100 };
+    const notes = {
+        timelineZoom: 120,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
+    };
+    const overview = {
+        ...notes,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+    };
+    assert.equal(_compositeTimelineEffectiveZoomPure(context, 1200, notes), 120);
+    const narrow = _compositeTimelineEffectiveZoomPure(context, 900, overview);
+    const wide = _compositeTimelineEffectiveZoomPure(context, 1500, overview);
+    assert.ok(wide > narrow, 'Overview recomputes its fit when the workspace grows');
+    assert.equal(overview.timelineZoom, 120,
+        'computed fit never replaces the remembered Notes zoom');
 });
 
 test('Hybrid audition exposes the three level-matched local guitar programs', () => {
