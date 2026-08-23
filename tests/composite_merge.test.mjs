@@ -6,6 +6,7 @@ import {
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     COMPOSITE_TIMING_TOLERANCE_MIN_SECONDS,
     compositeCompatibility,
+    compositeCollisionReason,
     compositeTimingToleranceSeconds,
     materializeCompositeArrangement,
     prepareCompositeSources,
@@ -400,6 +401,72 @@ test('custom resolution refuses cross-source same-string collisions', () => {
     assert.equal(resolveCompositeConflict(plan, conflict.id, 'custom', both.map(e => e.id)).ok, false);
     assert.equal(conflict.resolution, null);
     assert.equal(resolveCompositeConflict(plan, conflict.id, 'secondary').ok, true);
+});
+
+function entrySources(entry) {
+    return new Set(entry.sources?.length ? entry.sources : [entry.source].filter(Boolean));
+}
+
+function legacyFirstCollision(entries, timeline) {
+    for (let leftIndex = 0; leftIndex < entries.length; leftIndex++) {
+        for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex++) {
+            const left = entries[leftIndex];
+            const right = entries[rightIndex];
+            const leftSources = entrySources(left);
+            if ([...entrySources(right)].some(source => leftSources.has(source))) continue;
+            if (compositeCollisionReason(left, right, timeline)) {
+                return [left.id, right.id];
+            }
+        }
+    }
+    return null;
+}
+
+test('indexed selection validation preserves exhaustive first-conflict ordering', () => {
+    let state = 0x5eed1234;
+    const random = () => {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        return state / 0x100000000;
+    };
+    for (let sample = 0; sample < 250; sample++) {
+        const entries = Array.from({ length: 8 + Math.floor(random() * 32) }, (_, index) => {
+            const startBeat = Math.floor(random() * 300) / 20;
+            const duration = random() < 0.2 ? 0 : Math.floor(random() * 60) / 20;
+            const source = random() < 0.5 ? 'primary' : 'secondary';
+            return {
+                id: `random:${sample}:${index}`,
+                source,
+                sources: random() < 0.08 ? ['primary', 'secondary'] : [source],
+                startBeat,
+                endBeat: startBeat + duration,
+                effectiveEndBeat: startBeat + Math.max(duration, 1e-4),
+                string: Math.floor(random() * 6),
+                fret: Math.floor(random() * 13),
+            };
+        });
+        // Input order is deliberately unrelated to time. The optimized sweep
+        // must still return the same lexicographically first pair as the old
+        // nested resolver because that pair determines transition messaging.
+        for (let index = entries.length - 1; index > 0; index--) {
+            const target = Math.floor(random() * (index + 1));
+            [entries[index], entries[target]] = [entries[target], entries[index]];
+        }
+        const expected = legacyFirstCollision(entries, beats);
+        const actual = validateCompositeSelection(entries, beats);
+        assert.deepEqual(actual.ok ? null : actual.entryIds, expected, `sample ${sample}`);
+    }
+});
+
+test('duplicate indexing remains one-to-one across a long repeated position', () => {
+    const count = 2000;
+    const primary = arr('Lead', Array.from({ length: count }, (_, index) =>
+        timeNote(index * 0.02, 1, 7, 0.005, { palm_mute: true })));
+    const secondary = arr('Rhythm', Array.from({ length: count }, (_, index) =>
+        timeNote(index * 0.02 + 0.001, 1, 7, 0.005, { palm_mute: true })));
+    const prepared = prepareCompositeSources({ primary, secondary, beats });
+    assert.equal(prepared.duplicates.length, count);
+    assert.equal(prepared.uniqueSecondaryEntries.length, 0);
+    assert.equal(new Set(prepared.duplicates.map(pair => pair.primary.id)).size, count);
 });
 
 test('materialization performs a final whole-arrangement playability check', () => {

@@ -11,6 +11,7 @@ import { _playabilityLintPure } from '../playability-lint.js';
 import { analyzeGapFillComposite, normalizeCompositeGapFillOptions } from './gap-fill-engine.js';
 import {
     COMPOSITE_BEAT_EPS,
+    COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     compositeEntryHasSource,
     compositeResolvedEntries,
     compositeTimingToleranceSeconds,
@@ -46,6 +47,8 @@ const SEMANTIC_NOTE_FIELDS = new Set([
     'time', 'string', 'fret', 'sustain', 'sus', 'beat', 'beatEnd', 'techniques',
     '_fn', '_fromChord', '_chordId',
 ]);
+
+const experimentalPlayabilityCache = new WeakMap();
 
 function clone(value) {
     if (value == null) return value;
@@ -200,17 +203,42 @@ export function classifyExperimentalDuplicates(prepared, beats = []) {
     for (const entry of primaryEntries) {
         const key = `${entry.string}:${entry.fret}`;
         if (!byPosition.has(key)) byPosition.set(key, []);
-        byPosition.get(key).push(entry);
+        byPosition.get(key).push({
+            entry,
+            startTime: timeOf(beats, entry.startBeat),
+        });
+    }
+    for (const list of byPosition.values()) {
+        list.sort((left, right) => left.startTime - right.startTime
+            || compareEntries(left.entry, right.entry));
     }
     const semanticSecondaryIds = new Set();
     for (const secondary of secondaryEntries) {
         if (strictSecondaryIds.has(secondary.id)) continue;
-        const candidates = (byPosition.get(`${secondary.string}:${secondary.fret}`) || [])
-            .filter(primary => !usedPrimaryIds.has(primary.id)
-                && semanticDuplicate(primary, secondary, beats))
-            .sort((left, right) => entryTimingDistance(left, secondary, beats)
-                - entryTimingDistance(right, secondary, beats) || compareEntries(left, right));
-        const primary = candidates[0];
+        const positionEntries = byPosition.get(`${secondary.string}:${secondary.fret}`) || [];
+        const secondaryStartTime = timeOf(beats, secondary.startBeat);
+        const from = Number.isFinite(secondaryStartTime)
+            ? lowerBound(positionEntries,
+                secondaryStartTime - COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS - 1e-9,
+                candidate => candidate.startTime)
+            : 0;
+        let primary = null;
+        let primaryDistance = Infinity;
+        for (let index = from; index < positionEntries.length; index++) {
+            const candidateRecord = positionEntries[index];
+            if (Number.isFinite(secondaryStartTime) && Number.isFinite(candidateRecord.startTime)
+                && candidateRecord.startTime
+                    > secondaryStartTime + COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS + 1e-9) break;
+            const candidate = candidateRecord.entry;
+            if (usedPrimaryIds.has(candidate.id)
+                || !semanticDuplicate(candidate, secondary, beats)) continue;
+            const distance = entryTimingDistance(candidate, secondary, beats);
+            if (!primary || distance < primaryDistance
+                || distance === primaryDistance && compareEntries(candidate, primary) < 0) {
+                primary = candidate;
+                primaryDistance = distance;
+            }
+        }
         if (!primary) continue;
         usedPrimaryIds.add(primary.id);
         semanticSecondaryIds.add(secondary.id);
@@ -861,10 +889,11 @@ function passageForTime(passages, beat) {
         && beat <= passage.endBeat + COMPOSITE_BEAT_EPS) || null;
 }
 
-function differentialPlayability(primaryEntries, hybridEntries, beats, passages = [], anchors = []) {
-    const primaryNotes = entriesToNotes(primaryEntries, beats);
+function differentialPlayability(primaryEntries, hybridEntries, beats, passages = [], anchors = [],
+    inheritedIssues = null) {
     const hybridNotes = entriesToNotes(hybridEntries, beats);
-    const inherited = _playabilityLintPure(primaryNotes, anchors);
+    const inherited = inheritedIssues || _playabilityLintPure(
+        entriesToNotes(primaryEntries, beats), anchors);
     const inheritedSignatures = new Set(inherited.map(issueSignature));
     const all = _playabilityLintPure(hybridNotes, anchors);
     const selectedIds = new Set(hybridEntries.map(entry => entry.id));
@@ -948,12 +977,14 @@ export function experimentalPassageOutcome(plan, passageOrId) {
     };
 }
 
+// Formatting is deliberately pure. Call refreshExperimentalPlayability after
+// a resolution change, then reuse that result for UI and report rendering.
 export function experimentalComparisonReport(plan) {
     const standard = plan && plan.standardComparison;
     if (!plan || !standard) return '';
-    refreshExperimentalPlayability(plan);
     const sync = plan.sync || {};
     const outcome = plan.reviewOutcome || {};
+    const playability = plan.playability || { newWarnings: [] };
     const passageLines = (plan.passages || []).map((passage, index) => {
         const outcome = experimentalPassageOutcome(plan, passage);
         const reasons = passage.reasons?.length ? passage.reasons.join('; ') : 'clean handoffs';
@@ -968,18 +999,20 @@ export function experimentalComparisonReport(plan) {
         `Standard Automatic: ${standard.secondaryAddedCleanly} fill notes added; ${standard.secondarySkippedByStrategy} left out`,
         `Experimental: ${plan.stats.secondaryAddedCleanly} fill notes added automatically; ${outcome.acceptedNotes || 0} added after review; ${(plan.stats.secondarySkippedByStrategy || 0) + (outcome.leftOutNotes || 0)} left out`,
         `Passages: ${plan.stats.addedPassages} automatic, ${plan.stats.reviewPassages} review, ${plan.stats.leftOutPassages} left out`,
-        `New playability warnings versus the base track: ${plan.playability.newWarnings.length}`,
+        `New playability warnings versus the base track: ${playability.newWarnings.length}`,
         ...(passageLines.length ? ['Passage details:', ...passageLines] : []),
     ].join('\n');
 }
 
-export function refreshExperimentalPlayability(plan) {
-    if (!plan || !plan.ok || plan.strategy !== 'experimental') return null;
-    plan.playability = differentialPlayability(
-        plan.sourceEntries?.primary || [], compositeResolvedEntries(plan), plan.beats || [],
-        plan.passages || [], plan.primary?.anchors_user?.length
-            ? plan.primary.anchors_user : plan.primary?.anchors || [],
-    );
+function experimentalResolutionSignature(plan) {
+    return (plan.conflicts || []).map(conflict => [
+        conflict.id,
+        conflict.resolution || '',
+        ...(conflict.selectedEntryIds || []).slice().sort(),
+    ].join(':')).join('|');
+}
+
+function experimentalReviewOutcome(plan) {
     const acceptedIds = new Set();
     for (const conflict of plan.conflicts || []) {
         const secondaryIds = new Set((conflict.secondaryEntries || []).map(entry => entry.id));
@@ -987,12 +1020,38 @@ export function refreshExperimentalPlayability(plan) {
             if (secondaryIds.has(id)) acceptedIds.add(id);
         }
     }
-    plan.reviewOutcome = {
+    return {
         offeredNotes: Number(plan.stats?.secondaryReviewable) || 0,
         acceptedNotes: acceptedIds.size,
         leftOutNotes: Math.max(0,
             (Number(plan.stats?.secondaryReviewable) || 0) - acceptedIds.size),
     };
+}
+
+export function refreshExperimentalPlayability(plan) {
+    if (!plan || !plan.ok || plan.strategy !== 'experimental') return null;
+    const resolutionSignature = experimentalResolutionSignature(plan);
+    const cached = experimentalPlayabilityCache.get(plan);
+    if (cached?.resolutionSignature === resolutionSignature) {
+        plan.playability = cached.playability;
+        plan.reviewOutcome = cached.reviewOutcome;
+        return cached.playability;
+    }
+    const anchors = plan.primary?.anchors_user?.length
+        ? plan.primary.anchors_user : plan.primary?.anchors || [];
+    const inherited = cached?.inherited || _playabilityLintPure(
+        entriesToNotes(plan.sourceEntries?.primary || [], plan.beats || []), anchors);
+    plan.playability = differentialPlayability(
+        plan.sourceEntries?.primary || [], compositeResolvedEntries(plan), plan.beats || [],
+        plan.passages || [], anchors, inherited,
+    );
+    plan.reviewOutcome = experimentalReviewOutcome(plan);
+    experimentalPlayabilityCache.set(plan, {
+        resolutionSignature,
+        inherited,
+        playability: plan.playability,
+        reviewOutcome: plan.reviewOutcome,
+    });
     return plan.playability;
 }
 
@@ -1044,8 +1103,6 @@ export function analyzeExperimentalAutoComposite({
     const reviewPassages = passages.filter(passage => passage.status === 'review');
     const leftOutPassages = passages.filter(passage => passage.status === 'left-out');
     const fixedEntries = [...classified.primaryEntries, ...automaticEntries].sort(compareEntries);
-    const playability = differentialPlayability(classified.primaryEntries, fixedEntries, beats,
-        passages, primary?.anchors_user?.length ? primary.anchors_user : primary?.anchors || []);
     const conflicts = reviewPassages.map(conflictForPassage);
     const stats = {
         primaryNotes: classified.primaryEntries.length,
@@ -1084,11 +1141,13 @@ export function analyzeExperimentalAutoComposite({
         gestures,
         passages,
         sync,
-        playability,
+        playability: null,
+        reviewOutcome: null,
         standardPlan,
         standardComparison: clone(standardPlan.stats),
         stats,
     };
+    refreshExperimentalPlayability(plan);
     plan.comparisonReport = experimentalComparisonReport(plan);
     return plan;
 }

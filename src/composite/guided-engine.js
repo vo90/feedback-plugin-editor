@@ -13,6 +13,7 @@ import {
     compositeCollisionReason,
     compositeEntryHasSource,
     compositeTimingToleranceSeconds,
+    forEachCompositeSelectionCollision,
     prepareCompositeSources,
     resolveCompositeConflict,
 } from './merge-engine.js';
@@ -20,6 +21,11 @@ import {
 export const GUIDED_MAX_REVIEW_BARS = 4;
 export const GUIDED_REPEAT_MODE_EVERY = 'every-occurrence';
 export const GUIDED_REPEAT_MODE_MATCHING = 'matching-repetitions';
+
+const repeatEntrySemanticKeyCache = new WeakMap();
+const repeatBlockFingerprintCache = new WeakMap();
+const repeatBlockEquivalenceCache = new WeakMap();
+const guidedRepeatGroupCache = new WeakMap();
 
 export function normalizeGuidedRepeatMode(value) {
     return value === GUIDED_REPEAT_MODE_MATCHING
@@ -122,11 +128,6 @@ function entryDecisionBeat(entry) {
 function entryEffectiveEnd(entry) {
     return Math.max(finite(entry && entry.startBeat), finite(entry && entry.endBeat),
         finite(entry && entry.effectiveEndBeat), finite(entry && entry.playableEndBeat));
-}
-
-function sourceSetsOverlap(left, right) {
-    return (compositeEntryHasSource(left, 'primary') && compositeEntryHasSource(right, 'primary'))
-        || (compositeEntryHasSource(left, 'secondary') && compositeEntryHasSource(right, 'secondary'));
 }
 
 function contentRange(prepared, beats) {
@@ -232,13 +233,16 @@ function buildBaseCells({ prepared, beats, sections, primary, secondary }) {
 }
 
 function cellForBeat(cells, beat) {
-    let fallback = cells.at(-1) || null;
-    for (const cell of cells) {
-        if (beat < cell.startBeat - COMPOSITE_BEAT_EPS) return cell;
-        if (beat < cell.endBeat - COMPOSITE_BEAT_EPS || near(beat, cell.startBeat)) return cell;
-        fallback = cell;
+    if (!cells.length) return null;
+    let low = 0;
+    let high = cells.length;
+    const inclusiveBeat = beat + COMPOSITE_BEAT_EPS;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (cells[middle].startBeat <= inclusiveBeat) low = middle + 1;
+        else high = middle;
     }
-    return fallback;
+    return cells[Math.max(0, Math.min(cells.length - 1, low - 1))];
 }
 
 function classifyCell(cell) {
@@ -279,23 +283,17 @@ function populateCells(cells, prepared) {
         if (cell.kind === 'primary-only') automaticEntries.push(...cell.primaryEntries);
         if (cell.kind === 'secondary-only') automaticEntries.push(...cell.secondaryEntries);
     }
-    for (let leftIndex = 0; leftIndex < automaticEntries.length; leftIndex++) {
-        const left = automaticEntries[leftIndex];
-        for (let rightIndex = leftIndex + 1; rightIndex < automaticEntries.length; rightIndex++) {
-            const right = automaticEntries[rightIndex];
-            if (left.string !== right.string || sourceSetsOverlap(left, right)) continue;
-            if (!compositeCollisionReason(left, right, prepared.beats)) continue;
-            const leftCell = cellByEntryId.get(left.id);
-            const rightCell = cellByEntryId.get(right.id);
-            if (!leftCell || !rightCell) continue;
-            const from = Math.min(leftCell.index, rightCell.index);
-            const to = Math.max(leftCell.index, rightCell.index);
-            for (let index = from; index <= to; index++) {
-                cells[index].forcedReview = true;
-                cells[index].transitionReview = true;
-            }
+    forEachCompositeSelectionCollision(automaticEntries, prepared.beats, (left, right) => {
+        const leftCell = cellByEntryId.get(left.id);
+        const rightCell = cellByEntryId.get(right.id);
+        if (!leftCell || !rightCell) return;
+        const from = Math.min(leftCell.index, rightCell.index);
+        const to = Math.max(leftCell.index, rightCell.index);
+        for (let index = from; index <= to; index++) {
+            cells[index].forcedReview = true;
+            cells[index].transitionReview = true;
         }
-    }
+    });
     for (const cell of cells) cell.kind = classifyCell(cell);
 }
 
@@ -363,8 +361,11 @@ function repeatChoiceEntries(block, lane) {
 }
 
 function entrySemanticKey(entry) {
+    if (entry && typeof entry === 'object' && repeatEntrySemanticKeyCache.has(entry)) {
+        return repeatEntrySemanticKeyCache.get(entry);
+    }
     const target = entry.connectedTarget;
-    return stable({
+    const key = stable({
         string: entry.string,
         fret: entry.fret,
         technique: entry.techniqueSignature,
@@ -374,19 +375,28 @@ function entrySemanticKey(entry) {
             technique: target.techniqueSignature,
         } : null,
     });
+    if (entry && typeof entry === 'object') repeatEntrySemanticKeyCache.set(entry, key);
+    return key;
 }
 
 function blockRepeatFingerprint(block) {
+    if (block && typeof block === 'object' && repeatBlockFingerprintCache.has(block)) {
+        return repeatBlockFingerprintCache.get(block);
+    }
     // This is only a conservative bucket before the tempo-aware exact match.
     // Sort semantic keys as a multiset so imported attacks straddling a bar
     // boundary by a few milliseconds cannot change their fingerprint order.
     const semanticKeys = lane => repeatChoiceEntries(block, lane)
         .map(entrySemanticKey).sort();
-    return stable({
+    const fingerprint = stable({
         cells: (block.cells || []).map(cell => !!cell.barBoundary),
         primary: semanticKeys('primary'),
         secondary: semanticKeys('secondary'),
     });
+    if (block && typeof block === 'object') {
+        repeatBlockFingerprintCache.set(block, fingerprint);
+    }
+    return fingerprint;
 }
 
 function localBeatTolerance(beats, beat) {
@@ -478,21 +488,66 @@ function repeatBlocksEquivalent(left, right, beats) {
             repeatChoiceEntries(right, 'secondary'), left.startBeat, right.startBeat, beats);
 }
 
+function repeatBlocksEquivalentCached(left, right, beats) {
+    if (!left || !right) return false;
+    let rightByLeft = repeatBlockEquivalenceCache.get(left);
+    if (!rightByLeft) {
+        rightByLeft = new WeakMap();
+        repeatBlockEquivalenceCache.set(left, rightByLeft);
+    }
+    if (rightByLeft.has(right)) return rightByLeft.get(right);
+    const equivalent = repeatBlocksEquivalent(left, right, beats);
+    rightByLeft.set(right, equivalent);
+    let leftByRight = repeatBlockEquivalenceCache.get(right);
+    if (!leftByRight) {
+        leftByRight = new WeakMap();
+        repeatBlockEquivalenceCache.set(right, leftByRight);
+    }
+    leftByRight.set(left, equivalent);
+    return equivalent;
+}
+
+function repeatDetachedSignature(conflicts) {
+    return conflicts.map(block => `${block.id}:${block.repeatDetached ? 1 : 0}`).join('|');
+}
+
+function updateGuidedRepeatStats(plan, groups, blockById) {
+    const unresolvedGroups = groups.filter(group => group.memberIds.some(id => {
+        const block = blockById.get(id);
+        return block && !block.resolution;
+    })).length;
+    plan.stats.reviewDecisions = groups.length;
+    plan.stats.repeatedOccurrences = Math.max(0, (plan.conflicts || []).length - groups.length);
+    plan.stats.unresolvedReviewDecisions = unresolvedGroups;
+    plan.stats.unresolvedConflicts = (plan.conflicts || []).filter(block => !block.resolution).length;
+}
+
 export function refreshGuidedRepeatGroups(plan) {
     if (!plan || plan.strategy !== 'guided') return [];
-    const matching = normalizeGuidedRepeatMode(plan.repeatMode) === GUIDED_REPEAT_MODE_MATCHING;
+    const conflicts = plan.conflicts || [];
+    const repeatMode = normalizeGuidedRepeatMode(plan.repeatMode);
+    const detachedSignature = repeatDetachedSignature(conflicts);
+    const cached = guidedRepeatGroupCache.get(plan);
+    if (cached && cached.conflicts === conflicts && cached.repeatMode === repeatMode
+        && cached.detachedSignature === detachedSignature) {
+        plan.repeatGroups = cached.groups;
+        updateGuidedRepeatStats(plan, cached.groups, cached.blockById);
+        return cached.groups;
+    }
+    const matching = repeatMode === GUIDED_REPEAT_MODE_MATCHING;
     const groups = [];
-    for (const block of plan.conflicts || []) {
+    const blockById = new Map(conflicts.map(block => [block.id, block]));
+    const blockGroupById = new Map();
+    const groupsByFingerprint = new Map();
+    const representativeByGroupId = new Map();
+    for (const block of conflicts) {
         block.repeatFingerprint = blockRepeatFingerprint(block);
         let group = null;
         if (matching && !block.repeatDetached) {
-            group = groups.find(candidate => !candidate.detached
-                && candidate.fingerprint === block.repeatFingerprint
-                && repeatBlocksEquivalent(
-                    plan.conflicts.find(item => item.id === candidate.representativeId),
-                    block,
-                    plan.beats,
-                ));
+            group = (groupsByFingerprint.get(block.repeatFingerprint) || [])
+                .find(candidate => !candidate.detached
+                    && repeatBlocksEquivalentCached(
+                        representativeByGroupId.get(candidate.id), block, plan.beats));
         }
         if (!group) {
             group = {
@@ -503,19 +558,26 @@ export function refreshGuidedRepeatGroups(plan) {
                 detached: !!block.repeatDetached,
             };
             groups.push(group);
+            representativeByGroupId.set(group.id, block);
+            if (!groupsByFingerprint.has(group.fingerprint)) {
+                groupsByFingerprint.set(group.fingerprint, []);
+            }
+            groupsByFingerprint.get(group.fingerprint).push(group);
         }
         group.memberIds.push(block.id);
         block.repeatGroupId = group.id;
+        blockGroupById.set(block.id, group);
     }
     plan.repeatGroups = groups;
-    const unresolvedGroups = groups.filter(group => group.memberIds.some(id => {
-        const block = plan.conflicts.find(candidate => candidate.id === id);
-        return block && !block.resolution;
-    })).length;
-    plan.stats.reviewDecisions = groups.length;
-    plan.stats.repeatedOccurrences = Math.max(0, (plan.conflicts || []).length - groups.length);
-    plan.stats.unresolvedReviewDecisions = unresolvedGroups;
-    plan.stats.unresolvedConflicts = (plan.conflicts || []).filter(block => !block.resolution).length;
+    guidedRepeatGroupCache.set(plan, {
+        conflicts,
+        repeatMode,
+        detachedSignature,
+        groups,
+        blockById,
+        blockGroupById,
+    });
+    updateGuidedRepeatStats(plan, groups, blockById);
     return groups;
 }
 
@@ -528,7 +590,7 @@ export function guidedRepeatGroupForBlock(plan, blockOrId) {
     if (!plan || plan.strategy !== 'guided') return null;
     const blockId = typeof blockOrId === 'string' ? blockOrId : blockOrId && blockOrId.id;
     refreshGuidedRepeatGroups(plan);
-    return plan.repeatGroups.find(group => group.memberIds.includes(blockId)) || null;
+    return guidedRepeatGroupCache.get(plan)?.blockGroupById.get(blockId) || null;
 }
 
 function blocksForRepeatGroup(plan, group) {

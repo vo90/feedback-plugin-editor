@@ -185,6 +185,17 @@ function near(a, b) {
     return Math.abs(a - b) <= COMPOSITE_BEAT_EPS;
 }
 
+function lowerBound(list, value, getter = item => item) {
+    let low = 0;
+    let high = list.length;
+    while (low < high) {
+        const middle = (low + high) >> 1;
+        if (getter(list[middle]) < value) low = middle + 1;
+        else high = middle;
+    }
+    return low;
+}
+
 function normalizeTinySourceBoundaries(entries, beats, { preserveConnections = false } = {}) {
     const byString = new Map();
     for (const entry of entries) {
@@ -391,22 +402,43 @@ export function prepareCompositeSources({ primary, secondary, beats = [] } = {})
     for (const entry of primaryEntries) {
         const key = `${entry.string}:${entry.fret}`;
         if (!primaryByPosition.has(key)) primaryByPosition.set(key, []);
-        primaryByPosition.get(key).push(entry);
+        primaryByPosition.get(key).push({
+            entry,
+            startTime: timeOf(beats, entry.startBeat),
+        });
+    }
+    for (const list of primaryByPosition.values()) {
+        list.sort((left, right) => left.startTime - right.startTime
+            || compareEntries(left.entry, right.entry));
     }
     const usedPrimaryIds = new Set();
     const duplicates = [];
     const uniqueSecondaryEntries = [];
     for (const entry of secondaryEntries) {
-        const candidates = (primaryByPosition.get(`${entry.string}:${entry.fret}`) || [])
-            .filter(candidate => !usedPrimaryIds.has(candidate.id) && exactDuplicate(candidate, entry, beats))
-            .sort((left, right) => {
-                const leftDelta = Math.abs(timeOf(beats, left.startBeat) - timeOf(beats, entry.startBeat))
-                    + Math.abs(timeOf(beats, left.endBeat) - timeOf(beats, entry.endBeat));
-                const rightDelta = Math.abs(timeOf(beats, right.startBeat) - timeOf(beats, entry.startBeat))
-                    + Math.abs(timeOf(beats, right.endBeat) - timeOf(beats, entry.endBeat));
-                return leftDelta - rightDelta || compareEntries(left, right);
-            });
-        const duplicate = candidates[0];
+        const positionEntries = primaryByPosition.get(`${entry.string}:${entry.fret}`) || [];
+        const entryStartTime = timeOf(beats, entry.startBeat);
+        const from = Number.isFinite(entryStartTime)
+            ? lowerBound(positionEntries,
+                entryStartTime - COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS - 1e-9,
+                candidate => candidate.startTime)
+            : 0;
+        let duplicate = null;
+        let duplicateDistance = Infinity;
+        for (let index = from; index < positionEntries.length; index++) {
+            const candidateRecord = positionEntries[index];
+            if (Number.isFinite(entryStartTime) && Number.isFinite(candidateRecord.startTime)
+                && candidateRecord.startTime
+                    > entryStartTime + COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS + 1e-9) break;
+            const candidate = candidateRecord.entry;
+            if (usedPrimaryIds.has(candidate.id) || !exactDuplicate(candidate, entry, beats)) continue;
+            const distance = Math.abs(candidateRecord.startTime - entryStartTime)
+                + Math.abs(timeOf(beats, candidate.endBeat) - timeOf(beats, entry.endBeat));
+            if (!duplicate || distance < duplicateDistance
+                || distance === duplicateDistance && compareEntries(candidate, duplicate) < 0) {
+                duplicate = candidate;
+                duplicateDistance = distance;
+            }
+        }
         if (!duplicate) {
             uniqueSecondaryEntries.push(entry);
             continue;
@@ -431,6 +463,71 @@ export function prepareCompositeSources({ primary, secondary, beats = [] } = {})
         duplicates,
         timingAdjustments,
     };
+}
+
+function collisionSweepCanRetain(earlier, later, beats) {
+    if (!Number.isFinite(earlier.effectiveEndBeat)) return true;
+    if (earlier.effectiveEndBeat > later.startBeat) return true;
+    return timingNear(earlier.startBeat, later.startBeat, beats);
+}
+
+/**
+ * Visit every cross-source, same-string collision without comparing unrelated
+ * strings or notes whose playable intervals have already ended. The visitor
+ * receives entries in their original input order so callers can retain the
+ * legacy selection/error ordering even though detection is time-indexed.
+ */
+export function forEachCompositeSelectionCollision(entries, beats = [], visitor = () => {}) {
+    const selected = Array.isArray(entries) ? entries : [];
+    const byString = new Map();
+    const indexedBySweep = new Array(selected.length).fill(false);
+    for (let index = 0; index < selected.length; index++) {
+        const entry = selected[index];
+        if (!entry || !Number.isFinite(entry.startBeat)) continue;
+        if (!byString.has(entry.string)) byString.set(entry.string, []);
+        byString.get(entry.string).push({ entry, index });
+        indexedBySweep[index] = true;
+    }
+    let collisionCount = 0;
+    for (const stringEntries of byString.values()) {
+        stringEntries.sort((left, right) => left.entry.startBeat - right.entry.startBeat
+            || left.index - right.index);
+        let active = [];
+        for (const current of stringEntries) {
+            active = active.filter(previous =>
+                collisionSweepCanRetain(previous.entry, current.entry, beats));
+            for (const previous of active) {
+                if (entriesShareSource(previous.entry, current.entry)) continue;
+                const reason = compositeCollisionReason(previous.entry, current.entry, beats);
+                if (!reason) continue;
+                collisionCount++;
+                const left = previous.index < current.index ? previous : current;
+                const right = left === previous ? current : previous;
+                if (visitor(left.entry, right.entry, reason, left.index, right.index) === false) {
+                    return collisionCount;
+                }
+            }
+            active.push(current);
+        }
+    }
+    // Planner entries always have numeric beat positions. Preserve the public
+    // validator's legacy degradation for malformed/ad-hoc callers by checking
+    // only pairs the ordered sweep could not index.
+    for (let leftIndex = 0; leftIndex < selected.length; leftIndex++) {
+        for (let rightIndex = leftIndex + 1; rightIndex < selected.length; rightIndex++) {
+            if (indexedBySweep[leftIndex] && indexedBySweep[rightIndex]) continue;
+            const left = selected[leftIndex];
+            const right = selected[rightIndex];
+            if (!left || !right || entriesShareSource(left, right)) continue;
+            const reason = compositeCollisionReason(left, right, beats);
+            if (!reason) continue;
+            collisionCount++;
+            if (visitor(left, right, reason, leftIndex, rightIndex) === false) {
+                return collisionCount;
+            }
+        }
+    }
+    return collisionCount;
 }
 
 function conflictEntries(group) {
@@ -470,21 +567,23 @@ function selectionFor(group, resolution, selectedEntryIds) {
 
 export function validateCompositeSelection(entries, beats = [], stringCount = 6) {
     const selected = entries || [];
-    for (let i = 0; i < selected.length; i++) {
-        for (let j = i + 1; j < selected.length; j++) {
-            const a = selected[i];
-            const b = selected[j];
-            if (!entriesShareSource(a, b) && compositeCollisionReason(a, b, beats)) {
-                const displayString = Math.max(1, Math.trunc(finite(stringCount, 6)) - a.string);
-                const overlapMilliseconds = Math.max(1,
-                    Math.round(collisionOverlapSeconds(a, b, beats) * 1000));
-                return {
-                    ok: false,
-                    error: `String ${displayString} has source notes overlapping by ${overlapMilliseconds} ms.`,
-                    entryIds: [a.id, b.id],
-                };
-            }
+    let first = null;
+    forEachCompositeSelectionCollision(selected, beats, (a, b, reason, leftIndex, rightIndex) => {
+        if (!first || leftIndex < first.leftIndex
+            || leftIndex === first.leftIndex && rightIndex < first.rightIndex) {
+            first = { a, b, reason, leftIndex, rightIndex };
         }
+    });
+    if (first) {
+        const displayString = Math.max(1,
+            Math.trunc(finite(stringCount, 6)) - first.a.string);
+        const overlapMilliseconds = Math.max(1,
+            Math.round(collisionOverlapSeconds(first.a, first.b, beats) * 1000));
+        return {
+            ok: false,
+            error: `String ${displayString} has source notes overlapping by ${overlapMilliseconds} ms.`,
+            entryIds: [first.a.id, first.b.id],
+        };
     }
     return { ok: true, error: '' };
 }

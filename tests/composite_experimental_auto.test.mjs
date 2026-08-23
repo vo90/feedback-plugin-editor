@@ -10,6 +10,7 @@ import {
     experimentalPassageOutcome,
     experimentalSyncPreflight,
     HYBRID_EXPERIMENTAL_ENGINE_VERSION,
+    refreshExperimentalPlayability,
 } from '../src/composite/experimental-auto-engine.js';
 import { analyzeGapFillComposite } from '../src/composite/gap-fill-engine.js';
 import {
@@ -133,6 +134,22 @@ test('semantic duplicate comparison covers the complete connected destination', 
         prepareCompositeSources({ primary, secondary, beats }), beats);
     assert.equal(classified.semanticCount, 2);
     assert.equal(classified.candidateEntries.length, 0);
+});
+
+test('semantic duplicate indexing preserves one-to-one results across a long repeated part', () => {
+    const count = 1200;
+    const beats = beatGrid(3000, 0.01);
+    const primary = arrangement('Lead', Array.from({ length: count }, (_, index) =>
+        note(index * 0.02, 1, 7, 0.005, { fret_finger: 1 })));
+    const secondary = arrangement('Rhythm', Array.from({ length: count }, (_, index) =>
+        note(index * 0.02 + 0.001, 1, 7, 0.005, { fret_finger: 3 })));
+    const classified = classifyExperimentalDuplicates(
+        prepareCompositeSources({ primary, secondary, beats }), beats);
+    assert.equal(classified.strictCount, 0);
+    assert.equal(classified.semanticCount, count);
+    assert.equal(classified.candidateEntries.length, 0);
+    assert.equal(new Set(classified.duplicates.map(pair => pair.primary.id)).size, count,
+        'the time index does not allow two repeated attacks to consume one base note');
 });
 
 test('complete gesture graph keeps hammer-ons and their preceding attacks atomic', () => {
@@ -268,8 +285,13 @@ test('experimental review uses the generic safe resolver and emits a copyable re
     assert.equal(experimentalPassageOutcome(plan, conflict.id).state, 'accepted');
     const hybrid = materializeCompositeArrangement(plan, 'Hybrid');
     assert.deepEqual(hybrid.notes.map(entry => entry.fret), [3, 7, 5]);
+    const refreshed = refreshExperimentalPlayability(plan);
     assert.match(experimentalComparisonReport(plan), /Standard Automatic/);
     assert.match(experimentalComparisonReport(plan), /Experimental:/);
+    assert.strictEqual(plan.playability, refreshed,
+        'formatting the report consumes the refreshed result without replacing it');
+    assert.strictEqual(refreshExperimentalPlayability(plan), refreshed,
+        'an unchanged review resolution reuses the cached playability pass');
     assert.deepEqual(plan.reviewOutcome, {
         offeredNotes: 1, acceptedNotes: 1, leftOutNotes: 0,
     });
@@ -288,7 +310,7 @@ test('differential playability refreshes after a reviewed passage is accepted', 
     assert.equal(plan.playability.newWarnings.length, 0,
         'unresolved optional material is not blamed on the safe result');
     assert.equal(resolveCompositeConflict(plan, plan.conflicts[0].id, 'secondary').ok, true);
-    experimentalComparisonReport(plan);
+    refreshExperimentalPlayability(plan);
     assert.ok(plan.playability.newWarnings.some(issue => issue.rule === 'stretch'));
 });
 

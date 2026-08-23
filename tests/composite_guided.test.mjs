@@ -228,6 +228,29 @@ test('matching Guided repetitions become one review decision and resolve togethe
     assert.ok(plan.conflicts.every(block => block.resolution === null));
 });
 
+test('Guided repetition groups are reused until their structure changes', () => {
+    const plan = analyzeGuidedComposite({
+        primary: arrangement('Lead', [note(1, 0, 3), note(9, 0, 3)]),
+        secondary: arrangement('Rhythm', [note(1, 1, 5), note(9, 1, 5)]),
+        beats,
+        sections: [{ name: 'Chorus', number: 2, start_time: 4 }],
+        repeatMode: GUIDED_REPEAT_MODE_MATCHING,
+    });
+    const grouped = guidedReviewGroups(plan);
+    assert.strictEqual(guidedReviewGroups(plan), grouped,
+        'render-time lookups reuse fingerprint and exact-match work');
+    assert.equal(resolveGuidedRepeatGroup(plan, plan.conflicts[0].id, 'primary').ok, true);
+    assert.strictEqual(guidedReviewGroups(plan), grouped,
+        'resolution-only changes update counters without regrouping immutable blocks');
+    assert.equal(plan.stats.unresolvedReviewDecisions, 0);
+
+    plan.repeatMode = GUIDED_REPEAT_MODE_EVERY;
+    const separated = guidedReviewGroups(plan);
+    assert.notStrictEqual(separated, grouped);
+    assert.equal(separated.length, 2);
+    assert.strictEqual(guidedReviewGroups(plan), separated);
+});
+
 test('shared automatic notes may differ without creating a second review decision', () => {
     const sharedOnlyInSecondOccurrence = note(8, 0, 0, 0.5, { palm_mute: true });
     const plan = analyzeGuidedComposite({

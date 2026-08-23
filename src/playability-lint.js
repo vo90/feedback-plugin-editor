@@ -115,17 +115,28 @@ export function _lintOverlapPure(nn) {
     });
     for (const list of byString.values()) {
         list.sort((a, b) => a.n.time - b.n.time);
-        for (let k = 1; k < list.length; k++) {
+        let active = [];
+        for (let k = 0; k < list.length; k++) {
             const cur = list[k];
-            // Scan EVERY still-active predecessor, not just the immediate one:
-            // a long sustain (t=1..6) overlaps attacks at t=2 AND t=3, and the
-            // second conflict is just as real (CodeRabbit, #200).
-            for (let j = k - 1; j >= 0; j--) {
-                const prev = list[j];
+            // Retain every still-active predecessor, not just the immediate
+            // one: a long sustain (t=1..6) overlaps attacks at t=2 AND t=3.
+            // Expired predecessors can never overlap this or a later attack,
+            // so dropping them avoids a full same-string history scan.
+            active = active.filter(prev =>
+                prev.n.time + (Number(prev.n.sustain) || 0) - cur.n.time
+                    > LINT_OVERLAP_EPSILON);
+            const immediate = k > 0 ? list[k - 1] : null;
+            const immediateIsActive = immediate && active.includes(immediate);
+            const immediateSameInstant = immediate
+                && Math.abs(cur.n.time - immediate.n.time) < LINT_CLUSTER_EPSILON;
+            if (immediateSameInstant && !immediateIsActive) active.push(immediate);
+            // Active entries preserve onset order. Walk newest to oldest to
+            // retain the legacy issue ordering exactly.
+            for (let j = active.length - 1; j >= 0; j--) {
+                const prev = active[j];
                 const prevEnd = prev.n.time + (Number(prev.n.sustain) || 0);
                 const overlap = prevEnd - cur.n.time;
-                const sameInstant = j === k - 1
-                    && Math.abs(cur.n.time - prev.n.time) < LINT_CLUSTER_EPSILON;
+                const sameInstant = prev === immediate && immediateSameInstant;
                 if (overlap > LINT_OVERLAP_EPSILON || sameInstant) {
                     issues.push({
                         rule: 'overlap', time: cur.n.time,
@@ -136,6 +147,8 @@ export function _lintOverlapPure(nn) {
                     });
                 }
             }
+            if (immediateSameInstant && !immediateIsActive) active.pop();
+            active.push(cur);
         }
     }
     return issues;
