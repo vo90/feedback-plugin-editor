@@ -119,6 +119,7 @@ import {
     HYBRID_TIMELINE_ZOOM_CONTROL_MIN,
     HYBRID_TIMELINE_ZOOM_MAX,
     HYBRID_TIMELINE_ZOOM_STEP,
+    createHybridPreferenceWriter,
     hybridGapFillPreferencesPure,
     hybridGuidedPreferencesPure,
     hybridExperimentalPreferencesPure,
@@ -166,6 +167,9 @@ export const HYBRID_DIALOG_STYLE = [
 
 const hybridSession = createHybridBuilderSession();
 let hybridPreviewPreferences = hybridPreviewPreferencesPure(null);
+const hybridPreviewPreferenceWriter = createHybridPreferenceWriter(
+    preferences => saveHybridPreviewPreferences(preferences),
+);
 let timelineViewportFrame = 0;
 let timelinePlayheadFrame = 0;
 let timelineZoomFrame = 0;
@@ -181,6 +185,36 @@ let dialogResizeSaveTimer = 0;
 let timelineViewCache = null;
 let timelineViewportDom = null;
 let compositeModalDocumentKeydown = null;
+const COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES = new Set([
+    'button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio',
+    'range', 'reset', 'submit',
+]);
+
+function setHybridPreviewPreferences(preferences, { deferred = false } = {}) {
+    // Normalization is intentionally separate from persistence: sliders and
+    // drags must update playback/layout immediately without synchronously
+    // serializing localStorage for every pointer event.
+    hybridPreviewPreferences = hybridPreviewPreferencesPure(preferences);
+    if (deferred) {
+        hybridPreviewPreferenceWriter.schedule(hybridPreviewPreferences);
+    } else {
+        // A discrete save supersedes any older debounced snapshot. Cancelling
+        // first prevents that stale snapshot from overwriting the newer tone,
+        // Follow, or layout choice later.
+        hybridPreviewPreferenceWriter.cancel();
+        hybridPreviewPreferences = saveHybridPreviewPreferences(hybridPreviewPreferences);
+    }
+    return hybridPreviewPreferences;
+}
+
+function flushHybridPreviewPreferences() {
+    const saved = hybridPreviewPreferenceWriter.flush();
+    if (saved) hybridPreviewPreferences = saved;
+    // flush() already clears its timer and pending value. cancel() makes the
+    // lifecycle guarantee explicit if the writer implementation changes.
+    hybridPreviewPreferenceWriter.cancel();
+    return hybridPreviewPreferences;
+}
 
 function stopCompositeModalDocumentKeyboard() {
     if (!compositeModalDocumentKeydown || typeof document === 'undefined') return;
@@ -428,7 +462,7 @@ export function _compositeTimelineStageActivePure(stage) {
 
 export function _compositeModalShortcutPure({
     key = '', editable = false, modified = false, stage = 'review',
-    previewActive = false, repeat = false, nativeActivation = false,
+    previewActive = false, repeat = false, spaceEditable = editable,
 } = {}) {
     // The Hybrid modal's generic keyboard trap closes on Escape. Consume the
     // first Escape here while auditioning so it behaves as Stop instead. A held
@@ -436,12 +470,17 @@ export function _compositeModalShortcutPure({
     // repeats must also stay consumed; a new physical press can then close.
     if (key === 'Escape' && repeat && !modified) return { kind: 'consume' };
     if (key === 'Escape' && previewActive && !modified) return { kind: 'stop-preview' };
-    if (editable || modified) return null;
+    if (modified) return null;
+    if (key === ' ') {
+        if (spaceEditable) return null;
+        return repeat ? { kind: 'consume' } : { kind: 'play-toggle' };
+    }
+    // Preserve arrows and character input for select/range/text controls. Only
+    // Space is deliberately uniform across non-text modal controls.
+    if (editable) return null;
     const modes = { '1': 'song', '2': 'primary', '3': 'secondary', '4': 'result' };
-    if (repeat && (key === ' ' || modes[key])) return { kind: 'consume' };
+    if (repeat && modes[key]) return { kind: 'consume' };
     if (modes[key]) return { kind: 'preview', mode: modes[key] };
-    if (key === ' ') return nativeActivation
-        ? { kind: 'native-activation' } : { kind: 'play-toggle' };
     if (stage === 'review' && key === 'ArrowLeft') return { kind: 'previous' };
     if (stage === 'review' && key === 'ArrowRight') return { kind: 'next' };
     if (stage === 'review' && key === 'Home') return { kind: 'focus-review' };
@@ -452,11 +491,21 @@ function byId(id) {
     return document.getElementById(id);
 }
 
-function compositeModalNativeActivationTarget(target) {
-    const control = target?.closest?.('button, summary');
-    return !!(control && control.isConnected && !control.disabled
-        && control.id !== 'editor-composite-timeline-map'
-        && !control.closest?.('[hidden], [inert]'));
+function compositeModalTextEditingTarget(target) {
+    if (!target) return false;
+    if (target.isContentEditable) return true;
+    if (target.matches?.('textarea')) return true;
+    if (!target.matches?.('input')) return false;
+    // Range, checkbox, and button-like inputs are modal controls, not text
+    // editors. Space therefore remains the same transport key whether focus is
+    // on one of those controls, a <select>, <button>, or <summary>.
+    return !COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES.has(
+        String(target.type || 'text').toLowerCase());
+}
+
+function compositeModalControlEditingTarget(target) {
+    return compositeModalTextEditingTarget(target)
+        || !!target?.matches?.('input, select, textarea');
 }
 
 function compositeModalVisibleFocusTarget(modal = byId('editor-composite-modal')) {
@@ -653,6 +702,7 @@ function restoreCompositePreviewSession() {
 }
 
 function clearTransientState() {
+    flushHybridPreviewPreferences();
     hybridSession.closeDecisionResolve?.('discard');
     stopCompositeModalDocumentKeyboard();
     stopHybridDialogSizePersistence();
@@ -1379,7 +1429,7 @@ function bindResultEvents() {
             : 'Whole-song loop is off. Playback stops at the end of the song.');
     });
     byId('editor-composite-preview-tone')?.addEventListener('change', event => {
-        hybridPreviewPreferences = saveHybridPreviewPreferences({
+        setHybridPreviewPreferences({
             ...hybridPreviewPreferences,
             tone: event.target.value,
         });
@@ -1392,14 +1442,16 @@ function bindResultEvents() {
         }
     });
     byId('editor-composite-preview-volume')?.addEventListener('input', event => {
-        hybridPreviewPreferences = saveHybridPreviewPreferences({
+        setHybridPreviewPreferences({
             ...hybridPreviewPreferences,
             volume: event.target.value,
-        });
+        }, { deferred: true });
         const value = byId('editor-composite-preview-volume-value');
         if (value) value.textContent = `${hybridPreviewPreferences.volume}%`;
         updateActiveHybridPreviewMix();
     });
+    byId('editor-composite-preview-volume')?.addEventListener(
+        'change', flushHybridPreviewPreferences);
     for (const button of result.querySelectorAll('[data-resolution]')) {
         button.addEventListener('click', () => {
             const conflict = hybridSession.plan.conflicts[hybridSession.conflictIndex];
@@ -2368,7 +2420,8 @@ function seekCompositeTimelineAtTime(rawTime, {
     return time;
 }
 
-function applyCompositeTimelineZoom(nextZoom, anchorX = null, forceStart = false) {
+function applyCompositeTimelineZoom(nextZoom, anchorX = null, forceStart = false,
+    flushPreference = false) {
     const view = currentTimelineView();
     const scroller = byId('editor-composite-timeline-scroller');
     const content = byId('editor-composite-timeline-content');
@@ -2399,9 +2452,10 @@ function applyCompositeTimelineZoom(nextZoom, anchorX = null, forceStart = false
             anchorX: anchor,
             viewportWidth: scroller.clientWidth,
         });
-    hybridPreviewPreferences = saveHybridPreviewPreferences({
+    setHybridPreviewPreferences({
         ...hybridPreviewPreferences, timelineZoom: next.zoom,
-    });
+    }, { deferred: true });
+    if (flushPreference) flushHybridPreviewPreferences();
     const nextContentWidth = compositeTimelineContentWidthPure(view.context, next.zoom);
     content.style.width = `${nextContentWidth}px`;
     if (dom) {
@@ -2422,15 +2476,16 @@ function pendingCompositeTimelineZoom() {
 
 // Slider and wheel input can fire much faster than the display. Keep the most
 // recent request and rebuild the three aligned lanes at most once per frame.
-function scheduleCompositeTimelineZoom(zoom, anchorX = null, forceStart = false) {
-    timelinePendingZoom = { zoom, anchorX, forceStart };
+function scheduleCompositeTimelineZoom(zoom, anchorX = null, forceStart = false,
+    flushPreference = false) {
+    timelinePendingZoom = { zoom, anchorX, forceStart, flushPreference };
     if (timelineZoomFrame) return;
     timelineZoomFrame = requestAnimationFrame(() => {
         timelineZoomFrame = 0;
         const pending = timelinePendingZoom;
         timelinePendingZoom = null;
         if (pending) applyCompositeTimelineZoom(
-            pending.zoom, pending.anchorX, pending.forceStart);
+            pending.zoom, pending.anchorX, pending.forceStart, pending.flushPreference);
     });
 }
 
@@ -2680,20 +2735,23 @@ function bindCompositeTimelineEvents() {
     for (const button of document.querySelectorAll('[data-composite-time-zoom]')) {
         button.addEventListener('click', () => scheduleCompositeTimelineZoom(
             compositeTimelineSteppedZoomPure(pendingCompositeTimelineZoom(),
-                button.dataset.compositeTimeZoom === 'in' ? 1 : -1)));
+                button.dataset.compositeTimeZoom === 'in' ? 1 : -1), null, false, true));
     }
     byId('editor-composite-time-zoom')?.addEventListener('input', event => {
         scheduleCompositeTimelineZoom(Number(event.target.value));
     });
+    byId('editor-composite-time-zoom')?.addEventListener('change', event => {
+        scheduleCompositeTimelineZoom(Number(event.target.value), null, false, true);
+    });
     byId('editor-composite-time-preset')?.addEventListener('change', event => {
-        scheduleCompositeTimelineZoom(Number(event.target.value));
+        scheduleCompositeTimelineZoom(Number(event.target.value), null, false, true);
     });
     byId('editor-composite-time-fit')?.addEventListener('click', () => {
         scheduleCompositeTimelineZoom(compositeTimelineFitZoomPure(
-            view.context, scroller.clientWidth), 0, true);
+            view.context, scroller.clientWidth), 0, true, true);
     });
     byId('editor-composite-time-follow')?.addEventListener('click', () => {
-        hybridPreviewPreferences = saveHybridPreviewPreferences({
+        setHybridPreviewPreferences({
             ...hybridPreviewPreferences,
             followPlayhead: !hybridPreviewPreferences.followPlayhead,
         });
@@ -2880,7 +2938,7 @@ function bindCompositeTimelineEvents() {
         centerCurrentReviewInTimeline(view, scroller);
     });
     const applyLaneHeights = laneHeights => {
-        hybridPreviewPreferences = saveHybridPreviewPreferences({
+        setHybridPreviewPreferences({
             ...hybridPreviewPreferences, laneHeights,
         });
         refreshCompositeTimelineViewport(true);
@@ -2924,7 +2982,7 @@ function bindCompositeTimelineEvents() {
     for (const grip of content?.querySelectorAll('[data-composite-lane-resize]') || []) {
         const reset = () => {
             const laneId = grip.dataset.compositeLaneResize;
-            hybridPreviewPreferences = saveHybridPreviewPreferences({
+            setHybridPreviewPreferences({
                 ...hybridPreviewPreferences,
                 laneHeights: {
                     ...hybridPreviewPreferences.laneHeights,
@@ -2947,13 +3005,13 @@ function bindCompositeTimelineEvents() {
             const applyLatestHeight = () => {
                 resizeFrame = 0;
                 if (finished || timelineViewportDom !== boundDom) return;
-                hybridPreviewPreferences = hybridPreviewPreferencesPure({
+                setHybridPreviewPreferences({
                     ...hybridPreviewPreferences,
                     laneHeights: {
                         ...hybridPreviewPreferences.laneHeights,
                         [laneId]: startHeight + latestY - startY,
                     },
-                });
+                }, { deferred: true });
                 previewCompositeLaneHeight(
                     laneId, hybridPreviewPreferences.laneHeights[laneId]);
             };
@@ -2976,7 +3034,7 @@ function bindCompositeTimelineEvents() {
                 window.removeEventListener('blur', cancel);
                 boundDom.cleanup.delete(cleanup);
                 if (!commit || timelineViewportDom !== boundDom) return;
-                hybridPreviewPreferences = saveHybridPreviewPreferences(hybridPreviewPreferences);
+                flushHybridPreviewPreferences();
                 refreshCompositeTimelineViewport(true);
             };
             const up = upEvent => {
@@ -3522,6 +3580,9 @@ function setCompositeCreationUi(creating) {
 function closeCompositeModalImmediately(modal = byId('editor-composite-modal'), {
     restorePreview = true,
 } = {}) {
+    // Commit the last slider/zoom/resize value before DOM teardown cancels its
+    // event stream. This also clears every pending persistence timer.
+    flushHybridPreviewPreferences();
     cancelHybridAnalysis(hybridSession);
     cancelHybridCreation(hybridSession);
     if (restorePreview) {
@@ -3594,22 +3655,17 @@ export async function editorHideCompositeArrangementModal() {
 function handleCompositeModalShortcut(event) {
     if (event.defaultPrevented) return;
     const target = event.target;
+    const textEditing = compositeModalTextEditingTarget(target);
     const action = _compositeModalShortcutPure({
         key: event.key,
-        editable: !!target?.matches?.('input, select, textarea, [contenteditable="true"]'),
+        editable: compositeModalControlEditingTarget(target),
+        spaceEditable: textEditing,
         modified: event.altKey || event.ctrlKey || event.metaKey,
         stage: hybridSession.stage,
         previewActive: hybridSession.previewPlaying || hybridSession.previewLoading,
         repeat: event.repeat,
-        nativeActivation: compositeModalNativeActivationTarget(target),
     });
     if (!action) return;
-    if (action.kind === 'native-activation') {
-        // Keep the focused control's normal Space activation, but never let
-        // the same key continue into the Editor transport behind the modal.
-        event.stopImmediatePropagation();
-        return;
-    }
     if (action.kind === 'consume') {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -3628,7 +3684,7 @@ function handleCompositeModalShortcut(event) {
         if (!button) return;
         event.preventDefault();
         event.stopImmediatePropagation();
-        button.click();
+        toggleCompositePreview(action.mode);
         return;
     }
     if (action.kind === 'play-toggle') {
@@ -3640,7 +3696,7 @@ function handleCompositeModalShortcut(event) {
             const button = document.querySelector(
                 `[data-composite-preview="${hybridSession.previewLastMode}"]:not([disabled])`)
                 || document.querySelector('[data-composite-preview]:not([disabled])');
-            button?.click();
+            if (button) toggleCompositePreview(button.dataset.compositePreview);
         }
         return;
     }

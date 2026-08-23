@@ -180,13 +180,27 @@ test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () 
     assert.match(resolver,
         /action\.kind === 'play-toggle'[\s\S]*event\.preventDefault\(\);\s*event\.stopImmediatePropagation\(\)/,
         'claimed Space playback cannot leak into a second transport handler');
-    assert.match(resolver, /action\.kind === 'native-activation'/,
-        'Space still activates a visible focused button without reaching the Editor');
+    assert.doesNotMatch(resolver, /action\.kind === 'native-activation'/,
+        'focused modal controls do not create a second Space-button activation path');
+    assert.match(resolver,
+        /editable:\s*compositeModalControlEditingTarget\(target\)[\s\S]*spaceEditable:\s*textEditing/,
+        'range/select navigation stays native while only actual text editing suppresses Space');
+    assert.match(resolver,
+        /COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES[\s\S]*'range'[\s\S]*return !COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES\.has/,
+        'range inputs remain transport controls while text-like inputs keep Space');
+    assert.doesNotMatch(resolver, /function compositeModalNativeActivationTarget/);
+    const shortcutStart = resolver.indexOf('function handleCompositeModalShortcut');
+    const shortcutBody = resolver.slice(shortcutStart,
+        resolver.indexOf('export async function editorShowCompositeArrangementModal', shortcutStart));
+    assert.match(shortcutBody,
+        /action\.kind === 'preview'[\s\S]*toggleCompositePreview\(action\.mode\)/,
+        'number shortcuts invoke transport directly instead of synthesizing a click');
+    assert.match(shortcutBody,
+        /action\.kind === 'play-toggle'[\s\S]*toggleCompositePreview\(button\.dataset\.compositePreview\)/,
+        'Space invokes the selected transport action directly');
     assert.match(resolver,
         /function toggleCompositePreview[\s\S]*hybridSession\.previewMode === mode[\s\S]*endCompositePreviewPlayback\(\)/,
         'Space or click on the active sound button toggles it off instead of restarting it');
-    assert.match(resolver, /control\.id !== 'editor-composite-timeline-map'/,
-        'the overview button keeps Space available as the documented transport shortcut');
     assert.match(resolver, /export function editorTeardownCompositeArrangementUi/);
     assert.match(main,
         /window\.__editorScreenTeardown = \(\) => \{[\s\S]*editorTeardownCompositeArrangementUi\(\)/,
@@ -276,8 +290,32 @@ test('Hybrid lane resizing coalesces visual updates and rerenders only on releas
     assert.doesNotMatch(resizeBody.slice(moveStart, moveEnd),
         /refreshCompositeTimelineViewport|innerHTML/,
         'pointer movement only resizes existing lane surfaces');
-    assert.match(resizeBody, /saveHybridPreviewPreferences[\s\S]*refreshCompositeTimelineViewport\(true\)/,
+    assert.match(resizeBody,
+        /setHybridPreviewPreferences\([\s\S]*deferred:\s*true[\s\S]*flushHybridPreviewPreferences\(\)[\s\S]*refreshCompositeTimelineViewport\(true\)/,
         'exact note/string geometry is persisted and rebuilt after release');
+});
+
+test('continuous Hybrid preview preferences update live and persist off the input path', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const bindStart = resolver.indexOf('function bindResultEvents');
+    const bindEnd = resolver.indexOf('function refreshCompositeTimelineZoomControls', bindStart);
+    const resultBinding = resolver.slice(bindStart, bindEnd);
+    assert.match(resultBinding,
+        /editor-composite-preview-volume'[\s\S]*setHybridPreviewPreferences\([\s\S]*deferred:\s*true[\s\S]*updateActiveHybridPreviewMix\(\)/,
+        'volume affects the active mix immediately while its storage write is deferred');
+    assert.match(resultBinding,
+        /editor-composite-preview-volume'[\s\S]*'change', flushHybridPreviewPreferences/,
+        'releasing the volume control flushes its final value');
+    const zoomStart = resolver.indexOf('function applyCompositeTimelineZoom');
+    const zoomEnd = resolver.indexOf('function updateCompositeTimelineMapFrame', zoomStart);
+    assert.match(resolver.slice(zoomStart, zoomEnd),
+        /setHybridPreviewPreferences\([\s\S]*deferred:\s*true[\s\S]*flushPreference[\s\S]*flushHybridPreviewPreferences\(\)/,
+        'zoom changes update layout live and discrete/change events flush after the coalesced frame');
+    const closeStart = resolver.indexOf('function closeCompositeModalImmediately');
+    const closeEnd = resolver.indexOf('export async function editorHideCompositeArrangementModal', closeStart);
+    assert.match(resolver.slice(closeStart, closeEnd),
+        /flushHybridPreviewPreferences\(\)[\s\S]*cancelHybridAnalysis/,
+        'close and teardown persist the latest continuous value before cleanup');
 });
 
 test('Hybrid preview policy is cleared when its modal loses ownership of the Editor session', () => {

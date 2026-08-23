@@ -219,9 +219,12 @@ test('the shared timeline and modal shortcuts cover review and final preview coh
     });
     assert.deepEqual(_compositeModalShortcutPure({ key: ' ' }), { kind: 'play-toggle' });
     assert.deepEqual(_compositeModalShortcutPure({
-        key: ' ', nativeActivation: true,
-    }), { kind: 'native-activation' },
-    'a visible focused control keeps native Space activation inside the modal');
+        key: ' ', editable: true, spaceEditable: false,
+    }), { kind: 'play-toggle' },
+    'a range or select keeps native editing keys but not a separate Space behavior');
+    assert.equal(_compositeModalShortcutPure({
+        key: ' ', editable: true, spaceEditable: true,
+    }), null, 'text-editing controls keep literal Space input');
     assert.deepEqual(_compositeModalShortcutPure({ key: ' ', repeat: true }), {
         kind: 'consume',
     }, 'holding Space cannot rapidly start and stop the preview');
