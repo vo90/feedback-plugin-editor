@@ -136,21 +136,39 @@ test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () 
 test('Hybrid follow uses bounded double-buffered cameras and compositor-only overview movers', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
     assert.match(resolver, /compositeTimelineStripGeometryPure/);
-    assert.match(resolver, /primaryCamera\?\.cloneNode\(true\)/,
-        'one bounded standby camera is cloned from the active strip');
+    assert.match(resolver, /cameraShell\(0\) \+ cameraShell\(1\)/,
+        'two empty camera shells are emitted before the real viewport is measured');
+    assert.doesNotMatch(resolver, /cloneNode\(true\)/,
+        'opening the workspace never deep-clones a dense rendered timeline');
+    const workspaceStart = resolver.indexOf('function renderCompositeTimelineWorkspace');
+    const workspaceEnd = resolver.indexOf('function cancelCompositeTimelineStandbyWork', workspaceStart);
+    assert.doesNotMatch(resolver.slice(workspaceStart, workspaceEnd),
+        /renderCompositeTimeline(?:Lane|Ruler)Contents\(/,
+        'opening emits lightweight shells instead of rendering at an assumed width first');
     assert.match(resolver, /scheduleCompositeTimelineStandby/);
     assert.match(resolver, /scheduleCompositeTimelineIdle/);
+    assert.match(resolver, /deadline\?\.timeRemaining\?\.\(\)/,
+        'standby work checks the idle time remaining before rendering a lane');
+    assert.match(resolver, /compositeTimelineInputPending\(\)/,
+        'pending input wins over background strip generation');
+    assert.doesNotMatch(resolver, /requestIdleCallback\(callback,\s*\{\s*timeout:/,
+        'idle rendering is never forced into a busy playback frame by a timeout');
     assert.match(resolver, /requestAnimationFrame\(\(\) =>\s*refreshCompositeTimelineViewport\(false\)\)/,
         'the animation timestamp can never be mistaken for a forced synchronous rebuild');
     assert.match(resolver, /setCompositeTimelineCameraSlotActive\(standby, true\)/);
     assert.match(resolver, /setCompositeTimelineCameraSlotActive\(previous, false\)/,
         'the prepared strip swaps atomically instead of replacing visible lane markup');
     assert.match(resolver, /toggleAttribute\('inert', !active\)/,
-        'cloned controls in the hidden strip never enter keyboard navigation');
+        'controls in the hidden shell never enter keyboard navigation');
     assert.match(resolver, /standby\.camera\.style\.opacity = '0\.001'/,
         'the hidden strip receives one pre-paint frame before the atomic swap');
-    assert.match(resolver, /activeStillCoversViewport[\s\S]*refreshCompositeTimelineViewport\(true\)[\s\S]*if \(dom\.standbyPending\) return/,
-        'coverage is checked before pending render-ahead can expose a blank strip');
+    const aheadStart = resolver.indexOf('function scheduleCompositeTimelineRenderAhead');
+    const aheadEnd = resolver.indexOf('function applyCompositeTimelineCamera', aheadStart);
+    const aheadBody = resolver.slice(aheadStart, aheadEnd);
+    assert.doesNotMatch(aheadBody, /refreshCompositeTimelineViewport\(true\)/,
+        'the display-rate camera can never force a full SVG rebuild');
+    assert.match(aheadBody, /scheduleCompositeTimelineStandby\(dom, visualScroll\)/,
+        'an outrun strip catches up through cancellable standby rendering');
     const cameraStart = resolver.indexOf('function applyCompositeTimelineCamera');
     const cameraEnd = resolver.indexOf('function setCompositeTimelineNativeCamera', cameraStart);
     const cameraBody = resolver.slice(cameraStart, cameraEnd);
@@ -161,8 +179,45 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
     assert.match(resolver, /data-composite-map-viewport-window/);
     assert.match(resolver, /mapPlayhead\.style\.transform\s*=\s*`translate3d/);
     assert.match(resolver, /mapViewport\.style\.transform\s*=\s*`translate3d/);
+    assert.doesNotMatch(resolver, /mapPaintAt|< 33/,
+        'the overview playhead is no longer deliberately limited to 30 fps');
     assert.doesNotMatch(resolver, /mapPlayhead\.setAttribute\('transform'/,
         'the dense static overview SVG is never repainted to move its playhead');
+});
+
+test('Hybrid overview drag previews visually and commits transport once on release', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const bindStart = resolver.indexOf('function bindCompositeTimelineEvents');
+    const bindEnd = resolver.indexOf('function renderFinalPreviewResult', bindStart);
+    const body = resolver.slice(bindStart, bindEnd);
+    const moveStart = body.indexOf("map?.addEventListener('pointermove'");
+    const moveEnd = body.indexOf("map?.addEventListener('pointerup'", moveStart);
+    assert.match(body.slice(moveStart, moveEnd), /queueMapPreview\(event\.clientX\)/);
+    assert.doesNotMatch(body.slice(moveStart, moveEnd),
+        /seekCompositeTimelineAtTime|host\.editorSeekToTime|startCompositePreview/,
+        'raw pointer moves never restart or seek the audio engine');
+    const upStart = moveEnd;
+    const upEnd = body.indexOf('const clearMapGesture', upStart);
+    assert.equal((body.slice(upStart, upEnd)
+        .match(/seekCompositeTimelineAtTime\(/g) || []).length, 1,
+    'pointer release performs one authoritative transport seek');
+    assert.match(body, /resumePlaying[\s\S]*resumeMapPreview/,
+        'playback that was active resumes once after the committed seek');
+});
+
+test('Hybrid lane resizing coalesces visual updates and rerenders only on release', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const resizeStart = resolver.indexOf('const previewCompositeLaneHeight');
+    const resizeEnd = resolver.indexOf('if (typeof ResizeObserver', resizeStart);
+    const resizeBody = resolver.slice(resizeStart, resizeEnd);
+    const moveStart = resizeBody.indexOf('const move =');
+    const moveEnd = resizeBody.indexOf('const finish =', moveStart);
+    assert.match(resizeBody.slice(moveStart, moveEnd), /requestAnimationFrame/);
+    assert.doesNotMatch(resizeBody.slice(moveStart, moveEnd),
+        /refreshCompositeTimelineViewport|innerHTML/,
+        'pointer movement only resizes existing lane surfaces');
+    assert.match(resizeBody, /saveHybridPreviewPreferences[\s\S]*refreshCompositeTimelineViewport\(true\)/,
+        'exact note/string geometry is persisted and rebuilt after release');
 });
 
 test('Hybrid preview policy is cleared when its modal loses ownership of the Editor session', () => {

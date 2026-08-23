@@ -27,6 +27,8 @@ export const COMPOSITE_TIMELINE_RULER_HEIGHT = 34;
 export const COMPOSITE_TIMELINE_EDGE_PADDING = 28;
 export const COMPOSITE_TIMELINE_STRIP_VIEWPORTS = 5;
 const RANGE_BUFFER_PX = 900;
+const ENTRY_RANGE_INDEX = new WeakMap();
+const OVERVIEW_WIDTH = 1000;
 
 const COLORS = Object.freeze({
     primary: Object.freeze({ main: '#38bdf8', soft: '#082f49', text: '#bae6fd' }),
@@ -522,8 +524,62 @@ export function compositeTimelineZoomAtPure({
 export function compositeTimelineEntriesInRangePure(entries, range) {
     const start = finite(range && range.startBeat);
     const end = Math.max(start, finite(range && range.endBeat, start));
-    return (entries || []).filter(entry => finite(entry && entry.startBeat) <= end + 1e-4
-        && entryEndBeat(entry) >= start - 1e-4);
+    if (!Array.isArray(entries) || !entries.length) return [];
+    let index = ENTRY_RANGE_INDEX.get(entries);
+    if (!index || index.length !== entries.length
+            || index.first !== entries[0] || index.last !== entries[entries.length - 1]) {
+        const starts = new Float64Array(entries.length);
+        const prefixMaxEnd = new Float64Array(entries.length);
+        let maximumEnd = -Infinity;
+        let sorted = true;
+        for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+            const entryStart = finite(entries[entryIndex]?.startBeat);
+            starts[entryIndex] = entryStart;
+            if (entryIndex && entryStart < starts[entryIndex - 1]) sorted = false;
+            maximumEnd = Math.max(maximumEnd, entryEndBeat(entries[entryIndex]));
+            prefixMaxEnd[entryIndex] = maximumEnd;
+        }
+        index = {
+            length: entries.length,
+            first: entries[0],
+            last: entries[entries.length - 1],
+            starts,
+            prefixMaxEnd,
+            sorted,
+        };
+        ENTRY_RANGE_INDEX.set(entries, index);
+    }
+    const startWithTolerance = start - 1e-4;
+    const endWithTolerance = end + 1e-4;
+    if (!index.sorted) {
+        return entries.filter(entry => finite(entry?.startBeat) <= endWithTolerance
+            && entryEndBeat(entry) >= startWithTolerance);
+    }
+    // Entries are sorted by start beat. The monotonic prefix maximum keeps
+    // long trails that began before the viewport without scanning every note
+    // from the start of the song on each camera render.
+    let lower = 0;
+    let upper = entries.length;
+    while (lower < upper) {
+        const middle = (lower + upper) >> 1;
+        if (index.prefixMaxEnd[middle] < startWithTolerance) lower = middle + 1;
+        else upper = middle;
+    }
+    const firstCandidate = lower;
+    lower = 0;
+    upper = entries.length;
+    while (lower < upper) {
+        const middle = (lower + upper) >> 1;
+        if (index.starts[middle] <= endWithTolerance) lower = middle + 1;
+        else upper = middle;
+    }
+    const pastLastCandidate = lower;
+    const visible = [];
+    for (let entryIndex = firstCandidate; entryIndex < pastLastCandidate; entryIndex++) {
+        const entry = entries[entryIndex];
+        if (entryEndBeat(entry) >= startWithTolerance) visible.push(entry);
+    }
+    return visible;
 }
 
 function badgeSummary(entry) {
@@ -699,19 +755,66 @@ export function compositeTimelineMapViewportPure(view, viewportRange) {
     return { x: lo, width: Math.max(4, hi - lo) };
 }
 
+function compositeTimelineOverviewDensityMarkup(entries, toX, {
+    width = OVERVIEW_WIDTH,
+    y = 17,
+    height = 9,
+    fill = '#34d399',
+    include = () => true,
+} = {}) {
+    // One difference-array update per note and at most `width` output bins.
+    // The overview therefore represents every note in arbitrarily large songs
+    // without creating one SVG node per note or silently truncating the tail.
+    const difference = new Int32Array(width + 1);
+    for (const entry of entries || []) {
+        if (!include(entry)) continue;
+        const rawStart = Math.max(0, Math.min(width, toX(entry.startBeat)));
+        const rawEnd = Math.max(rawStart, Math.min(width, toX(entryEndBeat(entry))));
+        const first = Math.max(0, Math.min(width - 1, Math.floor(rawStart)));
+        const last = Math.max(first, Math.min(width - 1,
+            Math.max(Math.floor(rawStart), Math.ceil(rawEnd) - 1)));
+        difference[first] += 1;
+        difference[last + 1] -= 1;
+    }
+    const runs = [];
+    let active = 0;
+    let runStart = -1;
+    let runOpacity = 0;
+    const flush = end => {
+        if (runStart < 0) return;
+        runs.push(`<rect data-composite-map-density="true" x="${runStart.toFixed(1)}" y="${y}" width="${Math.max(1, end - runStart).toFixed(1)}" height="${height}" rx="1" fill="${fill}" opacity="${runOpacity.toFixed(2)}"/>`);
+        runStart = -1;
+    };
+    for (let bin = 0; bin < width; bin++) {
+        active += difference[bin];
+        // Quantising density lets adjacent pixels collapse into bounded runs
+        // while still making stacked chords/passages visibly stronger.
+        const opacity = active > 0
+            ? Math.min(0.88, 0.52 + Math.floor(Math.log2(active + 1)) * 0.09) : 0;
+        if (opacity !== runOpacity) {
+            flush(bin);
+            runOpacity = opacity;
+            if (opacity) runStart = bin;
+        } else if (opacity && runStart < 0) runStart = bin;
+    }
+    flush(width);
+    return runs.join('');
+}
+
 export function renderCompositeTimelineMapSvg(view, _viewportRange, _playheadBeat = 0) {
-    const width = 1000;
+    const width = OVERVIEW_WIDTH;
     const height = 42;
     const span = Math.max(1, view.context.endBeat - view.context.startBeat);
     const x = beat => ((finite(beat) - view.context.startBeat) / span) * width;
     const result = view.lanes.find(lane => lane.id === 'result');
-    const entries = (result?.entries || []).slice(0, 4000).map(entry => {
-        const x1 = Math.max(0, Math.min(width, x(entry.startBeat)));
-        const x2 = Math.max(x1 + 1, Math.min(width, x(entryEndBeat(entry))));
-        const fillAddition = entry.source === 'secondary'
-            && !(entry.sources || []).includes('primary');
-        return `<rect x="${x1.toFixed(1)}" y="17" width="${Math.max(1, x2 - x1).toFixed(1)}" height="9" rx="1" fill="${fillAddition ? '#c084fc' : '#34d399'}" opacity="0.68"/>`;
-    }).join('');
+    const resultEntries = result?.entries || [];
+    const fillAddition = entry => entry.source === 'secondary'
+        && !(entry.sources || []).includes('primary');
+    const entries = compositeTimelineOverviewDensityMarkup(resultEntries, x, {
+        width, fill: '#34d399', include: entry => !fillAddition(entry),
+    }) + compositeTimelineOverviewDensityMarkup(resultEntries, x, {
+        width, fill: '#c084fc', include: fillAddition,
+    });
     const decisions = (view.decisions || []).map(decision => {
         const x1 = Math.max(0, Math.min(width, x(decision.startBeat)));
         const x2 = Math.max(x1 + 2, Math.min(width, x(decision.endBeat)));

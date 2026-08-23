@@ -106,6 +106,17 @@ test('timeline uses one stable beat-to-x map and culls entries outside the buffe
         .map(candidate => candidate.id), ['p:1']);
 });
 
+test('range culling keeps pre-window trails and reaches a dense song tail', () => {
+    const entries = [entry('long-trail', 0, 8_500),
+        ...Array.from({ length: 10_000 }, (_, index) =>
+            entry(`note:${index}`, index + 1, index + 1.25))];
+    assert.deepEqual(compositeTimelineEntriesInRangePure(entries, {
+        startBeat: 8_000, endBeat: 8_001,
+    }).map(candidate => candidate.id), [
+        'long-trail', 'note:7999', 'note:8000',
+    ], 'binary culling does not discard trails that began before the viewport');
+});
+
 test('continuous follow reuses its buffered note window until the viewport nears an edge', () => {
     const context = { startBeat: 0, endBeat: 200 };
     const renderedRange = { startBeat: 20, endBeat: 70 };
@@ -387,8 +398,24 @@ test('a fret marker on either song boundary stays wholly inside the tablature', 
 
     model.lanes[2].entries = [zero];
     const map = renderCompositeTimelineMapSvg(model, visible, 0);
-    assert.match(map, /<rect x="0\.0" y="17"/,
+    assert.match(map, /<rect data-composite-map-density="true" x="0\.0" y="17"/,
         'the overview remains mapped to real time rather than fake visual pre-roll');
+});
+
+test('overview aggregation includes every note without unbounded SVG nodes', () => {
+    const model = view();
+    model.lanes[2].entries = Array.from({ length: 5_200 }, (_, index) =>
+        entry(`dense:${index}`, index / 10, index / 10 + 0.04, 0, 3,
+            index === 5_199 ? 'secondary' : 'primary'));
+    model.context.endBeat = 520;
+    const map = renderCompositeTimelineMapSvg(model, {
+        startBeat: 0, endBeat: model.context.endBeat,
+    });
+    assert.match(map, /fill="#c084fc"/,
+        'a fill note beyond the former 4,000-note cutoff remains represented');
+    assert.ok((map.match(/data-composite-map-density=/g) || []).length <= 2_000,
+        'the static overview is bounded by its 1,000 horizontal bins per source');
+    assert.doesNotMatch(map, /slice\(0, 4000\)/);
 });
 
 test('overview pointer coordinates map exactly to the song and center the tablature area', () => {
