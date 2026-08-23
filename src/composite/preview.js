@@ -26,6 +26,27 @@ const COMPOSITE_PREVIEW_MIN_RECORDING_GAIN = 10 ** (-18 / 20);
 const COMPOSITE_PREVIEW_MAX_RECORDING_GAIN = 10 ** (6 / 20);
 const COMPOSITE_PREVIEW_ANALYSIS_WINDOW_SECONDS = 0.05;
 const COMPOSITE_PREVIEW_MAX_ANALYSIS_SAMPLES = 250000;
+const COMPOSITE_PREVIEW_MAX_SUMMARY_BINS = 4000;
+
+function recordingLevelFromMeasurements(rms, peak, activeSamples, options = {}) {
+    if (!activeSamples || !(rms > 0)) {
+        return { gain: 1, rms: 0, peak: Math.max(0, finite(peak)), silent: true };
+    }
+    const targetRms = Math.max(0.001, finite(options.targetRms, COMPOSITE_PREVIEW_TARGET_RMS));
+    const minimumGain = Math.max(0, finite(options.minimumGain, COMPOSITE_PREVIEW_MIN_RECORDING_GAIN));
+    const maximumGain = Math.max(minimumGain,
+        finite(options.maximumGain, COMPOSITE_PREVIEW_MAX_RECORDING_GAIN));
+    const peakCeiling = Math.max(0.1, Math.min(1,
+        finite(options.peakCeiling, COMPOSITE_PREVIEW_PEAK_CEILING)));
+    const wanted = Math.max(minimumGain, Math.min(maximumGain, targetRms / rms));
+    const peakSafe = peak > 0 ? peakCeiling / peak : maximumGain;
+    return {
+        gain: Math.max(0, Math.min(wanted, peakSafe)),
+        rms,
+        peak,
+        silent: false,
+    };
+}
 
 export function compositePreviewVolumeGainPure(volume) {
     const value = Number(volume);
@@ -109,18 +130,75 @@ export function compositeRecordingPreviewLevelPure(buffer, startTime, endTime, o
             activeSamples += samples;
         }
     }
-    if (!activeSamples) return { gain: 1, rms: 0, peak, silent: true };
+    const rms = activeSamples ? Math.sqrt(activeSquares / activeSamples) : 0;
+    return recordingLevelFromMeasurements(rms, peak, activeSamples, options);
+}
 
-    const rms = Math.sqrt(activeSquares / activeSamples);
-    const targetRms = Math.max(0.001, finite(options.targetRms, COMPOSITE_PREVIEW_TARGET_RMS));
-    const minimumGain = Math.max(0, finite(options.minimumGain, COMPOSITE_PREVIEW_MIN_RECORDING_GAIN));
-    const maximumGain = Math.max(minimumGain,
-        finite(options.maximumGain, COMPOSITE_PREVIEW_MAX_RECORDING_GAIN));
-    const peakCeiling = Math.max(0.1, Math.min(1,
-        finite(options.peakCeiling, COMPOSITE_PREVIEW_PEAK_CEILING)));
-    const wanted = Math.max(minimumGain, Math.min(maximumGain, targetRms / rms));
-    const peakSafe = peak > 0 ? peakCeiling / peak : maximumGain;
-    return { gain: Math.max(0, Math.min(wanted, peakSafe)), rms, peak, silent: false };
+// The Editor already builds a ~3 ms RMS/min/max waveform summary when audio is
+// decoded. Reusing it avoids walking hundreds of thousands of raw PCM samples
+// on the Play/Space input path. The same 50 ms silence gate and gain/peak rules
+// are applied here; raw PCM remains the correctness fallback when no waveform
+// cache exists (for example in a synthetic host integration).
+export function compositeRecordingPreviewLevelFromPeaksPure(
+    peaks, durationSeconds, startTime, endTime, options = {},
+) {
+    const rmsBins = peaks?.rms;
+    const minimumBins = peaks?.min;
+    const maximumBins = peaks?.max;
+    const declaredBins = Math.max(0, Math.trunc(finite(peaks?.bins)));
+    const binCount = Math.min(declaredBins || Number(rmsBins?.length) || 0,
+        Number(rmsBins?.length) || 0);
+    const duration = finite(durationSeconds);
+    if (!(duration > 0) || !binCount || !rmsBins) {
+        return { gain: 1, rms: 0, peak: 0, silent: true };
+    }
+    const rawStart = finite(startTime);
+    const rawEnd = Number(endTime);
+    const from = Math.max(0, Math.min(binCount,
+        Math.floor(Math.max(0, rawStart) / duration * binCount)));
+    const fallbackEnd = duration;
+    const to = Math.max(from, Math.min(binCount,
+        Math.ceil(Math.max(0, Number.isFinite(rawEnd) ? rawEnd : fallbackEnd)
+            / duration * binCount)));
+    if (to <= from) return { gain: 1, rms: 0, peak: 0, silent: true };
+
+    const maximumSamples = Math.max(1000,
+        Math.trunc(finite(options.maximumSamples, COMPOSITE_PREVIEW_MAX_SUMMARY_BINS)));
+    const stride = Math.max(1, Math.floor((to - from) / maximumSamples));
+    const binSeconds = duration / binCount;
+    const windowBins = Math.max(stride,
+        Math.round(COMPOSITE_PREVIEW_ANALYSIS_WINDOW_SECONDS / binSeconds));
+    let activeSquares = 0;
+    let activeSamples = 0;
+    // New waveform summaries carry the whole recording's exact channel peak,
+    // computed for free while their bins are built. It is conservative for a
+    // short review section and lets this input-critical query sample only RMS.
+    const summaryPeak = Number(peaks?.peak);
+    const hasSummaryPeak = Number.isFinite(summaryPeak) && summaryPeak >= 0;
+    let peak = hasSummaryPeak ? summaryPeak : 0;
+    for (let windowStart = from; windowStart < to; windowStart += windowBins) {
+        const windowEnd = Math.min(to, windowStart + windowBins);
+        let squares = 0;
+        let samples = 0;
+        for (let bin = windowStart; bin < windowEnd; bin += stride) {
+            const value = Math.max(0, finite(rmsBins[bin]));
+            squares += value * value;
+            samples++;
+            if (!hasSummaryPeak) {
+                const low = Math.abs(finite(minimumBins?.[bin]));
+                const high = Math.abs(finite(maximumBins?.[bin]));
+                peak = Math.max(peak, low, high);
+            }
+        }
+        if (!samples) continue;
+        const windowRms = Math.sqrt(squares / samples);
+        if (windowRms >= COMPOSITE_PREVIEW_GATE_RMS) {
+            activeSquares += squares;
+            activeSamples += samples;
+        }
+    }
+    const rms = activeSamples ? Math.sqrt(activeSquares / activeSamples) : 0;
+    return recordingLevelFromMeasurements(rms, peak, activeSamples, options);
 }
 
 function entryEndBeat(entry) {

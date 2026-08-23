@@ -105,6 +105,19 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
         'seek, bind, and maximize cannot multiply the playback animation loop');
 });
 
+test('Original-song Hybrid playback reuses waveform levels instead of scanning PCM on Space', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const start = resolver.indexOf('function recordingPreviewGainFor');
+    const end = resolver.indexOf('function updateActiveHybridPreviewMix', start);
+    const body = resolver.slice(start, end);
+    assert.match(body,
+        /S\.waveformPeaks[\s\S]*compositeRecordingPreviewLevelFromPeaksPure/,
+        'the decoded waveform summary is the normal constant-time playback path');
+    assert.match(body,
+        /:\s*compositeRecordingPreviewLevelPure\(S\.audioBuffer/,
+        'a host without waveform data retains the exact PCM correctness fallback');
+});
+
 test('Hybrid analysis and creation use cancellable background tasks with stale guards', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
     assert.match(resolver, /runHybridAnalysisTask/);

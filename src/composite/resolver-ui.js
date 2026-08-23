@@ -66,6 +66,7 @@ import {
     compositePreviewModesPure,
     compositePreviewRegionPure,
     compositeRecordingPreviewLevelPure,
+    compositeRecordingPreviewLevelFromPeaksPure,
 } from './preview.js';
 import {
     beginHybridAnalysis,
@@ -602,7 +603,14 @@ function recordingPreviewGainFor(view) {
     const cached = recordingPreviewLevelCache;
     if (cached && cached.buffer === S.audioBuffer
             && cached.startTime === startTime && cached.endTime === endTime) return cached.gain;
-    const gain = compositeRecordingPreviewLevelPure(S.audioBuffer, startTime, endTime).gain;
+    // Audio decoding already produced a compact RMS/peak waveform summary.
+    // Prefer it here so the Play/Space gesture never has to scan hundreds of
+    // thousands of raw samples before Original Song playback can start.
+    const level = S.waveformPeaks
+        ? compositeRecordingPreviewLevelFromPeaksPure(
+            S.waveformPeaks, S.audioBuffer.duration, startTime, endTime)
+        : compositeRecordingPreviewLevelPure(S.audioBuffer, startTime, endTime);
+    const gain = level.gain;
     recordingPreviewLevelCache = { buffer: S.audioBuffer, startTime, endTime, gain };
     return gain;
 }

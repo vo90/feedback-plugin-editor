@@ -128,6 +128,7 @@ function _buildWaveformPeaks(data, binSamples) {
     const min = new Float32Array(bins);
     const max = new Float32Array(bins);
     const rms = new Float32Array(bins);
+    let peak = 0;
     for (let b = 0; b < bins; b++) {
         const start = b * binSamples;
         // The last bin soaks up any remainder so no tail samples are dropped.
@@ -143,8 +144,9 @@ function _buildWaveformPeaks(data, binSamples) {
         min[b] = cnt ? lo : 0;
         max[b] = cnt ? hi : 0;
         rms[b] = cnt ? Math.sqrt(sumSq / cnt) : 0;
+        if (cnt) peak = Math.max(peak, Math.abs(lo), Math.abs(hi));
     }
-    return { min, max, rms, bins };
+    return { min, max, rms, bins, peak };
 }
 
 export function computeWaveform() {

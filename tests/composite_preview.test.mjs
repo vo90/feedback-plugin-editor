@@ -10,6 +10,7 @@ import {
     compositePreviewRegionPure,
     compositePreviewVolumeGainPure,
     compositeRecordingPreviewLevelPure,
+    compositeRecordingPreviewLevelFromPeaksPure,
 } from '../src/composite/preview.js';
 import {
     COMPOSITE_BEAT_EPS,
@@ -220,4 +221,69 @@ test('recording level matching is stereo-safe, peak-safe, bounded, and silence-s
     assert.deepEqual(compositeRecordingPreviewLevelPure(null, 0, 1), {
         gain: 1, rms: 0, peak: 0, silent: true,
     });
+});
+
+function waveformSummary(values, bins = 100) {
+    const size = Math.max(1, Math.floor(values.length / bins));
+    const minimum = new Float32Array(bins);
+    const maximum = new Float32Array(bins);
+    const rms = new Float32Array(bins);
+    for (let bin = 0; bin < bins; bin++) {
+        const from = bin * size;
+        const to = bin === bins - 1 ? values.length : Math.min(values.length, from + size);
+        let low = Infinity, high = -Infinity, squares = 0, count = 0;
+        for (let index = from; index < to; index++) {
+            const value = Number(values[index]) || 0;
+            low = Math.min(low, value);
+            high = Math.max(high, value);
+            squares += value * value;
+            count++;
+        }
+        minimum[bin] = count ? low : 0;
+        maximum[bin] = count ? high : 0;
+        rms[bin] = count ? Math.sqrt(squares / count) : 0;
+    }
+    return { min: minimum, max: maximum, rms, bins };
+}
+
+test('waveform summary level matching preserves the PCM gate and gain result', () => {
+    const values = [
+        ...Array(500).fill(0),
+        ...Array(1500).fill(0.2),
+    ];
+    const exact = compositeRecordingPreviewLevelPure(fakeBuffer(values), 0, 2);
+    const summarized = compositeRecordingPreviewLevelFromPeaksPure(
+        waveformSummary(values, 200), 2, 0, 2);
+    assert.equal(summarized.silent, false);
+    assert.ok(Math.abs(summarized.rms - exact.rms) < 1e-6);
+    assert.ok(Math.abs(summarized.peak - exact.peak) < 1e-6);
+    assert.ok(Math.abs(summarized.gain - exact.gain) < 1e-6);
+
+    const silent = compositeRecordingPreviewLevelFromPeaksPure(
+        waveformSummary(Array(1000).fill(0.001), 100), 1, 0, 1);
+    assert.equal(silent.silent, true);
+    assert.equal(silent.gain, 1);
+    assert.equal(silent.rms, 0);
+    assert.ok(Math.abs(silent.peak - 0.001) < 1e-8);
+});
+
+test('waveform summary level matching bounds work for very long recordings', () => {
+    const bins = 1_000_000;
+    let reads = 0;
+    const values = new Proxy({ length: bins }, {
+        get(target, property) {
+            if (property === 'length') return target.length;
+            if (String(Number(property)) === property) {
+                reads++;
+                return 0.2;
+            }
+            return target[property];
+        },
+    });
+    const level = compositeRecordingPreviewLevelFromPeaksPure({
+        bins, rms: values, min: values, max: values,
+    }, 3600, 0, 3600, { maximumSamples: 1000 });
+    assert.equal(level.silent, false);
+    assert.ok(reads <= 3100,
+        `RMS/min/max summaries should read about three values per sampled bin, read ${reads}`);
 });
