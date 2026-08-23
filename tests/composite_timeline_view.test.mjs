@@ -5,6 +5,7 @@ import {
     buildCompositeTimelineViewModel,
     COMPOSITE_TIMELINE_EDGE_PADDING,
     COMPOSITE_TIMELINE_GUTTER,
+    COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT,
     COMPOSITE_TIMELINE_STRIP_MAX_WIDTH,
     COMPOSITE_TIMELINE_STRIP_VIEWPORTS,
     compositeTimelineBeatForXPure,
@@ -362,6 +363,112 @@ test('lane and overview markup contain full-song notes without review controls',
     assert.doesNotMatch(map, /editor-composite-map-(viewport|playhead)/,
         'the dense overview SVG stays static while HTML overlays move above it');
     assert.match(map, /data-composite-map-passage="experimental:passage:1"/);
+});
+
+test('Experimental passage outcomes stay linear at twenty thousand review sections', () => {
+    const count = 20_000;
+    let conflictReads = 0;
+    const conflicts = Array.from({ length: count }, (_, index) => ({
+        id: `passage:${index}`,
+        startBeat: index,
+        endBeat: index + 0.5,
+        resolution: index % 2 ? 'secondary' : null,
+        selectedEntryIds: index % 2 ? [`entry:${index}`] : [],
+        primaryEntries: [],
+        secondaryEntries: [],
+    }));
+    const observedConflicts = new Proxy(conflicts, {
+        get(target, property, receiver) {
+            if (typeof property === 'string' && /^\d+$/.test(property)) conflictReads++;
+            return Reflect.get(target, property, receiver);
+        },
+    });
+    const passages = Array.from({ length: count }, (_, index) => ({
+        id: `passage:${index}`,
+        startBeat: index,
+        endBeat: index + 0.5,
+        status: 'review',
+        noteCount: 1,
+        entries: [{ id: `entry:${index}` }],
+        reasons: [],
+    }));
+    const model = buildCompositeTimelineViewModel({
+        plan: {
+            beats: [], compatibility: { stringCount: 6 },
+            sourceEntries: { primary: [], secondary: [] },
+            conflicts: observedConflicts, passages,
+        },
+    });
+    assert.equal(model.passages.length, count);
+    assert.equal(model.passages[0].state, 'review');
+    assert.equal(model.passages.at(-1).state, 'accepted');
+    assert.ok(conflictReads < count * 12,
+        `indexed construction should be linear, but read ${conflictReads} conflict slots`);
+});
+
+test('dense overview groups visual intervals but keeps late focused markers interactive', () => {
+    const count = 20_000;
+    assert.equal(COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT, 512);
+    const decisions = Array.from({ length: count }, (_, index) => ({
+        id: `decision:${index}`,
+        index,
+        startBeat: index,
+        endBeat: index + 0.5,
+        state: index % 3 === 0 ? 'resolved' : index % 3 === 1 ? 'unresolved' : 'invalid',
+    }));
+    const passages = Array.from({ length: count }, (_, index) => ({
+        id: `passage:${index}`,
+        startBeat: index,
+        endBeat: index + 0.5,
+        state: index % 2 ? 'automatic' : 'left-out',
+        label: `Passage ${index + 1}`,
+        active: index === count - 1,
+    }));
+    const map = renderCompositeTimelineMapSvg({
+        context: { startBeat: 0, endBeat: count },
+        lanes: [{ id: 'result', entries: [] }],
+        review: { id: decisions.at(-1).id },
+        decisions,
+        passages,
+    });
+
+    assert.equal((map.match(/data-composite-map-decision="/g) || []).length, 1,
+        'only the focused decision remains an individual SVG hit target');
+    assert.match(map, /data-composite-map-decision="19999"/,
+        'a focused decision beyond the aggregation limit remains selectable');
+    assert.equal((map.match(/data-composite-map-passage="/g) || []).length, 1,
+        'only the inspected passage remains an individual SVG hit target');
+    assert.match(map, /data-composite-map-passage="passage:19999"/,
+        'a late inspected passage remains selectable');
+    assert.match(map, /data-composite-map-decision-density=/);
+    assert.match(map, /data-composite-map-passage-density=/);
+    assert.match(map, /Dense 20000 decision markers and 20000 passage markers are visually grouped/,
+        'the accessible description does not imply that grouped marks are individual controls');
+    assert.ok(map.length < 250_000,
+        `twenty thousand intervals should not produce unbounded markup (${map.length} chars)`);
+});
+
+test('ordinary overview counts preserve every decision and passage hit target', () => {
+    const decisions = Array.from({ length: 12 }, (_, index) => ({
+        id: `decision:${index}`, index, startBeat: index, endBeat: index + 0.5,
+        state: 'unresolved',
+    }));
+    const passages = Array.from({ length: 12 }, (_, index) => ({
+        id: `passage:${index}`, startBeat: index, endBeat: index + 0.5,
+        state: 'automatic', label: `Passage ${index + 1}`, active: false,
+    }));
+    const map = renderCompositeTimelineMapSvg({
+        context: { startBeat: 0, endBeat: 12 },
+        lanes: [{ id: 'result', entries: [] }],
+        review: null,
+        decisions,
+        passages,
+    });
+    assert.equal((map.match(/data-composite-map-decision="/g) || []).length, 12);
+    assert.equal((map.match(/data-composite-map-passage="/g) || []).length, 12);
+    assert.doesNotMatch(map, /data-composite-map-(?:decision|passage)-density=/);
+    assert.match(map, /aria-label="Whole-song Hybrid overview"/,
+        'normal songs keep the previous concise accessible name');
 });
 
 test('overview viewport geometry can update without rebuilding the whole map', () => {

@@ -8,6 +8,7 @@
 
 import { beatOf } from '../beats.js';
 import { compositeTechniqueLabels } from './conflict-view.js';
+import { experimentalPassageOutcomes } from './experimental-auto-engine.js';
 import {
     HYBRID_PREVIEW_DEFAULTS,
     HYBRID_TIMELINE_LANE_MAX,
@@ -33,6 +34,7 @@ export const COMPOSITE_TIMELINE_STRIP_MAX_WIDTH = 7680;
 const RANGE_BUFFER_PX = 900;
 const ENTRY_RANGE_INDEX = new WeakMap();
 const OVERVIEW_WIDTH = 1000;
+export const COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT = 512;
 
 const TIMELINE_DETAIL_LEVELS = Object.freeze({
     density: Object.freeze({
@@ -186,15 +188,10 @@ export function buildCompositeTimelineViewModel({
         state: conflict.validationError ? 'invalid' : conflict.resolution ? 'resolved' : 'unresolved',
         label: conflict.label || `Decision ${index + 1}`,
     }));
+    const passageOutcomes = plan.passages?.length
+        ? experimentalPassageOutcomes(plan) : new Map();
     const passages = (plan.passages || []).map((passage, index) => {
-        const conflict = (plan.conflicts || []).find(candidate => candidate.id === passage.id);
-        const selected = new Set(conflict?.selectedEntryIds || []);
-        const selectedNotes = (passage.entries || []).filter(entry => selected.has(entry.id)).length;
-        let state = passage.status;
-        if (passage.status === 'review' && conflict?.resolution) {
-            state = selectedNotes === 0 ? 'declined'
-                : selectedNotes === passage.noteCount ? 'accepted' : 'accepted-partial';
-        }
+        const state = passageOutcomes.get(passage.id)?.state || passage.status;
         return {
             id: passage.id,
             index,
@@ -870,6 +867,8 @@ function compositeTimelineOverviewDensityMarkup(entries, toX, {
     height = 9,
     fill = '#34d399',
     include = () => true,
+    attribute = 'data-composite-map-density="true"',
+    fixedOpacity = null,
 } = {}) {
     // One difference-array update per note and at most `width` output bins.
     // The overview therefore represents every note in arbitrarily large songs
@@ -891,7 +890,7 @@ function compositeTimelineOverviewDensityMarkup(entries, toX, {
     let runOpacity = 0;
     const flush = end => {
         if (runStart < 0) return;
-        runs.push(`<rect data-composite-map-density="true" x="${runStart.toFixed(1)}" y="${y}" width="${Math.max(1, end - runStart).toFixed(1)}" height="${height}" rx="1" fill="${fill}" opacity="${runOpacity.toFixed(2)}"/>`);
+        runs.push(`<rect ${attribute} x="${runStart.toFixed(1)}" y="${y}" width="${Math.max(1, end - runStart).toFixed(1)}" height="${height}" rx="1" fill="${fill}" opacity="${runOpacity.toFixed(2)}"/>`);
         runStart = -1;
     };
     for (let bin = 0; bin < width; bin++) {
@@ -899,7 +898,9 @@ function compositeTimelineOverviewDensityMarkup(entries, toX, {
         // Quantising density lets adjacent pixels collapse into bounded runs
         // while still making stacked chords/passages visibly stronger.
         const opacity = active > 0
-            ? Math.min(0.88, 0.52 + Math.floor(Math.log2(active + 1)) * 0.09) : 0;
+            ? fixedOpacity ?? Math.min(0.88,
+                0.52 + Math.floor(Math.log2(active + 1)) * 0.09)
+            : 0;
         if (opacity !== runOpacity) {
             flush(bin);
             runOpacity = opacity;
@@ -908,6 +909,44 @@ function compositeTimelineOverviewDensityMarkup(entries, toX, {
     }
     flush(width);
     return runs.join('');
+}
+
+function compositeTimelineOverviewGroupedIntervals(items, toX, {
+    kind,
+    y,
+    height,
+    colors,
+    active = () => false,
+} = {}) {
+    const grouped = new Map();
+    for (const item of items || []) {
+        if (active(item)) continue;
+        const state = Object.hasOwn(colors, item.state) ? item.state : 'other';
+        if (!grouped.has(state)) grouped.set(state, []);
+        grouped.get(state).push(item);
+    }
+    return [...grouped].map(([state, intervals]) =>
+        compositeTimelineOverviewDensityMarkup(intervals, toX, {
+            y,
+            height,
+            fill: colors[state] || colors.other || '#64748b',
+            attribute: `data-composite-map-${kind}-density="${escapeMarkup(state)}" aria-hidden="true"`,
+            fixedOpacity: 0.72,
+        })).join('');
+}
+
+function compositeTimelineOverviewDecisionMarkup(decision, toX, width, active) {
+    const x1 = Math.max(0, Math.min(width, toX(decision.startBeat)));
+    const x2 = Math.max(x1 + 2, Math.min(width, toX(decision.endBeat)));
+    const color = decision.state === 'invalid' ? '#f87171'
+        : decision.state === 'resolved' ? '#34d399' : '#fbbf24';
+    return `<rect data-composite-map-decision="${decision.index}" x="${x1.toFixed(1)}" y="5" width="${Math.max(2, x2 - x1).toFixed(1)}" height="8" rx="2" fill="${color}" opacity="${active ? 1 : 0.72}"/>`;
+}
+
+function compositeTimelineOverviewPassageMarkup(passage, toX, width, colors) {
+    const x1 = Math.max(0, Math.min(width, toX(passage.startBeat)));
+    const x2 = Math.max(x1 + 2, Math.min(width, toX(passage.endBeat)));
+    return `<rect data-composite-map-passage="${escapeMarkup(passage.id)}" x="${x1.toFixed(1)}" y="31" width="${Math.max(2, x2 - x1).toFixed(1)}" height="7" rx="2" fill="${colors[passage.state] || '#64748b'}" opacity="${passage.active ? 1 : 0.76}"${passage.active ? ' stroke="#f8fafc" stroke-width="1.5"' : ''}><title>${escapeMarkup(`${passage.label}: ${passage.state}`)}</title></rect>`;
 }
 
 export function renderCompositeTimelineMapSvg(view, _viewportRange, _playheadBeat = 0) {
@@ -924,24 +963,38 @@ export function renderCompositeTimelineMapSvg(view, _viewportRange, _playheadBea
     }) + compositeTimelineOverviewDensityMarkup(resultEntries, x, {
         width, fill: '#c084fc', include: fillAddition,
     });
-    const decisions = (view.decisions || []).map(decision => {
-        const x1 = Math.max(0, Math.min(width, x(decision.startBeat)));
-        const x2 = Math.max(x1 + 2, Math.min(width, x(decision.endBeat)));
-        const color = decision.state === 'invalid' ? '#f87171'
-            : decision.state === 'resolved' ? '#34d399' : '#fbbf24';
-        const active = view.review && view.review.id === decision.id;
-        return `<rect data-composite-map-decision="${decision.index}" x="${x1.toFixed(1)}" y="5" width="${Math.max(2, x2 - x1).toFixed(1)}" height="8" rx="2" fill="${color}" opacity="${active ? 1 : 0.72}"/>`;
-    }).join('');
+    const decisionItems = view.decisions || [];
+    const activeDecision = decision => view.review && view.review.id === decision.id;
+    const denseDecisions = decisionItems.length > COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT;
+    const decisions = denseDecisions
+        ? compositeTimelineOverviewGroupedIntervals(decisionItems, x, {
+            kind: 'decision', y: 5, height: 8,
+            colors: { invalid: '#f87171', resolved: '#34d399', unresolved: '#fbbf24' },
+            active: activeDecision,
+        }) + decisionItems.filter(activeDecision).map(decision =>
+            compositeTimelineOverviewDecisionMarkup(decision, x, width, true)).join('')
+        : decisionItems.map(decision => compositeTimelineOverviewDecisionMarkup(
+            decision, x, width, activeDecision(decision))).join('');
     const passageColors = {
         automatic: '#c084fc', review: '#fbbf24', accepted: '#34d399',
         'accepted-partial': '#2dd4bf', declined: '#64748b', 'left-out': '#475569',
     };
-    const passages = (view.passages || []).map(passage => {
-        const x1 = Math.max(0, Math.min(width, x(passage.startBeat)));
-        const x2 = Math.max(x1 + 2, Math.min(width, x(passage.endBeat)));
-        return `<rect data-composite-map-passage="${escapeMarkup(passage.id)}" x="${x1.toFixed(1)}" y="31" width="${Math.max(2, x2 - x1).toFixed(1)}" height="7" rx="2" fill="${passageColors[passage.state] || '#64748b'}" opacity="${passage.active ? 1 : 0.76}"${passage.active ? ' stroke="#f8fafc" stroke-width="1.5"' : ''}><title>${escapeMarkup(`${passage.label}: ${passage.state}`)}</title></rect>`;
-    }).join('');
-    return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" width="100%" height="42" role="img" aria-label="Whole-song Hybrid overview" style="display:block">`
-        + `<rect width="${width}" height="${height}" rx="7" fill="#0f172a"/>${entries}${decisions}${passages}`
+    const passageItems = view.passages || [];
+    const densePassages = passageItems.length > COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT;
+    const passages = densePassages
+        ? compositeTimelineOverviewGroupedIntervals(passageItems, x, {
+            kind: 'passage', y: 31, height: 7,
+            colors: passageColors,
+            active: passage => passage.active,
+        }) + passageItems.filter(passage => passage.active).map(passage =>
+            compositeTimelineOverviewPassageMarkup(passage, x, width, passageColors)).join('')
+        : passageItems.map(passage =>
+            compositeTimelineOverviewPassageMarkup(passage, x, width, passageColors)).join('');
+    const groupedDescription = denseDecisions || densePassages
+        ? `. Dense ${denseDecisions ? `${decisionItems.length} decision markers` : ''}${denseDecisions && densePassages ? ' and ' : ''}${densePassages ? `${passageItems.length} passage markers` : ''} are visually grouped by position and status; focused markers remain individually selectable`
+        : '';
+    const accessibleLabel = `Whole-song Hybrid overview${groupedDescription}`;
+    return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" width="100%" height="42" role="img" aria-label="${escapeMarkup(accessibleLabel)}" style="display:block">`
+        + `<title>${escapeMarkup(accessibleLabel)}</title><rect width="${width}" height="${height}" rx="7" fill="#0f172a"/>${entries}${decisions}${passages}`
         + '</svg>';
 }

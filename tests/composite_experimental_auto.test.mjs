@@ -8,6 +8,7 @@ import {
     EXPERIMENTAL_REASON,
     experimentalComparisonReport,
     experimentalPassageOutcome,
+    experimentalPassageOutcomes,
     experimentalSyncPreflight,
     HYBRID_EXPERIMENTAL_ENGINE_VERSION,
     refreshExperimentalPlayability,
@@ -300,6 +301,64 @@ test('experimental review uses the generic safe resolver and emits a copyable re
     assert.deepEqual(plan.reviewOutcome, {
         offeredNotes: 1, acceptedNotes: 1, leftOutNotes: 0,
     });
+});
+
+test('passage outcome and report caches follow in-place resolutions and replaced plan members', () => {
+    const passageEntry = { id: 'entry:1' };
+    const passage = {
+        id: 'passage:1', status: 'review', label: 'Bar 2', handoffScore: 80,
+        noteCount: 1, entries: [passageEntry], reasons: ['review this handoff'],
+    };
+    const conflict = {
+        id: passage.id, resolution: 'secondary', selectedEntryIds: [passageEntry.id],
+        secondaryEntries: [passageEntry],
+    };
+    const plan = {
+        passages: [passage], conflicts: [conflict],
+        standardComparison: { secondaryAddedCleanly: 0, secondarySkippedByStrategy: 1 },
+        stats: {
+            duplicatesRemoved: 0, semanticDuplicates: 0,
+            secondaryAddedCleanly: 0, secondarySkippedByStrategy: 0,
+            addedPassages: 0, reviewPassages: 1, leftOutPassages: 0,
+        },
+        sync: { status: 'ready', message: 'Ready' },
+        reviewOutcome: { acceptedNotes: 1, leftOutNotes: 0 },
+        playability: { newWarnings: [] },
+        profile: 'balanced',
+    };
+
+    const accepted = experimentalPassageOutcomes(plan);
+    assert.equal(accepted.get(passage.id).state, 'accepted');
+    assert.doesNotThrow(() => structuredClone(plan),
+        'ephemeral indexes and Maps stay outside the Worker-cloned plan');
+    assert.strictEqual(experimentalPassageOutcomes(plan), accepted,
+        'an unchanged resolution reuses the bulk outcome structure');
+    assert.match(experimentalComparisonReport(plan), /Bar 2 — accepted,/);
+
+    conflict.selectedEntryIds.splice(0);
+    const declined = experimentalPassageOutcomes(plan);
+    assert.notStrictEqual(declined, accepted,
+        'mutating the selected-id array invalidates the resolution signature');
+    assert.equal(declined.get(passage.id).state, 'declined');
+    assert.match(experimentalComparisonReport(plan), /Bar 2 — declined,/,
+        'the cached report follows the same resolution-sensitive outcome set');
+
+    passage.label = 'Late fill';
+    assert.match(experimentalComparisonReport(plan), /Late fill — declined,/,
+        'in-place report metadata edits cannot leave cached text behind');
+    passage.status = 'automatic';
+    assert.equal(experimentalPassageOutcomes(plan).get(passage.id).state, 'automatic',
+        'in-place passage state edits invalidate the bulk outcome structure');
+    passage.status = 'review';
+
+    plan.conflicts[0] = {
+        ...conflict, resolution: 'secondary', selectedEntryIds: [passageEntry.id],
+    };
+    assert.equal(experimentalPassageOutcome(plan, passage.id).state, 'accepted',
+        'same-length conflict replacement rebuilds the cached id index');
+    plan.passages[0] = { ...passage, status: 'automatic' };
+    assert.equal(experimentalPassageOutcome(plan, passage.id).state, 'automatic',
+        'same-length passage replacement also rebuilds its id index');
 });
 
 test('differential playability refreshes after a reviewed passage is accepted', () => {

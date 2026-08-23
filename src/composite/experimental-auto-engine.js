@@ -49,6 +49,11 @@ const SEMANTIC_NOTE_FIELDS = new Set([
 ]);
 
 const experimentalPlayabilityCache = new WeakMap();
+const experimentalConflictIndexCache = new WeakMap();
+const experimentalPassageIndexCache = new WeakMap();
+const experimentalPassageOutcomeCache = new WeakMap();
+const experimentalPassageOutcomeSetCache = new WeakMap();
+const experimentalComparisonReportCache = new WeakMap();
 
 function clone(value) {
     if (value == null) return value;
@@ -951,30 +956,191 @@ function conflictForPassage(passage) {
     };
 }
 
-export function experimentalPassageOutcome(plan, passageOrId) {
-    const passage = typeof passageOrId === 'string'
-        ? (plan?.passages || []).find(candidate => candidate.id === passageOrId)
-        : passageOrId;
+function indexedPlanItem(cache, collection, id) {
+    if (!Array.isArray(collection) || !id) return null;
+    let cached = cache.get(collection);
+    const rebuild = () => {
+        const byId = new Map();
+        collection.forEach((value, index) => {
+            // Preserve Array.find's first-match behavior if malformed imported
+            // data ever contains duplicate ids.
+            if (value?.id && !byId.has(value.id)) byId.set(value.id, { index, value });
+        });
+        cached = { length: collection.length, byId };
+        cache.set(collection, cached);
+    };
+    if (!cached || cached.length !== collection.length) rebuild();
+    let indexed = cached.byId.get(id);
+    // Resolution edits mutate conflict objects but do not replace the plan's
+    // conflict array. Still validate the indexed slot so tests, restored plans,
+    // or future editing tools may replace/reorder entries without leaving a
+    // stale lookup behind. A miss is also rebuilt to catch same-length edits.
+    if (!indexed || collection[indexed.index] !== indexed.value
+            || indexed.value?.id !== id) {
+        rebuild();
+        indexed = cached.byId.get(id);
+    }
+    return indexed?.value || null;
+}
+
+function experimentalPassageForId(plan, id) {
+    return indexedPlanItem(experimentalPassageIndexCache, plan?.passages, id);
+}
+
+function experimentalConflictForPassage(plan, passageId) {
+    return indexedPlanItem(experimentalConflictIndexCache, plan?.conflicts, passageId);
+}
+
+function experimentalPassageResolutionSignature(conflict) {
+    return JSON.stringify([
+        conflict?.resolution || '',
+        conflict?.selectedEntryIds || [],
+    ]);
+}
+
+function computeExperimentalPassageOutcome(plan, passage,
+    conflict = experimentalConflictForPassage(plan, passage?.id)) {
     if (!passage) return null;
     if (passage.status === 'automatic') {
-        return { state: 'automatic', selectedNotes: passage.noteCount, offeredNotes: passage.noteCount };
+        return Object.freeze({
+            state: 'automatic', selectedNotes: passage.noteCount, offeredNotes: passage.noteCount,
+        });
     }
     if (passage.status === 'left-out') {
-        return { state: 'left-out', selectedNotes: 0, offeredNotes: passage.noteCount };
+        return Object.freeze({
+            state: 'left-out', selectedNotes: 0, offeredNotes: passage.noteCount,
+        });
     }
-    const conflict = (plan?.conflicts || []).find(candidate => candidate.id === passage.id);
     if (!conflict?.resolution) {
-        return { state: 'review', selectedNotes: 0, offeredNotes: passage.noteCount };
+        return Object.freeze({
+            state: 'review', selectedNotes: 0, offeredNotes: passage.noteCount,
+        });
     }
     const selected = new Set(conflict.selectedEntryIds || []);
     const selectedNotes = (passage.entries || []).filter(entry => selected.has(entry.id)).length;
-    return {
+    return Object.freeze({
         state: selectedNotes > 0
             ? selectedNotes === passage.noteCount ? 'accepted' : 'accepted-partial'
             : 'declined',
         selectedNotes,
         offeredNotes: passage.noteCount,
+    });
+}
+
+export function experimentalPassageOutcome(plan, passageOrId) {
+    const passage = typeof passageOrId === 'string'
+        ? experimentalPassageForId(plan, passageOrId)
+        : passageOrId;
+    if (!passage) return null;
+    if (!plan || typeof plan !== 'object') return computeExperimentalPassageOutcome(plan, passage);
+    let outcomes = experimentalPassageOutcomeCache.get(plan);
+    if (!outcomes) {
+        outcomes = new Map();
+        experimentalPassageOutcomeCache.set(plan, outcomes);
+    }
+    const conflict = passage.status === 'review'
+        ? experimentalConflictForPassage(plan, passage.id) : null;
+    const resolutionSignature = experimentalPassageResolutionSignature(conflict);
+    const entrySignature = JSON.stringify((passage.entries || []).map(entry => entry.id));
+    const cached = outcomes.get(passage.id);
+    if (cached && cached.passage === passage && cached.conflict === conflict
+            && cached.status === passage.status && cached.noteCount === passage.noteCount
+            && cached.entries === passage.entries
+            && cached.entrySignature === entrySignature
+            && cached.resolutionSignature === resolutionSignature) return cached.outcome;
+    const outcome = computeExperimentalPassageOutcome(plan, passage, conflict);
+    outcomes.set(passage.id, {
+        passage,
+        conflict,
+        status: passage.status,
+        noteCount: passage.noteCount,
+        entries: passage.entries,
+        entrySignature,
+        resolutionSignature,
+        outcome,
+    });
+    return outcome;
+}
+
+function sameMembers(collection, snapshot) {
+    if (!Array.isArray(collection) || collection.length !== snapshot?.length) return false;
+    for (let index = 0; index < collection.length; index++) {
+        if (collection[index] !== snapshot[index]) return false;
+    }
+    return true;
+}
+
+function experimentalPassageStateSignature(passages) {
+    return JSON.stringify((passages || []).map(passage => [
+        passage.id,
+        passage.status,
+        passage.noteCount,
+        (passage.entries || []).map(entry => entry.id),
+    ]));
+}
+
+function experimentalPassageOutcomeSet(plan) {
+    const passages = plan?.passages || [];
+    const conflicts = plan?.conflicts || [];
+    const resolutionSignature = experimentalResolutionSignature(plan);
+    const passageStateSignature = experimentalPassageStateSignature(passages);
+    const cached = experimentalPassageOutcomeSetCache.get(plan);
+    if (cached && cached.resolutionSignature === resolutionSignature
+            && cached.passageStateSignature === passageStateSignature
+            && sameMembers(passages, cached.passages)
+            && sameMembers(conflicts, cached.conflicts)) return cached;
+    const outcomes = new Map();
+    for (const passage of passages) {
+        outcomes.set(passage.id, experimentalPassageOutcome(plan, passage));
+    }
+    const result = {
+        resolutionSignature,
+        passageStateSignature,
+        passages: passages.slice(),
+        conflicts: conflicts.slice(),
+        outcomes,
     };
+    experimentalPassageOutcomeSetCache.set(plan, result);
+    return result;
+}
+
+// One bulk lookup is used by both the report and the timeline. The returned
+// Map is an ephemeral cache value (never attached to a Worker-cloned plan) and
+// is replaced whenever any resolution or plan member changes.
+export function experimentalPassageOutcomes(plan) {
+    if (!plan || typeof plan !== 'object') return new Map();
+    return experimentalPassageOutcomeSet(plan).outcomes;
+}
+
+function experimentalComparisonReportSignature(plan) {
+    const sync = plan.sync || {};
+    const stats = plan.stats || {};
+    const standard = plan.standardComparison || {};
+    const review = plan.reviewOutcome || {};
+    return JSON.stringify([
+        plan.engineVersion || HYBRID_EXPERIMENTAL_ENGINE_VERSION,
+        plan.profile,
+        sync.status,
+        sync.message,
+        stats.duplicatesRemoved,
+        stats.semanticDuplicates,
+        standard.secondaryAddedCleanly,
+        standard.secondarySkippedByStrategy,
+        stats.secondaryAddedCleanly,
+        review.acceptedNotes,
+        stats.secondarySkippedByStrategy,
+        review.leftOutNotes,
+        stats.addedPassages,
+        stats.reviewPassages,
+        stats.leftOutPassages,
+        plan.playability?.newWarnings?.length || 0,
+        (plan.passages || []).map(passage => [
+            passage.id,
+            passage.label,
+            passage.handoffScore,
+            passage.reasons || [],
+        ]),
+    ]);
 }
 
 // Formatting is deliberately pure. Call refreshExperimentalPlayability after
@@ -985,12 +1151,17 @@ export function experimentalComparisonReport(plan) {
     const sync = plan.sync || {};
     const outcome = plan.reviewOutcome || {};
     const playability = plan.playability || { newWarnings: [] };
+    const outcomeSet = experimentalPassageOutcomeSet(plan);
+    const reportSignature = experimentalComparisonReportSignature(plan);
+    const cached = experimentalComparisonReportCache.get(plan);
+    if (cached && cached.outcomeSet === outcomeSet
+            && cached.reportSignature === reportSignature) return cached.report;
     const passageLines = (plan.passages || []).map((passage, index) => {
-        const outcome = experimentalPassageOutcome(plan, passage);
+        const passageOutcome = outcomeSet.outcomes.get(passage.id);
         const reasons = passage.reasons?.length ? passage.reasons.join('; ') : 'clean handoffs';
-        return `  ${index + 1}. ${passage.label} — ${outcome.state}, ${passage.handoffScore}/100: ${reasons}`;
+        return `  ${index + 1}. ${passage.label} — ${passageOutcome.state}, ${passage.handoffScore}/100: ${reasons}`;
     });
-    return [
+    const report = [
         'Hybrid Track automatic comparison',
         `Experimental engine: v${plan.engineVersion || HYBRID_EXPERIMENTAL_ENGINE_VERSION}`,
         `Profile: ${plan.profile}`,
@@ -1002,14 +1173,20 @@ export function experimentalComparisonReport(plan) {
         `New playability warnings versus the base track: ${playability.newWarnings.length}`,
         ...(passageLines.length ? ['Passage details:', ...passageLines] : []),
     ].join('\n');
+    experimentalComparisonReportCache.set(plan, {
+        outcomeSet,
+        reportSignature,
+        report,
+    });
+    return report;
 }
 
 function experimentalResolutionSignature(plan) {
-    return (plan.conflicts || []).map(conflict => [
+    return JSON.stringify((plan.conflicts || []).map(conflict => [
         conflict.id,
         conflict.resolution || '',
         ...(conflict.selectedEntryIds || []).slice().sort(),
-    ].join(':')).join('|');
+    ]));
 }
 
 function experimentalReviewOutcome(plan) {
