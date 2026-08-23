@@ -45,10 +45,23 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
     const playheadStart = resolver.indexOf('function updateCompositeTimelinePlayhead');
     const playheadEnd = resolver.indexOf('function startCompositeTimelinePlayhead', playheadStart);
     const playheadBody = resolver.slice(playheadStart, playheadEnd);
+    const activePlaybackBody = playheadBody.slice(
+        playheadBody.indexOf('if (activelyPlaying)'),
+        playheadBody.indexOf('} else if (hybridSession.previewPlaying'));
     assert.doesNotMatch(playheadBody, /innerHTML\s*=/,
         'the animation frame may move geometry but never regenerate note markup');
-    assert.match(playheadBody, /applyCompositeTimelineCamera\(dom, visualScroll, x\)/,
-        'the per-frame path delegates every moving layer to the shared compositor camera');
+    assert.match(playheadBody,
+        /applyCompositeTimelineCamera\(dom, visualScroll, frame\.contentX\)/,
+        'the per-frame path delegates the time surfaces to the shared compositor camera');
+    assert.doesNotMatch(activePlaybackBody, /syncCompositeTimelineNativeCamera/,
+        'playback never forces the native scrollbar to catch up');
+    assert.doesNotMatch(activePlaybackBody, /\.scrollLeft\s*=/,
+        'the animation frame never writes native scroll state');
+    assert.match(resolver, /data-composite-timeline-camera/);
+    assert.match(resolver, /if \(dom\.camera\) dom\.camera\.style\.transform = layerTransform/,
+        'the ruler and all lanes share one moving compositor layer');
+    assert.doesNotMatch(resolver, /rulerSvg\.style\.transform|lane\.svg\.style\.transform/,
+        'large SVG surfaces are not animated independently');
     assert.match(resolver, /dom\.playhead\.style\.transform\s*=\s*`translate3d/,
         'the moving playhead stays on the compositor instead of invalidating layout');
     assert.doesNotMatch(playheadBody, /playhead\.style\.left\s*=/);

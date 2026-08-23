@@ -26,7 +26,9 @@ const {
     _editorPlaybackPaintRequiredPure,
     _guideChartToCtxPure,
     _guideScheduleWindowPure,
+    editorPlaybackVisualTime,
 } = await import('../src/audio.js');
+const { S } = await import('../src/state.js');
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -94,6 +96,37 @@ t('a focused Hybrid preview owns the visible frame and suppresses the hidden edi
         'ordinary editor playback still paints the editor canvas');
     assert.equal(_editorPlaybackPaintRequiredPure(true), false,
         'focused preview playback does not repaint the obscured editor canvas');
+});
+
+t('the focused visual clock samples AudioContext directly between editor animation frames', () => {
+    const saved = {
+        playing: S.playing,
+        audioCtx: S.audioCtx,
+        playStartTime: S.playStartTime,
+        playStartWall: S.playStartWall,
+        cursorTime: S.cursorTime,
+        cursorDrawTime: S.cursorDrawTime,
+        auditionRate: S.auditionRate,
+    };
+    try {
+        S.playing = true;
+        S.audioCtx = { currentTime: 101 };
+        S.playStartTime = 3;
+        S.playStartWall = 100;
+        S.cursorTime = 3;
+        S.cursorDrawTime = 3;
+        S.auditionRate = 1;
+        assert.ok(near(editorPlaybackVisualTime(), 4));
+        S.audioCtx.currentTime = 101.25;
+        assert.ok(near(editorPlaybackVisualTime(), 4.25),
+            'time advances even when playbackTick has not changed S.cursorTime');
+        S.playing = false;
+        S.cursorDrawTime = 7;
+        assert.ok(near(editorPlaybackVisualTime(), 7),
+            'stopped transport returns the settled painted cursor');
+    } finally {
+        Object.assign(S, saved);
+    }
 });
 
 // ── 4. output-latency compensation is a paint-only chart-time offset ──────────

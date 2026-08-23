@@ -305,11 +305,36 @@ export function compositeTimelineCameraOffsetPure(nativeScrollLeft = 0,
     return native - finite(visualScrollLeft, native);
 }
 
-export function compositeTimelineCameraShouldCommitPure(nativeScrollLeft = 0,
-    visualScrollLeft = nativeScrollLeft, thresholdPx = 192) {
-    const threshold = Math.max(1, finite(thresholdPx, 192));
-    return Math.abs(compositeTimelineCameraOffsetPure(
-        nativeScrollLeft, visualScrollLeft)) >= threshold;
+export function compositeTimelineCameraFramePure({
+    beat = 0,
+    context = {},
+    zoom = HYBRID_PREVIEW_DEFAULTS.timelineZoom,
+    viewportWidth = 1200,
+    visualScrollLeft = 0,
+    follow = false,
+} = {}) {
+    const width = Math.max(1, finite(viewportWidth, 1200));
+    const contentX = compositeTimelineXForBeatPure(beat, context, zoom);
+    const maxScroll = Math.max(0,
+        compositeTimelineContentWidthPure(context, zoom) - width);
+    const wantedScroll = follow
+        ? compositeTimelineCenteredScrollPure({ beat, context, zoom, viewportWidth: width })
+        : finite(visualScrollLeft);
+    const scrollLeft = Math.max(0, Math.min(maxScroll, wantedScroll));
+    return {
+        contentX,
+        visualScrollLeft: scrollLeft,
+        screenX: contentX - scrollLeft,
+        maxScroll,
+    };
+}
+
+export function compositeTimelineRenderBufferPure(viewportWidth = 1200) {
+    return Math.max(1800, Math.max(1, finite(viewportWidth, 1200)) * 2);
+}
+
+export function compositeTimelineRenderGuardPure(viewportWidth = 1200) {
+    return Math.max(600, Math.max(1, finite(viewportWidth, 1200)) * 0.75);
 }
 
 // The notes are rendered with a generous buffer on either side. Reuse that
@@ -495,7 +520,7 @@ export function renderCompositeTimelineRulerContents(view, visibleRange, zoom) {
         + (view.review ? `<text x="${(compositeTimelineXForBeatPure(view.review.startBeat, view.context, z) + 5).toFixed(1)}" y="29" fill="#fef3c7" font-size="9" font-weight="700">REVIEW</text>` : '');
 }
 
-export function renderCompositeTimelineLaneHeader(view, laneId, height) {
+export function renderCompositeTimelineLaneHeader(view, laneId, height, { fixed = false } = {}) {
     const lane = view.lanes.find(candidate => candidate.id === laneId);
     const laneHeight = compositeTimelineLaneHeightPure(height);
     const colors = COLORS[laneId] || COLORS.result;
@@ -510,7 +535,8 @@ export function renderCompositeTimelineLaneHeader(view, laneId, height) {
     const selectedStyle = selected
         ? `;box-shadow:inset 4px 0 0 ${colors.main},0 0 0 1px ${colors.main};background:${colors.soft}` : '';
     const selectedLabel = selected ? ', selected for this decision' : '';
-    return `<div data-composite-timeline-header="${laneId}" data-composite-choice-active="${selected}" aria-label="${escapeMarkup(`${lane.label}${selectedLabel}`)}" class="sticky left-0 z-50 border-r border-slate-600/80 px-3 py-2 shadow-lg" style="width:${COMPOSITE_TIMELINE_GUTTER}px;height:${laneHeight}px;background:#111827${selectedStyle}">`
+    const positionClass = fixed ? 'relative' : 'sticky left-0';
+    return `<div data-composite-timeline-header="${laneId}" data-composite-choice-active="${selected}" aria-label="${escapeMarkup(`${lane.label}${selectedLabel}`)}" class="${positionClass} z-50 border-r border-slate-600/80 px-3 py-2 shadow-lg" style="width:${COMPOSITE_TIMELINE_GUTTER}px;height:${laneHeight}px;background:#111827${selectedStyle}">`
         + `<b class="block truncate text-sm" style="color:${colors.text}" title="${escapeMarkup(lane.label)}">${escapeMarkup(lane.label)}</b>`
         + `<span class="block pr-5 text-xs leading-snug text-slate-400" title="${escapeMarkup(lane.subtitle)}">${escapeMarkup(lane.subtitle)}</span>`
         + (selected ? `<span class="mt-1 inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold" style="color:${colors.text};background:${colors.soft};border:1px solid ${colors.main}">Selected</span>` : '')
@@ -572,7 +598,7 @@ export function renderCompositeTimelineMapSvg(view, viewportRange, playheadBeat 
     const playheadX = Math.max(0, Math.min(width, x(playheadBeat)));
     return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" width="100%" height="42" role="img" aria-label="Whole-song Hybrid overview; the outlined window is the visible timeline" style="display:block">`
         + `<rect width="${width}" height="${height}" rx="7" fill="#0f172a"/>${entries}${decisions}${passages}`
-        + `<rect id="editor-composite-map-viewport" x="${viewport.x.toFixed(1)}" y="3" width="${viewport.width.toFixed(1)}" height="36" rx="5" fill="#38bdf8" fill-opacity="0.08" stroke="#7dd3fc" stroke-width="2" pointer-events="none"/>`
-        + `<line id="editor-composite-map-playhead" x1="${playheadX.toFixed(1)}" y1="2" x2="${playheadX.toFixed(1)}" y2="40" stroke="#fb7185" stroke-width="2" pointer-events="none"/>`
+        + `<rect id="editor-composite-map-viewport" x="0" y="3" width="${viewport.width.toFixed(1)}" height="36" rx="5" fill="#38bdf8" fill-opacity="0.08" stroke="#7dd3fc" stroke-width="2" pointer-events="none" transform="translate(${viewport.x.toFixed(1)} 0)"/>`
+        + `<line id="editor-composite-map-playhead" x1="0" y1="2" x2="0" y2="40" stroke="#fb7185" stroke-width="2" pointer-events="none" transform="translate(${playheadX.toFixed(1)} 0)"/>`
         + '</svg>';
 }

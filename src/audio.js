@@ -1025,6 +1025,22 @@ export function stopPlayback() {
     _abApplyRefGain();
 }
 
+// Focused workspaces paint on their own animation frame. Sampling the live
+// AudioContext anchor here avoids waiting for playbackTick to publish a cursor
+// from a separate rAF, which can otherwise repeat a visual frame even though
+// the audio clock has advanced. This is read-only and uses the same held output
+// latency as the normal Editor playhead.
+export function editorPlaybackVisualTime() {
+    const fallback = Math.max(0, Number(S.cursorDrawTime) || Number(S.cursorTime) || 0);
+    if (!S.playing || !S.audioCtx) return fallback;
+    return _cursorDrawTimePure(
+        S.playStartTime,
+        S.playStartWall,
+        S.audioCtx.currentTime,
+        _heldOutputLatency,
+        _auditionRate());
+}
+
 export function playbackTick() {
     if (!S.playing) return;
     // Focused tools such as the Hybrid Track reviewer paint their own visible

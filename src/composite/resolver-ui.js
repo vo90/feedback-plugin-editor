@@ -9,6 +9,7 @@ import { arrKind, _isFrettedKind } from '../instrument.js';
 import { beatOf, timeOf } from '../beats.js';
 import {
     editorClearGuidePreview,
+    editorPlaybackVisualTime,
     editorPrepareGuidePreview,
     editorSetGuidePreview,
     editorUpdateGuidePreviewMix,
@@ -83,19 +84,20 @@ import {
     COMPOSITE_TIMELINE_GUTTER,
     COMPOSITE_TIMELINE_RULER_HEIGHT,
     compositeTimelineBeatForXPure,
+    compositeTimelineCameraFramePure,
     compositeTimelineCameraOffsetPure,
-    compositeTimelineCameraShouldCommitPure,
     compositeTimelineCenteredScrollPure,
     compositeTimelineContentWidthPure,
     compositeTimelineFitZoomPure,
     compositeTimelineLaneHeightPure,
     compositeTimelineMapViewportPure,
     compositeTimelineMapBeatPure,
+    compositeTimelineRenderBufferPure,
+    compositeTimelineRenderGuardPure,
     compositeTimelineRenderWindowNeedsRefreshPure,
     compositeTimelineSteppedZoomPure,
     compositeTimelineVisibleRangePure,
     compositeTimelineViewportRangePure,
-    compositeTimelineXForBeatPure,
     compositeTimelineZoomAtPure,
     renderCompositeTimelineLaneContents,
     renderCompositeTimelineLaneHeader,
@@ -160,7 +162,7 @@ let hybridPreviewPreferences = hybridPreviewPreferencesPure(null);
 let timelineViewportFrame = 0;
 let timelinePlayheadFrame = 0;
 let timelineResizeObserver = null;
-let timelineIgnoreNextScroll = false;
+let timelineProgrammaticScrollTarget = null;
 let dialogResizeObserver = null;
 let dialogResizeSaveTimer = 0;
 let timelineViewCache = null;
@@ -506,7 +508,7 @@ function endCompositePreviewPlayback() {
     if (hybridSession.previewPlaying && S.playing) stopPlayback();
     // Settle any fractional compositor camera into the real scrollbar before
     // playback stops, so manual scrolling resumes from the exact visible view.
-    syncCompositeTimelineNativeCamera(timelineViewportDom, true);
+    syncCompositeTimelineNativeCamera(timelineViewportDom);
     editorClearGuidePreview();
     hybridSession.previewPlaying = false;
     hybridSession.previewLoading = false;
@@ -1560,14 +1562,22 @@ function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar
     const viewport = compositeTimelineViewportRangePure({
         context: view.context, zoom, scrollLeft: 0, viewportWidth: 1400,
     });
+    const laneHeights = new Map(view.lanes.map(lane => [lane.id,
+        compositeTimelineLaneHeightPure(hybridPreviewPreferences.laneHeights[lane.id])]));
     const rows = view.lanes.map(lane => {
-        const height = compositeTimelineLaneHeightPure(hybridPreviewPreferences.laneHeights[lane.id]);
+        const height = laneHeights.get(lane.id);
         return `<div class="relative border-t border-slate-700/80" data-composite-timeline-row="${lane.id}" style="height:${height}px;width:${width}px;min-width:100%">`
-            + `<svg data-composite-timeline-lane-svg="${lane.id}" width="${width}" height="${height}" role="group" aria-label="${_editorEscHtml(lane.label)} full-song tablature" style="position:absolute;inset:0;display:block;width:${width}px;height:${height}px;max-width:none;contain:paint;will-change:transform">`
+            + `<svg data-composite-timeline-lane-svg="${lane.id}" width="${width}" height="${height}" role="group" aria-label="${_editorEscHtml(lane.label)} full-song tablature" style="position:absolute;inset:0;display:block;width:${width}px;height:${height}px;max-width:none;contain:paint">`
             + renderCompositeTimelineLaneContents(view, lane.id, height, visible, zoom) + '</svg>'
-            + renderCompositeTimelineLaneHeader(view, lane.id, height)
             + `<button type="button" data-composite-lane-resize="${lane.id}" role="separator" aria-orientation="horizontal" aria-label="Resize ${_editorEscHtml(lane.label)} track" title="Drag to resize this track; double-click to reset" class="absolute bottom-0 left-0 z-30 h-2 w-full select-none border-0 bg-transparent" style="cursor:row-resize;touch-action:none;user-select:none"></button></div>`;
     }).join('');
+    const fixedHeaders = `<div data-composite-timeline-fixed-headers class="sticky left-0 top-0 z-50" style="width:${COMPOSITE_TIMELINE_GUTTER}px">`
+        + `<div class="relative flex items-center border-b border-r border-slate-600 bg-gray-900 px-3 text-xs font-semibold text-gray-300 shadow-lg" style="width:${COMPOSITE_TIMELINE_GUTTER}px;height:${COMPOSITE_TIMELINE_RULER_HEIGHT}px">Bars and beats</div>`
+        + view.lanes.map(lane => renderCompositeTimelineLaneHeader(
+            view, lane.id, laneHeights.get(lane.id), { fixed: true })).join('')
+        + '</div>';
+    const timelineHeight = COMPOSITE_TIMELINE_RULER_HEIGHT
+        + [...laneHeights.values()].reduce((sum, height) => sum + height, 0);
     const followPressed = hybridPreviewPreferences.followPlayhead
         && !hybridSession.timelineFollowSuspended;
     const title = view.review ? `Decision ${view.review.index + 1}`
@@ -1611,12 +1621,13 @@ function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar
         + `<section class="rounded-xl border border-slate-700 bg-slate-950/60 p-2">`
         + `<div class="editor-composite-map-key"><span><i class="editor-composite-map-base" aria-hidden="true"></i>Hybrid notes</span>${view.hasFillAdditions ? `<span><i class="editor-composite-map-fill" aria-hidden="true"></i>Added from ${_editorEscHtml(view.names.secondary)}</span>` : ''}${decisionKey}${passageKey}</div>`
         + `<button type="button" id="editor-composite-timeline-map" class="mb-1.5 block w-full rounded-lg border border-slate-700 bg-slate-950 p-0 text-left" title="Click or drag to move through the song" aria-label="Navigate the whole song">${renderCompositeTimelineMapSvg(view, viewport)}</button>`
-        + `<div id="editor-composite-timeline-scroller" class="relative overflow-x-auto overflow-y-hidden rounded-lg border border-slate-700 bg-slate-950" style="will-change:scroll-position;contain:layout paint style" tabindex="0" aria-label="Scrollable full-song Hybrid timeline; Control plus mouse wheel changes time zoom">`
-        + `<div id="editor-composite-timeline-content" class="relative" style="width:${width}px;min-width:100%">`
+        + `<div id="editor-composite-timeline-scroller" class="relative overflow-x-auto overflow-y-hidden rounded-lg border border-slate-700 bg-slate-950" style="contain:layout paint style" tabindex="0" aria-label="Scrollable full-song Hybrid timeline; Control plus mouse wheel changes time zoom">`
+        + `<div id="editor-composite-timeline-content" class="relative" style="width:${width}px;min-width:100%;height:${timelineHeight}px">`
+        + `<div data-composite-timeline-camera class="absolute left-0 top-0" style="width:${width}px;will-change:transform;contain:layout paint style">`
         + `<div class="relative border-b border-slate-600" data-composite-timeline-ruler style="height:${COMPOSITE_TIMELINE_RULER_HEIGHT}px;width:${width}px;min-width:100%">`
-        + `<svg data-composite-timeline-ruler-svg width="${width}" height="${COMPOSITE_TIMELINE_RULER_HEIGHT}" role="img" aria-label="Bar and beat ruler; click to seek" style="position:absolute;inset:0;display:block;width:${width}px;height:${COMPOSITE_TIMELINE_RULER_HEIGHT}px;max-width:none;cursor:pointer;contain:paint;will-change:transform">${renderCompositeTimelineRulerContents(view, visible, zoom)}</svg>`
-        + `<div class="sticky left-0 z-50 flex h-full items-center border-r border-slate-600 bg-gray-900 px-3 text-xs font-semibold text-gray-300 shadow-lg" style="width:${COMPOSITE_TIMELINE_GUTTER}px">Bars and beats</div></div>`
-        + rows
+        + `<svg data-composite-timeline-ruler-svg width="${width}" height="${COMPOSITE_TIMELINE_RULER_HEIGHT}" role="img" aria-label="Bar and beat ruler; click to seek" style="position:absolute;inset:0;display:block;width:${width}px;height:${COMPOSITE_TIMELINE_RULER_HEIGHT}px;max-width:none;cursor:pointer;contain:paint">${renderCompositeTimelineRulerContents(view, visible, zoom)}</svg>`
+        + `</div>${rows}</div>`
+        + fixedHeaders
         + renderCompositeTimelinePlayhead()
         + `</div></div></section>`;
 }
@@ -1626,6 +1637,7 @@ function stopCompositeTimelineUi() {
     if (timelinePlayheadFrame) cancelAnimationFrame(timelinePlayheadFrame);
     timelineViewportFrame = 0;
     timelinePlayheadFrame = 0;
+    timelineProgrammaticScrollTarget = null;
     timelineResizeObserver?.disconnect();
     timelineResizeObserver = null;
     timelineViewportDom = null;
@@ -1657,8 +1669,12 @@ function updateCompositeTimelineMapViewport(dom, view, scroller, scrollLeft = un
     const exact = timelineActualViewportRange(view, scroller, scrollLeft);
     const mapViewport = compositeTimelineMapViewportPure(view, exact);
     if (dom.mapViewport) {
-        dom.mapViewport.setAttribute('x', mapViewport.x.toFixed(1));
-        dom.mapViewport.setAttribute('width', mapViewport.width.toFixed(1));
+        const width = mapViewport.width.toFixed(1);
+        if (dom.mapViewport.getAttribute('width') !== width) {
+            dom.mapViewport.setAttribute('width', width);
+        }
+        dom.mapViewport.setAttribute('transform',
+            `translate(${mapViewport.x.toFixed(1)} 0)`);
     }
     return exact;
 }
@@ -1675,17 +1691,21 @@ function refreshCompositeTimelineViewport(force = false) {
     const width = compositeTimelineContentWidthPure(view.context, zoom);
     const visualScroll = compositeTimelineVisualScrollLeft(dom);
     const exact = updateCompositeTimelineMapViewport(dom, view, scroller, visualScroll);
+    const guardPx = compositeTimelineRenderGuardPure(scroller.clientWidth);
     const rebuildMarkup = compositeTimelineRenderWindowNeedsRefreshPure({
         context: view.context,
         zoom,
         renderedZoom: dom.renderedZoom,
         renderedRange: dom.renderedRange,
         viewportRange: exact,
+        guardPx,
         force,
     });
     if (!rebuildMarkup) return;
     content.style.width = `${width}px`;
-    const visible = timelineViewportRange(view, scroller, undefined, visualScroll);
+    const visible = timelineViewportRange(view, scroller,
+        compositeTimelineRenderBufferPure(scroller.clientWidth), visualScroll);
+    if (dom.camera) dom.camera.style.width = `${width}px`;
     const ruler = dom.ruler;
     const rulerSvg = dom.rulerSvg;
     if (ruler) ruler.style.width = `${width}px`;
@@ -1694,16 +1714,19 @@ function refreshCompositeTimelineViewport(force = false) {
         rulerSvg.style.width = `${width}px`;
         rulerSvg.innerHTML = renderCompositeTimelineRulerContents(view, visible, zoom);
     }
+    let timelineHeight = COMPOSITE_TIMELINE_RULER_HEIGHT;
     for (const lane of view.lanes) {
         const laneDom = dom.lanes.get(lane.id);
         const row = laneDom?.row;
         const svg = laneDom?.svg;
         const header = laneDom?.header;
         const height = compositeTimelineLaneHeightPure(hybridPreviewPreferences.laneHeights[lane.id]);
+        timelineHeight += height;
         if (row) { row.style.width = `${width}px`; row.style.height = `${height}px`; }
         if (header && header.style.height !== `${height}px`) {
-            header.outerHTML = renderCompositeTimelineLaneHeader(view, lane.id, height);
-            laneDom.header = row.querySelector(`[data-composite-timeline-header="${lane.id}"]`);
+            header.outerHTML = renderCompositeTimelineLaneHeader(
+                view, lane.id, height, { fixed: true });
+            laneDom.header = content.querySelector(`[data-composite-timeline-header="${lane.id}"]`);
         }
         if (svg) {
             svg.setAttribute('width', String(width));
@@ -1713,6 +1736,7 @@ function refreshCompositeTimelineViewport(force = false) {
             svg.innerHTML = renderCompositeTimelineLaneContents(view, lane.id, height, visible, zoom);
         }
     }
+    content.style.height = `${timelineHeight}px`;
     dom.renderedRange = visible;
     dom.renderedZoom = zoom;
     const output = dom.zoomOutput;
@@ -1753,10 +1777,23 @@ function compositeTimelineVisualScrollLeft(dom = timelineViewportDom) {
         ? Number(dom.visualScrollLeft) : scroller.scrollLeft);
 }
 
-// The sticky track labels remain native DOM elements while every time-bearing
-// SVG moves on the compositor. This gives Follow a fractional, frame-by-frame
-// visual camera without asking Chromium to relayout a huge scroll surface on
-// every frame.
+function scheduleCompositeTimelineRenderAhead(dom, visualScroll) {
+    const scroller = dom?.scroller;
+    if (!dom?.view || !scroller || timelineViewportFrame) return;
+    const viewportRange = timelineActualViewportRange(dom.view, scroller, visualScroll);
+    if (compositeTimelineRenderWindowNeedsRefreshPure({
+        context: dom.view.context,
+        zoom: hybridPreviewPreferences.timelineZoom,
+        renderedZoom: dom.renderedZoom,
+        renderedRange: dom.renderedRange,
+        viewportRange,
+        guardPx: compositeTimelineRenderGuardPure(scroller.clientWidth),
+    })) scheduleCompositeTimelineViewport();
+}
+
+// Labels remain fixed while one shared time-bearing layer moves on the
+// compositor. Native scroll is deliberately left untouched during Follow;
+// settling it is reserved for stop/seek/zoom or an explicit user scroll.
 function applyCompositeTimelineCamera(dom = timelineViewportDom, rawVisualScroll,
     rawPlayheadX = dom?.playheadX) {
     const scroller = dom?.scroller;
@@ -1765,17 +1802,14 @@ function applyCompositeTimelineCamera(dom = timelineViewportDom, rawVisualScroll
     const cameraOffset = compositeTimelineCameraOffsetPure(
         scroller.scrollLeft, visualScroll);
     const layerTransform = `translate3d(${cameraOffset}px,0,0)`;
-    if (dom.rulerSvg) dom.rulerSvg.style.transform = layerTransform;
-    for (const lane of dom.lanes?.values?.() || []) {
-        if (lane?.svg) lane.svg.style.transform = layerTransform;
-    }
+    if (dom.camera) dom.camera.style.transform = layerTransform;
     const playheadX = Number(rawPlayheadX);
     if (Number.isFinite(playheadX)) dom.playheadX = playheadX;
     if (dom.playhead && Number.isFinite(Number(dom.playheadX))) {
         dom.playhead.style.transform = `translate3d(${Number(dom.playheadX) + cameraOffset}px,0,0)`;
     }
     dom.visualScrollLeft = visualScroll;
-    updateCompositeTimelineMapViewport(dom, dom.view, scroller, visualScroll);
+    scheduleCompositeTimelineRenderAhead(dom, visualScroll);
     return visualScroll;
 }
 
@@ -1785,21 +1819,20 @@ function setCompositeTimelineNativeCamera(dom = timelineViewportDom,
     if (!dom || !scroller) return 0;
     const visualScroll = clampTimelineScroll(scroller, rawVisualScroll);
     if (Math.abs(scroller.scrollLeft - visualScroll) >= 0.5) {
-        timelineIgnoreNextScroll = true;
+        timelineProgrammaticScrollTarget = visualScroll;
         scroller.scrollLeft = visualScroll;
     }
+    dom.nativeScrollLeft = scroller.scrollLeft;
     applyCompositeTimelineCamera(dom, visualScroll);
     hybridSession.timelineScrollLeft = visualScroll;
     if (refresh) scheduleCompositeTimelineViewport();
     return visualScroll;
 }
 
-function syncCompositeTimelineNativeCamera(dom = timelineViewportDom, force = false) {
+function syncCompositeTimelineNativeCamera(dom = timelineViewportDom) {
     const scroller = dom?.scroller;
     if (!dom || !scroller) return false;
     const visualScroll = compositeTimelineVisualScrollLeft(dom);
-    if (!force && !compositeTimelineCameraShouldCommitPure(
-        scroller.scrollLeft, visualScroll)) return false;
     setCompositeTimelineNativeCamera(dom, visualScroll);
     return true;
 }
@@ -1859,13 +1892,27 @@ function applyCompositeTimelineZoom(nextZoom, anchorX = null, forceStart = false
     content.style.width = `${compositeTimelineContentWidthPure(view.context, next.zoom)}px`;
     if (dom) setCompositeTimelineNativeCamera(dom, Math.max(0, next.scrollLeft), false);
     else {
-        timelineIgnoreNextScroll = true;
+        timelineProgrammaticScrollTarget = Math.max(0, next.scrollLeft);
         scroller.scrollLeft = Math.max(0, next.scrollLeft);
     }
     refreshCompositeTimelineViewport(true);
 }
 
-function updateCompositeTimelinePlayhead() {
+function updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime = 0, force = false) {
+    if (!dom?.view || !dom.scroller) return;
+    const timestamp = Number(frameTime) || 0;
+    if (!force && timestamp && timestamp - (dom.mapPaintAt || 0) < 15) return;
+    dom.mapPaintAt = timestamp || performance.now?.() || 0;
+    const span = Math.max(1, dom.view.context.endBeat - dom.view.context.startBeat);
+    const mapX = Math.max(0, Math.min(1000,
+        ((beat - dom.view.context.startBeat) / span) * 1000));
+    if (dom.mapPlayhead) {
+        dom.mapPlayhead.setAttribute('transform', `translate(${mapX.toFixed(2)} 0)`);
+    }
+    updateCompositeTimelineMapViewport(dom, dom.view, dom.scroller, visualScroll);
+}
+
+function updateCompositeTimelinePlayhead(frameTime = 0) {
     timelinePlayheadFrame = 0;
     if (!_compositeTimelineStageActivePure(hybridSession.stage)) return;
     const dom = timelineViewportDom;
@@ -1873,42 +1920,35 @@ function updateCompositeTimelinePlayhead() {
     const scroller = dom?.scroller;
     const playhead = dom?.playhead;
     if (!view || !scroller || !playhead) return;
-    const time = hybridSession.previewPlaying && S.playing
-        ? Number(S.cursorTime) || 0 : hybridSession.timelineSeekTime;
+    const activelyPlaying = hybridSession.previewPlaying && S.playing;
+    const time = activelyPlaying
+        ? editorPlaybackVisualTime() : hybridSession.timelineSeekTime;
     const beat = beatOf(hybridSession.plan.beats, time);
-    const x = compositeTimelineXForBeatPure(beat, view.context,
-        hybridPreviewPreferences.timelineZoom);
-    let visualScroll = compositeTimelineVisualScrollLeft(dom);
-    const mapPlayhead = dom.mapPlayhead;
-    if (mapPlayhead) {
-        const span = Math.max(1, view.context.endBeat - view.context.startBeat);
-        const mapX = Math.max(0, Math.min(1000,
-            ((beat - view.context.startBeat) / span) * 1000));
-        mapPlayhead.setAttribute('x1', String(mapX));
-        mapPlayhead.setAttribute('x2', String(mapX));
-    }
-    if (hybridSession.previewPlaying && S.playing) {
+    const frame = compositeTimelineCameraFramePure({
+        beat,
+        context: view.context,
+        zoom: hybridPreviewPreferences.timelineZoom,
+        viewportWidth: scroller.clientWidth,
+        visualScrollLeft: compositeTimelineVisualScrollLeft(dom),
+        follow: activelyPlaying && hybridPreviewPreferences.followPlayhead
+            && !hybridSession.timelineFollowSuspended,
+    });
+    const visualScroll = frame.visualScrollLeft;
+    if (activelyPlaying) {
         hybridSession.timelineSeekTime = Math.max(0, time);
-        if (hybridPreviewPreferences.followPlayhead && !hybridSession.timelineFollowSuspended) {
-            visualScroll = clampTimelineScroll(scroller,
-                compositeTimelineCenteredScrollPure({
-                    beat,
-                    context: view.context,
-                    zoom: hybridPreviewPreferences.timelineZoom,
-                    viewportWidth: scroller.clientWidth,
-                }));
-            hybridSession.timelineScrollLeft = visualScroll;
-        }
-        applyCompositeTimelineCamera(dom, visualScroll, x);
-        syncCompositeTimelineNativeCamera(dom);
+        hybridSession.timelineScrollLeft = visualScroll;
+        applyCompositeTimelineCamera(dom, visualScroll, frame.contentX);
+        updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime);
         timelinePlayheadFrame = requestAnimationFrame(updateCompositeTimelinePlayhead);
     } else if (hybridSession.previewPlaying && !S.playing) {
-        applyCompositeTimelineCamera(dom, visualScroll, x);
-        syncCompositeTimelineNativeCamera(dom, true);
+        applyCompositeTimelineCamera(dom, visualScroll, frame.contentX);
+        updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime, true);
+        syncCompositeTimelineNativeCamera(dom);
         hybridSession.previewPlaying = false;
         updateCompositePreviewButtons();
     } else {
-        applyCompositeTimelineCamera(dom, visualScroll, x);
+        applyCompositeTimelineCamera(dom, visualScroll, frame.contentX);
+        updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime, true);
     }
 }
 
@@ -1975,6 +2015,8 @@ function bindCompositeTimelineEvents() {
         view,
         scroller,
         content,
+        camera: content?.querySelector('[data-composite-timeline-camera]'),
+        fixedHeaders: content?.querySelector('[data-composite-timeline-fixed-headers]'),
         ruler: content?.querySelector('[data-composite-timeline-ruler]'),
         rulerSvg: content?.querySelector('[data-composite-timeline-ruler-svg]'),
         lanes,
@@ -1988,29 +2030,58 @@ function bindCompositeTimelineEvents() {
         renderedRange: null,
         renderedZoom: null,
         visualScrollLeft: scroller.scrollLeft,
+        nativeScrollLeft: scroller.scrollLeft,
         playheadX: null,
+        mapPaintAt: 0,
     };
     scroller.addEventListener('scroll', () => {
-        const internalCameraCommit = timelineIgnoreNextScroll;
+        const dom = timelineViewportDom;
+        if (!dom) return;
+        const programmaticTarget = timelineProgrammaticScrollTarget;
+        timelineProgrammaticScrollTarget = null;
+        const internalCameraCommit = Number.isFinite(Number(programmaticTarget))
+            && Math.abs(scroller.scrollLeft - Number(programmaticTarget)) < 0.5;
         if (internalCameraCommit) {
-            timelineIgnoreNextScroll = false;
-            applyCompositeTimelineCamera(timelineViewportDom,
-                compositeTimelineVisualScrollLeft(timelineViewportDom));
+            dom.nativeScrollLeft = scroller.scrollLeft;
+            applyCompositeTimelineCamera(dom, compositeTimelineVisualScrollLeft(dom));
         } else {
-            hybridSession.timelineScrollLeft = scroller.scrollLeft;
-            applyCompositeTimelineCamera(timelineViewportDom, scroller.scrollLeft);
+            const previousNative = Number.isFinite(Number(dom.nativeScrollLeft))
+                ? Number(dom.nativeScrollLeft) : scroller.scrollLeft;
+            const visualScroll = clampTimelineScroll(scroller,
+                compositeTimelineVisualScrollLeft(dom) + scroller.scrollLeft - previousNative);
+            dom.nativeScrollLeft = scroller.scrollLeft;
+            hybridSession.timelineScrollLeft = visualScroll;
+            applyCompositeTimelineCamera(dom, visualScroll);
             if (S.playing) setCompositeTimelineFollowSuspended(true);
         }
+        updateCompositeTimelineMapViewport(dom, view, scroller,
+            compositeTimelineVisualScrollLeft(dom));
         scheduleCompositeTimelineViewport();
     }, { passive: true });
+    const prepareManualScroll = () => {
+        const dom = timelineViewportDom;
+        if (!dom) return;
+        if (Math.abs(scroller.scrollLeft - compositeTimelineVisualScrollLeft(dom)) >= 0.5) {
+            syncCompositeTimelineNativeCamera(dom);
+        }
+        if (S.playing) setCompositeTimelineFollowSuspended(true);
+    };
     scroller.addEventListener('wheel', event => {
-        if (!event.ctrlKey || !event.deltaY) return;
+        if (!event.ctrlKey) {
+            if (event.deltaX || event.deltaY) prepareManualScroll();
+            return;
+        }
+        if (!event.deltaY) return;
         event.preventDefault();
         const rect = scroller.getBoundingClientRect();
         const anchor = event.clientX - rect.left;
         applyCompositeTimelineZoom(compositeTimelineSteppedZoomPure(
             hybridPreviewPreferences.timelineZoom, event.deltaY < 0 ? 1 : -1), anchor);
     }, { passive: false });
+    scroller.addEventListener('pointerdown', event => {
+        if (event.target === scroller) prepareManualScroll();
+    }, { passive: true });
+    scroller.addEventListener('touchstart', prepareManualScroll, { passive: true });
     const ruler = timelineViewportDom.rulerSvg;
     ruler?.addEventListener('click', event => {
         const rect = ruler.getBoundingClientRect();
@@ -2148,9 +2219,13 @@ function bindCompositeTimelineEvents() {
     });
     scroller.addEventListener('keydown', event => {
         const note = event.target.closest?.('[data-composite-entry-id]');
-        if (!note || (event.key !== 'Enter' && event.key !== ' ')) return;
-        event.preventDefault();
-        toggleCompositeCustomEntry(note.dataset.compositeEntryId);
+        if (note && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault();
+            toggleCompositeCustomEntry(note.dataset.compositeEntryId);
+            return;
+        }
+        if (['ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End']
+            .includes(event.key)) prepareManualScroll();
     });
     for (const grip of document.querySelectorAll('[data-composite-lane-resize]')) {
         const reset = () => {

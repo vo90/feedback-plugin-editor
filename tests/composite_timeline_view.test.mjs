@@ -6,14 +6,16 @@ import {
     COMPOSITE_TIMELINE_EDGE_PADDING,
     COMPOSITE_TIMELINE_GUTTER,
     compositeTimelineBeatForXPure,
+    compositeTimelineCameraFramePure,
     compositeTimelineCameraOffsetPure,
-    compositeTimelineCameraShouldCommitPure,
     compositeTimelineCenteredScrollPure,
     compositeTimelineContentWidthPure,
     compositeTimelineEntriesInRangePure,
     compositeTimelineFitZoomPure,
     compositeTimelineMapViewportPure,
     compositeTimelineMapBeatPure,
+    compositeTimelineRenderBufferPure,
+    compositeTimelineRenderGuardPure,
     compositeTimelineRenderWindowNeedsRefreshPure,
     compositeTimelineSongRangePure,
     compositeTimelineSteppedZoomPure,
@@ -108,15 +110,39 @@ test('continuous follow reuses its buffered note window until the viewport nears
     }), true, 'zoom changes always rebuild geometry');
 });
 
-test('the compositor camera glides between periodic native-scroll commits', () => {
+test('the virtual camera glides fractionally without native-scroll catch-up', () => {
     assert.equal(compositeTimelineCameraOffsetPure(200, 212.5), -12.5);
     assert.equal(compositeTimelineCameraOffsetPure(212.5, 200), 12.5);
-    assert.equal(compositeTimelineCameraShouldCommitPure(200, 391), false,
-        'a sub-threshold visual lead stays entirely on the compositor');
-    assert.equal(compositeTimelineCameraShouldCommitPure(200, 392), true,
-        'the native scrollbar catches up at the bounded threshold');
-    assert.equal(compositeTimelineCameraShouldCommitPure(400, 200), true,
-        'backward camera movement uses the same absolute threshold');
+    const context = { startBeat: 0, endBeat: 24 };
+    const start = compositeTimelineCameraFramePure({
+        beat: 0, context, zoom: 60, viewportWidth: 1000, follow: true,
+    });
+    assert.equal(start.visualScrollLeft, 0);
+    assert.equal(start.screenX, COMPOSITE_TIMELINE_GUTTER + COMPOSITE_TIMELINE_EDGE_PADDING);
+    const middle = compositeTimelineCameraFramePure({
+        beat: 8.125, context, zoom: 60, viewportWidth: 1000, follow: true,
+    });
+    assert.equal(middle.screenX, COMPOSITE_TIMELINE_GUTTER
+        + (1000 - COMPOSITE_TIMELINE_GUTTER) / 2);
+    assert.ok(!Number.isInteger(middle.contentX), 'sub-beat motion keeps fractional pixels');
+    const end = compositeTimelineCameraFramePure({
+        beat: 24, context, zoom: 60, viewportWidth: 1000, follow: true,
+    });
+    assert.equal(end.visualScrollLeft, end.maxScroll);
+    assert.equal(end.screenX, 1000 - COMPOSITE_TIMELINE_EDGE_PADDING);
+    const paused = compositeTimelineCameraFramePure({
+        beat: 12, context, zoom: 60, viewportWidth: 1000,
+        visualScrollLeft: 321.5, follow: false,
+    });
+    assert.equal(paused.visualScrollLeft, 321.5,
+        'Follow off preserves the user camera exactly');
+});
+
+test('render-ahead scales with the real viewport instead of a fixed song window', () => {
+    assert.equal(compositeTimelineRenderBufferPure(600), 1800);
+    assert.equal(compositeTimelineRenderBufferPure(1600), 3200);
+    assert.equal(compositeTimelineRenderGuardPure(600), 600);
+    assert.equal(compositeTimelineRenderGuardPure(1600), 1200);
 });
 
 test('cursor-anchored zoom preserves the beat beneath the pointer and clamps scrolling', () => {
