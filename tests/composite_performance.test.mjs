@@ -7,6 +7,7 @@ import {
     hybridPerfGauge,
     hybridPerfSample,
     hybridPerfSummaryPure,
+    hybridPerformanceAssessmentPure,
     hybridPerformanceSnapshot,
     setHybridPerformanceEnabled,
 } from '../src/composite/performance.js';
@@ -14,6 +15,32 @@ import {
 test.afterEach(() => {
     setHybridPerformanceEnabled(false);
     _resetHybridPerformanceForTest();
+});
+
+test('Hybrid release assessment never turns missing traces into false passes', () => {
+    const incomplete = hybridPerformanceAssessmentPure({ timings: {}, counters: {} });
+    assert.equal(incomplete.status, 'incomplete');
+    assert.equal(incomplete.passed, 0);
+    assert.equal(incomplete.notRun, incomplete.gates.length);
+
+    const assessed = hybridPerformanceAssessmentPure({
+        timings: {
+            'audio.preview.startMs': { count: 3, p95: 7 },
+            'audio.preview.stopMs': { count: 3, p95: 3 },
+            'audio.preview.muteScheduleMs': { count: 1, max: 2 },
+            'timeline.playhead.frameMs': { count: 120, p95: 16.9 },
+            'ui.interactionMs': { count: 4, max: 12 },
+            'main.longTaskMs': { count: 1, max: 61 },
+        },
+        counters: {
+            'audio.preview.firstSchedule': 3,
+        },
+    });
+    assert.equal(assessed.status, 'fail');
+    assert.equal(assessed.failed, 1);
+    assert.equal(assessed.notRun, 0);
+    assert.equal(assessed.gates.find(gate => gate.id === 'main-long-task').measured, 61);
+    assert.equal(assessed.gates.find(gate => gate.id === 'dropped-guide-events').state, 'pass');
 });
 
 test('Hybrid performance summaries expose bounded release-relevant percentiles', () => {

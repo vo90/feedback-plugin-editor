@@ -27,7 +27,12 @@ After exercising the builder:
 
 ```js
 editorHybridPerformance.snapshot();
+editorHybridPerformance.assess();
 ```
+
+`assess()` reports each measured release gate as pass, fail, or not run. Missing
+interactions remain not run instead of being treated as successful; use the
+scenario list below until the assessment is complete.
 
 Disable it with:
 

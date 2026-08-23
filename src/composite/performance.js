@@ -117,6 +117,90 @@ export function hybridPerformanceSnapshot() {
     };
 }
 
+const RELEASE_GATES = Object.freeze([
+    Object.freeze({
+        id: 'transport-start', label: 'Warm preview start',
+        timing: 'audio.preview.startMs', limit: 8, statistic: 'p95', unit: 'ms',
+    }),
+    Object.freeze({
+        id: 'transport-stop', label: 'Preview stop',
+        timing: 'audio.preview.stopMs', limit: 8, statistic: 'p95', unit: 'ms',
+    }),
+    Object.freeze({
+        id: 'preview-mute', label: 'Generated preview mute scheduling',
+        timing: 'audio.preview.muteScheduleMs', limit: 5, statistic: 'max', unit: 'ms',
+    }),
+    Object.freeze({
+        id: 'playhead-frame', label: 'Timeline display frame',
+        timing: 'timeline.playhead.frameMs', limit: 25, statistic: 'p95', unit: 'ms',
+    }),
+    Object.freeze({
+        id: 'interaction-task', label: 'Hybrid interaction task',
+        timing: 'ui.interactionMs', limit: 50, statistic: 'max', unit: 'ms',
+    }),
+    Object.freeze({
+        id: 'main-long-task', label: 'Main-thread long task',
+        timing: 'main.longTaskMs', limit: 50, statistic: 'max', unit: 'ms',
+        zeroWhenTiming: 'timeline.playhead.frameMs',
+    }),
+    Object.freeze({
+        id: 'dropped-guide-events', label: 'Dropped guide attacks',
+        counter: 'audio.preview.schedulerDroppedEvents', limit: 0, unit: 'events',
+    }),
+]);
+
+// Turn an in-memory trace into a deliberately strict release checklist. A
+// missing measurement is "not run", never a false pass; developers can see
+// exactly which interactions still need exercising before drawing conclusions.
+export function hybridPerformanceAssessmentPure(snapshot = {}) {
+    const timings = snapshot.timings || {};
+    const counters = snapshot.counters || {};
+    const gates = RELEASE_GATES.map(gate => {
+        if (gate.timing) {
+            const summary = timings[gate.timing];
+            const observedZero = !summary?.count && gate.zeroWhenTiming
+                && Number(timings[gate.zeroWhenTiming]?.count) > 0;
+            const measured = observedZero ? 0 : Number(summary?.[gate.statistic]);
+            if (!observedZero && (!summary?.count || !Number.isFinite(measured))) {
+                return { ...gate, state: 'not-run', measured: null };
+            }
+            return {
+                ...gate,
+                state: measured <= gate.limit ? 'pass' : 'fail',
+                measured,
+                samples: summary?.count || 0,
+            };
+        }
+        const present = Object.prototype.hasOwnProperty.call(counters, gate.counter);
+        const measured = present ? Number(counters[gate.counter]) : 0;
+        // A scheduler trace is considered exercised when any preview scheduler
+        // window was recorded, even when its dropped-event counter correctly
+        // remained absent at zero.
+        const schedulerRan = Number(counters['audio.preview.firstSchedule']) > 0;
+        if (!present && !schedulerRan) {
+            return { ...gate, state: 'not-run', measured: null };
+        }
+        return {
+            ...gate,
+            state: measured <= gate.limit ? 'pass' : 'fail',
+            measured,
+        };
+    });
+    const failed = gates.filter(gate => gate.state === 'fail').length;
+    const notRun = gates.filter(gate => gate.state === 'not-run').length;
+    return {
+        status: failed ? 'fail' : notRun ? 'incomplete' : 'pass',
+        passed: gates.length - failed - notRun,
+        failed,
+        notRun,
+        gates,
+    };
+}
+
+export function hybridPerformanceAssessment() {
+    return hybridPerformanceAssessmentPure(hybridPerformanceSnapshot());
+}
+
 export function resetHybridPerformanceTelemetry() {
     telemetry.samples.clear();
     telemetry.counters.clear();
@@ -153,6 +237,7 @@ export function installHybridPerformanceTools() {
     if (typeof globalThis.window !== 'undefined') {
         globalThis.window.editorHybridPerformance = Object.freeze({
             snapshot: hybridPerformanceSnapshot,
+            assess: hybridPerformanceAssessment,
             reset: resetHybridPerformanceTelemetry,
             enable: setHybridPerformanceEnabled,
         });
