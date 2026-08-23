@@ -138,6 +138,7 @@ can contain local song metadata. Summarize the reproducible evidence here:
 | Power / graphics | Windows Balanced, AC power; GTX 1650 Max-Q + Intel UHD 630 |
 | Synthetic sizes | 1,000 / 5,000 / 20,000 notes per source |
 | Desktop fixture | Majesty; maximized native desktop |
+| Native smoke | Passed Automatic preview, Space playback, preset zoom while playing, Follow retention, Restart synchronization, and Guided Previous/Next navigation |
 | Iterations | 5 per size; first sample reported cold, remaining four summarized warm |
 | Remaining evidence | DPR/window trace, warm desktop telemetry assessment, and 20-cycle heap soak |
 
@@ -161,6 +162,14 @@ budgets:
 At the same size, the Experimental comparison report was 14.10 ms warm median
 and source guide-event conversion was 10.18 ms. The complete local measurement
 summary is stored outside the repository with the other release artifacts.
+
+The native Majesty smoke used Lead as the base and Rhythm as the fill. Before
+playback, the red playhead and blue overview viewport were both initialized at
+the beginning. Space started the original recording; switching from 120 to 60
+px/beat during playback preserved Follow; Restart returned the playhead,
+viewport, and scroll position together. Guided review advanced from decision 1
+to 2 and back without rebuilding the workspace. The temporary review choice
+was discarded and no Hybrid track or feedpak change was saved.
 
 ## Profiling notes
 
