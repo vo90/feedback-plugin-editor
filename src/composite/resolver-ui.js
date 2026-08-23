@@ -43,7 +43,7 @@ import {
 import {
     clearGuidedRepeatGroup,
     detachGuidedRepeatOccurrence,
-    guidedRepeatGroupForBlock,
+    guidedReviewContext,
     guidedReviewGroups,
     normalizeGuidedRepeatMode,
     resolveGuidedRepeatGroup,
@@ -61,7 +61,7 @@ import {
 } from './conflict-view.js';
 import {
     compositePreviewAudioPolicyPure,
-    compositePreviewEventsPure,
+    createCompositePreviewEventCache,
     compositePreviewMixPure,
     compositePreviewModesPure,
     compositePreviewRegionPure,
@@ -189,6 +189,8 @@ let dialogResizeSaveTimer = 0;
 let timelineViewCache = null;
 let timelineViewportDom = null;
 let compositeModalDocumentKeydown = null;
+const convertCompositePreviewEvents = createCompositePreviewEventCache();
+const compositePreviewEventPlanCache = new WeakMap();
 const COMPOSITE_MODAL_NON_EDITING_INPUT_TYPES = new Set([
     'button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio',
     'range', 'reset', 'submit',
@@ -792,25 +794,7 @@ function selectedSourceNames() {
 }
 
 function guidedRepeatContext(plan, block) {
-    if (!plan || plan.strategy !== 'guided' || !block) return null;
-    const groups = guidedReviewGroups(plan);
-    const group = guidedRepeatGroupForBlock(plan, block);
-    const memberIds = new Set(group && group.memberIds || [block.id]);
-    const members = plan.conflicts.map((candidate, index) => ({ block: candidate, index }))
-        .filter(candidate => memberIds.has(candidate.block.id));
-    const groupIndex = Math.max(0, groups.findIndex(candidate => candidate.id === group?.id));
-    return {
-        group,
-        groups,
-        members,
-        groupIndex,
-        grouped: members.length > 1,
-        allResolved: members.every(candidate => !!candidate.block.resolution),
-        unresolvedDecisions: groups.filter(candidate => candidate.memberIds.some(id => {
-            const candidateBlock = plan.conflicts.find(item => item.id === id);
-            return candidateBlock && !candidateBlock.resolution;
-        })).length,
-    };
+    return guidedReviewContext(plan, block);
 }
 
 function resolveReviewChoice(plan, conflictId, resolution, selectedEntryIds = []) {
@@ -1019,6 +1003,47 @@ function currentPreviewView() {
     return currentTimelineView() || currentConflictView() || wholePlanPreviewView();
 }
 
+function compositePreviewEventsForMode(mode) {
+    const plan = hybridSession.plan;
+    if (!plan || !['primary', 'secondary', 'result'].includes(mode)) return [];
+    let cache = compositePreviewEventPlanCache.get(plan);
+    if (!cache) {
+        cache = { primary: null, secondary: null, result: null, resultRevision: -1 };
+        compositePreviewEventPlanCache.set(plan, cache);
+    }
+    const arrangement = mode === 'secondary' ? plan.secondary : plan.primary;
+    const stringCount = plan.compatibility?.stringCount;
+    if (mode !== 'result' && cache[mode] !== null) return cache[mode];
+    if (mode === 'result' && cache.result !== null
+            && cache.resultRevision === hybridSession.resolutionRevision) return cache.result;
+    const entries = mode === 'result'
+        ? compositeResolvedEntries(plan) : plan.sourceEntries?.[mode] || [];
+    const events = convertCompositePreviewEvents(
+        entries, arrangement, plan.beats, stringCount);
+    cache[mode] = events;
+    if (mode === 'result') cache.resultRevision = hybridSession.resolutionRevision;
+    return events;
+}
+
+function scheduleCompositePreviewEventPrewarm(plan = hybridSession.plan) {
+    if (!plan) return;
+    const resolutionRevision = hybridSession.resolutionRevision;
+    const modes = ['primary', 'secondary', 'result'];
+    let index = 0;
+    const queue = () => scheduleCompositeTimelineIdle(deadline => {
+        if (hybridSession.plan !== plan
+                || hybridSession.resolutionRevision !== resolutionRevision) return;
+        if (compositeTimelineInputPending()
+                || Math.max(0, Number(deadline?.timeRemaining?.()) || 0) < 8) {
+            queue();
+            return;
+        }
+        compositePreviewEventsForMode(modes[index++]);
+        if (index < modes.length) queue();
+    });
+    queue();
+}
+
 function setCompositeContextLoop(view, requestedStartTime = null) {
     const region = compositePreviewRegionPure(
         view.playbackContext || view.context, hybridSession.plan.beats);
@@ -1056,7 +1081,6 @@ async function startCompositePreview(mode) {
         setStatus(`Hybrid preview: ${reason}`);
         return;
     }
-    const lane = view.lanes.find(candidate => candidate.id === mode);
     const arrangement = mode === 'secondary'
         ? hybridSession.plan.secondary
         : hybridSession.plan.primary;
@@ -1092,15 +1116,14 @@ async function startCompositePreview(mode) {
     rememberCompositePreviewSession();
     if (S.playing) stopPlayback();
     editorClearGuidePreview();
-    const events = mode === 'song' ? [] : compositePreviewEventsPure(
-        lane ? lane.entries : [], arrangement, hybridSession.plan.beats,
-        hybridSession.plan.compatibility.stringCount);
+    const events = mode === 'song' ? [] : compositePreviewEventsForMode(mode);
     hybridSession.previewRecordingGain = mode === 'song' ? recordingPreviewGainFor(view) : 1;
     editorSetGuidePreview(events, arrKind(arrangement), {
         ...compositePreviewAudioPolicyPure(mode),
         ...hybridPreviewMixFor(mode),
         gm: tone.gm,
         voiceCap: hybridSession.plan.compatibility.stringCount,
+        preSanitized: mode !== 'song',
     });
     setCompositeContextLoop(view, requestedStartTime);
     startPlayback();
@@ -1470,17 +1493,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
     toolbar.querySelector('#editor-composite-apply-next')?.addEventListener('click', () => {
         const context = guidedRepeatContext(hybridSession.plan,
             hybridSession.plan.conflicts[hybridSession.conflictIndex]);
-        let target = null;
-        if (context) {
-            for (let offset = 1; offset < context.groups.length; offset++) {
-                const candidate = context.groups[(context.groupIndex + offset)
-                    % context.groups.length];
-                if (candidate.memberIds.some(id => {
-                    const block = hybridSession.plan.conflicts.find(item => item.id === id);
-                    return block && !block.resolution;
-                })) { target = candidate; break; }
-            }
-        }
+        const target = context?.nextUnresolvedGroup || null;
         if (target) {
             activateGuidedReviewGroup(hybridSession.plan, target);
             prepareCurrentReviewFocus(true);
@@ -2272,6 +2285,7 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
     const freshnessDeadlineAt = Math.max(0, Number(
         options.freshnessDeadlineAt ?? retainedOptions.freshnessDeadlineAt) || 0);
     const onCommitted = options.onCommitted || retainedOptions.onCommitted || null;
+    const beforeCommit = options.beforeCommit || retainedOptions.beforeCommit || null;
     const zoom = hybridPreviewPreferences.timelineZoom;
     const visualScroll = clampCompositeTimelineScroll(dom, rawVisualScroll);
     const standbyIndex = dom.activeCameraIndex === 0 ? 1 : 0;
@@ -2302,6 +2316,7 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
     });
     const generation = ++timelineRenderGeneration;
     const plan = compositeTimelineCameraRenderPlan(dom, standby, geometry, zoom);
+    if (beforeCommit) plan.steps.push(beforeCommit);
     let stepIndex = 0;
     let cancelled = false;
     let cancelPendingIdle = null;
@@ -2349,6 +2364,7 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
             scheduleCompositeTimelineStandby(dom, currentVisual, {
                 freshnessDeadlineAt,
                 onCommitted,
+                beforeCommit,
             });
         }
     };
@@ -3423,6 +3439,7 @@ function scheduleCompositeReviewTimelineRefresh(conflictId) {
             if ((dom.cameraSlots?.length || 0) > 1) {
                 const reviewRefreshOptions = {
                     freshnessDeadlineAt: (globalThis.performance?.now?.() || Date.now()) + 240,
+                    beforeCommit: () => compositePreviewEventsForMode('result'),
                     onCommitted: finishReviewRefresh,
                 };
                 dom.reviewRefreshOptions = reviewRefreshOptions;
@@ -3430,6 +3447,7 @@ function scheduleCompositeReviewTimelineRefresh(conflictId) {
                     dom, compositeTimelineVisualScrollLeft(dom), reviewRefreshOptions);
             } else {
                 refreshCompositeTimelineViewport(true);
+                compositePreviewEventsForMode('result');
                 finishReviewRefresh();
             }
             refreshCompositeTimelinePlayheadNow();
@@ -3734,6 +3752,7 @@ async function analyzeFromDialog() {
     editorWarmGuidePreview(arrKind(plan.primary), { gm: selectedHybridPreviewTone().gm });
     setCompositeReviewMode(true);
     renderResult();
+    scheduleCompositePreviewEventPrewarm(plan);
 }
 
 function clearEditorSelection() {

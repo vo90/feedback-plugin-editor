@@ -121,6 +121,27 @@ test('same-decision Hybrid choices retain the workspace and update its live mode
         'camera swaps restore a duplicate note id inside its original track');
 });
 
+test('Hybrid review navigation and guide playback reuse indexed revision caches', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const guidedStart = resolver.indexOf('function guidedRepeatContext');
+    const guidedEnd = resolver.indexOf('\nfunction resolveReviewChoice', guidedStart);
+    assert.match(resolver.slice(guidedStart, guidedEnd),
+        /return guidedReviewContext\(plan, block\)/,
+        'render/navigation consumes the engine index instead of rescanning groups and members');
+    const eventsStart = resolver.indexOf('function compositePreviewEventsForMode');
+    const eventsEnd = resolver.indexOf('\nfunction scheduleCompositePreviewEventPrewarm', eventsStart);
+    const eventsBody = resolver.slice(eventsStart, eventsEnd);
+    assert.match(eventsBody,
+        /compositePreviewEventPlanCache[\s\S]*resolutionRevision[\s\S]*convertCompositePreviewEvents/,
+        'source events are plan-cached and Hybrid events are resolution-revision-cached');
+    const previewStart = resolver.indexOf('async function startCompositePreview');
+    const previewEnd = resolver.indexOf('\nfunction keepCompositeContextLoop', previewStart);
+    const previewBody = resolver.slice(previewStart, previewEnd);
+    assert.match(previewBody,
+        /compositePreviewEventsForMode\(mode\)[\s\S]*preSanitized:\s*mode !== 'song'/,
+        'the gesture path skips duplicate conversion, filtering, and sorting');
+});
+
 test('Hybrid playback keeps heavy rendering off the per-frame follow path and shares seek state', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
     assert.match(resolver, /compositeTimelineRenderWindowNeedsRefreshPure/);
