@@ -588,7 +588,8 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
     assert.match(resolver, /data-composite-map-viewport-window/);
     const bindFrameStart = resolver.indexOf(
         'timelineBindFrame = requestAnimationFrame');
-    const bindFrameEnd = resolver.indexOf('\n    });\n}', bindFrameStart);
+    const bindFrameEnd = resolver.indexOf(
+        'function renderFinalPreviewResult', bindFrameStart);
     const bindFrameBody = resolver.slice(bindFrameStart, bindFrameEnd);
     assert.doesNotMatch(bindFrameBody, /setCompositeTimelineNativeCamera/,
         'initial binding primes scroll state before the first exact render instead of rendering twice');
@@ -600,6 +601,80 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
         'the overview playhead is no longer deliberately limited to 30 fps');
     assert.doesNotMatch(resolver, /mapPlayhead\.setAttribute\('transform'/,
         'the dense static overview SVG is never repainted to move its playhead');
+});
+
+test('Guided review navigation atomically moves distant decisions with the blue viewport', () => {
+    const resolver = fs.readFileSync(
+        new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const toolbarStart = resolver.indexOf('function bindCompositeReviewToolbarEvents');
+    const toolbarEnd = resolver.indexOf('\nfunction bindResultEvents', toolbarStart);
+    const toolbarBody = resolver.slice(toolbarStart, toolbarEnd);
+    const moveStart = toolbarBody.indexOf('const moveDecision');
+    const moveEnd = toolbarBody.indexOf("toolbar.querySelector('#editor-composite-prev')", moveStart);
+    assert.match(toolbarBody.slice(moveStart, moveEnd),
+        /prepareCurrentReviewFocus\(true\)[\s\S]*refreshReviewDecision\(\)/,
+        'Previous and Next seek and focus the newly selected decision');
+    const continueStart = toolbarBody.indexOf(
+        "toolbar.querySelector('#editor-composite-apply-next')");
+    assert.match(toolbarBody.slice(continueStart),
+        /prepareCurrentReviewFocus\(true\)[\s\S]*refreshReviewDecision\(\)/,
+        'Continue to next choice uses the same explicit camera focus');
+
+    const refreshStart = resolver.indexOf('function scheduleCompositeReviewTimelineRefresh');
+    const refreshEnd = resolver.indexOf('\nfunction refreshCurrentCompositeReview', refreshStart);
+    const refreshBody = resolver.slice(refreshStart, refreshEnd);
+    const resetIndex = refreshBody.indexOf('resetCompositeTimelinePageFollow');
+    const targetIndex = refreshBody.indexOf('const reviewFocusScroll');
+    assert.ok(resetIndex >= 0 && resetIndex < targetIndex,
+        'stale camera work is cancelled before the new review target is prepared');
+    assert.match(refreshBody,
+        /scheduleCompositeTimelineStandby\(dom, reviewFocusScroll,[\s\S]*holdReady: true,[\s\S]*purpose: 'review-focus',[\s\S]*onPrepared:[\s\S]*commitCompositeTimelineCameraSlot\([\s\S]*setCompositeTimelineNativeCamera\(dom, preparedScroll, false\)[\s\S]*updateCompositeTimelineMapViewport\([\s\S]*finishReviewRefresh\(\)/,
+        'a far target is rendered offscreen, then its lanes, native camera, and blue box commit together');
+    assert.match(refreshBody,
+        /const resizePending = dom\.reviewResizePending === true[\s\S]*dom\.reviewRefreshPending = false[\s\S]*if \(resizePending\) refreshCompositeTimelineViewport\(true\)[\s\S]*centerCurrentReviewInTimeline/,
+        'a resize is deferred until the owned review render finishes, then focus is applied last');
+    assert.match(refreshBody,
+        /dom\.reviewRefreshOptions !== reviewRefreshOptions[\s\S]*dom\.view !== presentation\.timelineView[\s\S]*clearCompositeTimelinePagePrefetch\(dom\)[\s\S]*finishReviewRefresh\(\)/,
+        'a stale prepared callback cannot clear a newer owner or retain its own stale prepared slot');
+
+    const standbyStart = resolver.indexOf('function scheduleCompositeTimelineStandby');
+    const standbyEnd = resolver.indexOf('\nfunction scheduleCompositeTimelinePageTarget', standbyStart);
+    assert.match(resolver.slice(standbyStart, standbyEnd),
+        /const purpose = options\.purpose \|\| \(holdReady \? 'page-prefetch' : 'camera'\)/,
+        'an atomic review focus cannot be mistaken for disposable page prefetch work');
+
+    for (const [name, endName] of [
+        ['function commitCompositeTimelineZoom', 'function applyCompositeTimelineZoom'],
+        ['function commitCompositeTimelineDisplayMode', 'function scheduleCompositeTimelineDisplayMode'],
+    ]) {
+        const start = resolver.indexOf(name);
+        const end = resolver.indexOf(endName, start + name.length);
+        const body = resolver.slice(start, end);
+        assert.ok(body.indexOf('updateCompositeTimelineMapViewport')
+            < body.indexOf('retainedReview?.onCommitted?.()'),
+        `${name} lets the focused blue-box update run last`);
+    }
+    const resizeStart = resolver.indexOf('if (typeof ResizeObserver');
+    const resizeEnd = resolver.indexOf('timelineBindFrame = requestAnimationFrame', resizeStart);
+    assert.match(resolver.slice(resizeStart, resizeEnd),
+        /if \(boundDom\.reviewRefreshPending\)[\s\S]*boundDom\.reviewResizePending = true[\s\S]*return/,
+        'ResizeObserver cannot cancel an owned review-focus render in either display mode');
+    const resultEventsStart = resolver.indexOf('function bindResultEvents');
+    const resultEventsEnd = resolver.indexOf(
+        'function refreshCompositeTimelineZoomControls', resultEventsStart);
+    assert.match(resolver.slice(resultEventsStart, resultEventsEnd),
+        /'click', 'dblclick', 'change', 'input', 'pointerdown', 'keydown', 'wheel',[\s\S]*guardResultInteraction, true/,
+        'all camera-mutating timeline gestures are capture-blocked while review refresh owns the camera');
+    const timelineEventsStart = resolver.indexOf('function bindCompositeTimelineEvents');
+    const timelineEventsEnd = resolver.indexOf(
+        'function renderFinalPreviewResult', timelineEventsStart);
+    const timelineEvents = resolver.slice(timelineEventsStart, timelineEventsEnd);
+    assert.match(timelineEvents,
+        /const discardMapGesture[\s\S]*boundDom\.reviewRefreshPending[\s\S]*discardMapGesture\(event\.pointerId\)/,
+        'a map gesture begun before navigation is discarded instead of overwriting its camera target');
+    assert.match(timelineEvents,
+        /flushHybridPreviewPreferences\(\)[\s\S]*if \(boundDom\.reviewRefreshPending\)[\s\S]*boundDom\.reviewResizePending = true[\s\S]*return[\s\S]*refreshCompositeTimelineViewport\(true\)/,
+        'a lane drag begun before navigation defers its final rebuild until review focus commits');
 });
 
 test('Hybrid Overview is an explicit shared display mode with bounded production rendering', () => {

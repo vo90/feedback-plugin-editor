@@ -1714,7 +1714,9 @@ function bindResultEvents() {
         event.preventDefault();
         event.stopImmediatePropagation();
     };
-    for (const type of ['click', 'change', 'input', 'pointerdown', 'keydown', 'wheel']) {
+    for (const type of [
+        'click', 'dblclick', 'change', 'input', 'pointerdown', 'keydown', 'wheel',
+    ]) {
         result.addEventListener(type, guardResultInteraction, true);
     }
     const reviewToolbar = result.querySelector('.editor-composite-review-toolbar');
@@ -2729,7 +2731,7 @@ function scheduleCompositeTimelineStandby(dom, rawVisualScroll, options = {}) {
     if (!dom?.view || !dom.scroller || (dom.cameraSlots?.length || 0) < 2) return;
     const retainedOptions = dom.reviewRefreshOptions || {};
     const holdReady = options.holdReady === true;
-    const purpose = holdReady ? 'page-prefetch' : (options.purpose || 'camera');
+    const purpose = options.purpose || (holdReady ? 'page-prefetch' : 'camera');
     const now = globalThis.performance?.now?.() || Date.now();
     const activeCoverage = compositeTimelineCameraCoverage(
         dom, dom.cameraSlots[dom.activeCameraIndex],
@@ -3196,10 +3198,10 @@ function commitCompositeTimelineZoom(dom, requestId) {
     rememberCompositeTimelineScroll(nextScroll);
     timelineRequestedZoom = null;
     refreshCompositeTimelineViewport(true);
-    retainedReview?.onCommitted?.();
     refreshCompositeTimelineZoomControls(dom, next.zoom);
     updateCompositeTimelineMapViewport(
         dom, view, scroller, nextScroll, dom.viewportWidth);
+    retainedReview?.onCommitted?.();
     timelineLastZoomCommitAt = globalThis.performance?.now?.() || Date.now();
     finishCompositeInteraction('zoom.response', request.interactionStartedAt);
 }
@@ -3265,10 +3267,10 @@ function commitCompositeTimelineDisplayMode(dom, nextMode, {
     dom.lastCoverageVisualScroll = nextScroll;
     rememberCompositeTimelineScroll(nextScroll);
     refreshCompositeTimelineViewport(true);
-    retainedReview?.onCommitted?.();
     refreshCompositeTimelineZoomControls(dom);
     updateCompositeTimelineMapViewport(
         dom, dom.view, dom.scroller, nextScroll, dom.viewportWidth);
+    retainedReview?.onCommitted?.();
     refreshCompositeTimelinePlayheadNow();
 }
 
@@ -3592,19 +3594,25 @@ function prepareCurrentReviewFocus(seek = false) {
     }
 }
 
-function centerCurrentReviewInTimeline(view, scroller) {
-    if (!view?.review || !scroller) return;
+function currentReviewCenteredScroll(view, scroller) {
+    if (!view?.review || !scroller) return null;
     const beat = (view.review.startBeat + view.review.endBeat) / 2;
-    const nextScroll = clampTimelineScroll(scroller,
+    return clampTimelineScroll(scroller,
         compositeTimelineCenteredScrollPure({
             beat, context: view.context,
             zoom: compositeTimelineEffectiveZoom(view, scroller.clientWidth),
             viewportWidth: scroller.clientWidth,
         }));
+}
+
+function centerCurrentReviewInTimeline(view, scroller) {
+    const nextScroll = currentReviewCenteredScroll(view, scroller);
+    if (nextScroll === null) return;
     if (timelineViewportDom) setCompositeTimelineNativeCamera(
         timelineViewportDom, nextScroll, false);
     else rememberCompositeTimelineScroll(nextScroll);
     hybridSession.timelineFocusReview = false;
+    return nextScroll;
 }
 
 function refreshCompositeTimelineFollowControl() {
@@ -3837,6 +3845,13 @@ function bindCompositeTimelineEvents() {
         refreshCompositeTimelinePlayheadNow();
     };
     let mapPointerGesture = null;
+    const discardMapGesture = pointerId => {
+        const gesture = mapPointerGesture;
+        if (!gesture) return;
+        if (gesture.frame) cancelAnimationFrame(gesture.frame);
+        mapPointerGesture = null;
+        if (pointerId != null) map?.releasePointerCapture?.(pointerId);
+    };
     const flushMapPreview = (clientX = mapPointerGesture?.latestClientX) => {
         const gesture = mapPointerGesture;
         if (!gesture) return null;
@@ -3853,6 +3868,10 @@ function bindCompositeTimelineEvents() {
         if (gesture.frame) return;
         gesture.frame = requestAnimationFrame(() => {
             if (mapPointerGesture !== gesture) return;
+            if (boundDom.reviewRefreshPending) {
+                discardMapGesture(gesture.pointerId);
+                return;
+            }
             gesture.frame = 0;
             gesture.location = previewMapLocation(
                 mapLocationAt(gesture.latestClientX, gesture.rect));
@@ -3914,6 +3933,10 @@ function bindCompositeTimelineEvents() {
         if (timelineViewportDom !== boundDom) return;
         if (!mapPointerGesture || event.pointerId !== mapPointerGesture.pointerId
             || !(event.buttons & 1)) return;
+        if (boundDom.reviewRefreshPending) {
+            discardMapGesture(event.pointerId);
+            return;
+        }
         if (Math.hypot(event.clientX - mapPointerGesture.startX,
             event.clientY - mapPointerGesture.startY) > 4) mapPointerGesture.moved = true;
         queueMapPreview(event.clientX);
@@ -3921,6 +3944,10 @@ function bindCompositeTimelineEvents() {
     map?.addEventListener('pointerup', event => {
         if (timelineViewportDom !== boundDom) return;
         if (!mapPointerGesture || event.pointerId !== mapPointerGesture.pointerId) return;
+        if (boundDom.reviewRefreshPending) {
+            discardMapGesture(event.pointerId);
+            return;
+        }
         const gesture = mapPointerGesture;
         const location = flushMapPreview(event.clientX);
         mapPointerGesture = null;
@@ -3956,6 +3983,10 @@ function bindCompositeTimelineEvents() {
     const clearMapGesture = event => {
         if (timelineViewportDom !== boundDom) return;
         if (!mapPointerGesture || event.pointerId !== mapPointerGesture.pointerId) return;
+        if (boundDom.reviewRefreshPending) {
+            discardMapGesture(event.pointerId);
+            return;
+        }
         const gesture = mapPointerGesture;
         if (gesture.frame) cancelAnimationFrame(gesture.frame);
         mapPointerGesture = null;
@@ -4085,6 +4116,10 @@ function bindCompositeTimelineEvents() {
                 boundDom.cleanup.delete(cleanup);
                 if (!commit || timelineViewportDom !== boundDom) return;
                 flushHybridPreviewPreferences();
+                if (boundDom.reviewRefreshPending) {
+                    boundDom.reviewResizePending = true;
+                    return;
+                }
                 refreshCompositeTimelineViewport(true);
             };
             const up = upEvent => {
@@ -4103,6 +4138,10 @@ function bindCompositeTimelineEvents() {
     if (typeof ResizeObserver === 'function') {
         timelineResizeObserver = new ResizeObserver(() => {
             if (timelineViewportDom !== boundDom) return;
+            if (boundDom.reviewRefreshPending) {
+                boundDom.reviewResizePending = true;
+                return;
+            }
             if (!compositeTimelineOverviewActive()) {
                 resetCompositeTimelinePageFollow(boundDom, { immediateCatchup: true });
                 scheduleCompositeTimelineViewport();
@@ -4115,6 +4154,10 @@ function bindCompositeTimelineEvents() {
             timelineOverviewResizeTimer = setTimeout(() => {
                 timelineOverviewResizeTimer = 0;
                 if (timelineViewportDom === boundDom) {
+                    if (boundDom.reviewRefreshPending) {
+                        boundDom.reviewResizePending = true;
+                        return;
+                    }
                     refreshCompositeTimelineViewport(true);
                     refreshCompositeTimelinePlayheadNow();
                 }
@@ -4344,35 +4387,92 @@ function scheduleCompositeReviewTimelineRefresh(conflictId) {
             const presentation = currentCompositeReviewPresentation(plan);
             if (!presentation?.timelineView) return;
             dom.view = presentation.timelineView;
-            if (hybridSession.timelineFocusReview) {
-                centerCurrentReviewInTimeline(presentation.timelineView, dom.scroller);
-            }
+            // Cancel work that still belongs to the previous decision before
+            // preparing the new camera. A far review jump needs a fresh bounded
+            // strip; cancelling coverage after requesting that strip leaves the
+            // red playhead at the new decision while the tracks stay behind.
+            resetCompositeTimelinePageFollow(dom, { immediateCatchup: true });
+            cancelCompositeTimelineStandbyWork(dom);
+            const reviewFocusScroll = hybridSession.timelineFocusReview
+                ? currentReviewCenteredScroll(presentation.timelineView, dom.scroller)
+                : null;
             dom.reviewRefreshPending = true;
             refreshCompositePreviewAvailability(presentation.timelineView);
             refreshCompositeTimelineHeaders(dom, presentation.timelineView);
             refreshCompositeTimelineStaticMap(dom, presentation.timelineView);
-            // A Stop/seek issued by the choice may have queued render-ahead
-            // against the previous model between paints. Invalidate it again
-            // now that the new live view is installed.
-            resetCompositeTimelinePageFollow(dom, { immediateCatchup: true });
-            cancelCompositeTimelineStandbyWork(dom);
+            let reviewRefreshOptions = null;
             const finishReviewRefresh = () => {
                 if (timelineViewportDom !== dom) return;
+                if (reviewRefreshOptions && dom.reviewRefreshOptions
+                        && dom.reviewRefreshOptions !== reviewRefreshOptions) return;
+                const resizePending = dom.reviewResizePending === true;
+                dom.reviewResizePending = false;
                 dom.reviewRefreshPending = false;
                 dom.reviewRefreshOptions = null;
+                if (resizePending) refreshCompositeTimelineViewport(true);
+                if (resizePending && reviewFocusScroll !== null) {
+                    hybridSession.timelineFocusReview = true;
+                }
+                // Zoom/display commits may replace a pending review render.
+                // They call this shared completion hook, so retain the explicit
+                // navigation focus even when that alternate path wins the race.
+                if (hybridSession.timelineFocusReview) {
+                    centerCurrentReviewInTimeline(dom.view, dom.scroller);
+                    updateCompositeTimelineMapViewport(dom, dom.view, dom.scroller,
+                        compositeTimelineVisualScrollLeft(dom), dom.viewportWidth);
+                }
                 updateCompositePreviewButtons();
                 setCompositePreviewHelp('Tracks updated · choose a sound to preview.');
             };
             if ((dom.cameraSlots?.length || 0) > 1) {
-                const reviewRefreshOptions = {
+                reviewRefreshOptions = {
                     freshnessDeadlineAt: (globalThis.performance?.now?.() || Date.now()) + 240,
                     beforeCommit: () => compositePreviewEventsForMode('result'),
                     onCommitted: finishReviewRefresh,
                 };
                 dom.reviewRefreshOptions = reviewRefreshOptions;
-                scheduleCompositeTimelineStandby(
-                    dom, compositeTimelineVisualScrollLeft(dom), reviewRefreshOptions);
+                if (reviewFocusScroll !== null) {
+                    scheduleCompositeTimelineStandby(dom, reviewFocusScroll, {
+                        ...reviewRefreshOptions,
+                        holdReady: true,
+                        purpose: 'review-focus',
+                        onPrepared: (slotIndex, preparedScroll) => {
+                            if (timelineViewportDom !== dom
+                                    || dom.reviewRefreshOptions !== reviewRefreshOptions) return;
+                            if (dom.view !== presentation.timelineView
+                                    || plan.conflicts[hybridSession.conflictIndex]?.id
+                                        !== conflictId) {
+                                clearCompositeTimelinePagePrefetch(dom);
+                                finishReviewRefresh();
+                                return;
+                            }
+                            if (!commitCompositeTimelineCameraSlot(
+                                dom, slotIndex, preparedScroll)) {
+                                clearCompositeTimelinePagePrefetch(dom);
+                                finishReviewRefresh();
+                                return;
+                            }
+                            setCompositeTimelineNativeCamera(dom, preparedScroll, false);
+                            hybridSession.timelineFocusReview = false;
+                            updateCompositeTimelineMapViewport(
+                                dom, dom.view, dom.scroller, preparedScroll, dom.viewportWidth);
+                            refreshCompositeTimelinePlayheadNow();
+                            finishReviewRefresh();
+                        },
+                    });
+                } else {
+                    scheduleCompositeTimelineStandby(
+                        dom, compositeTimelineVisualScrollLeft(dom), reviewRefreshOptions);
+                }
             } else {
+                if (reviewFocusScroll !== null) {
+                    timelineProgrammaticScrollTarget = reviewFocusScroll;
+                    dom.scroller.scrollLeft = reviewFocusScroll;
+                    dom.nativeScrollLeft = dom.scroller.scrollLeft;
+                    dom.visualScrollLeft = reviewFocusScroll;
+                    rememberCompositeTimelineScroll(reviewFocusScroll);
+                    hybridSession.timelineFocusReview = false;
+                }
                 refreshCompositeTimelineViewport(true);
                 compositePreviewEventsForMode('result');
                 finishReviewRefresh();
