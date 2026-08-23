@@ -181,6 +181,26 @@ test('Hybrid Worker fallback records one total duration while retaining path cou
         assert.equal(snapshot.timings['task.analyze.totalMs']?.count, 1);
         assert.equal(snapshot.counters['task.analyze.worker'], 1);
         assert.equal(snapshot.counters['task.analyze.localFallback'], 1);
+        assert.equal(snapshot.timings['task.analyze.localComputeMs']?.count, 1);
+    } finally {
+        setHybridPerformanceEnabled(false);
+        _resetHybridPerformanceForTest();
+    }
+});
+
+test('Hybrid Worker telemetry separates startup from background computation', async () => {
+    _resetHybridPerformanceForTest();
+    setHybridPerformanceEnabled(true);
+    try {
+        const worker = new FakeWorker({ ok: true });
+        await runHybridBackgroundTask('analyze', analysisPayload(), {
+            workerFactory: () => worker,
+        });
+        const snapshot = hybridPerformanceSnapshot();
+        assert.equal(snapshot.timings['task.analyze.workerStartupMs']?.count, 1);
+        assert.equal(snapshot.timings['task.analyze.workerComputeMs']?.count, 1);
+        assert.equal(snapshot.timings['task.analyze.totalMs']?.count, 1);
+        assert.equal(snapshot.timings['task.analyze.localComputeMs'], undefined);
     } finally {
         setHybridPerformanceEnabled(false);
         _resetHybridPerformanceForTest();

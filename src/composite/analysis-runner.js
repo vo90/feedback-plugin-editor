@@ -29,13 +29,20 @@ async function runLocal(action, payload, signal, onProgress) {
     await Promise.resolve();
     if (signal?.aborted) throw abortError();
     hybridPerfCount(`task.${action}.localFallback`);
-    return runHybridWorkerTaskPure(action, payload);
+    const computeStartedAt = hybridPerfStart();
+    try {
+        return runHybridWorkerTaskPure(action, payload);
+    } finally {
+        hybridPerfEnd(`task.${action}.localComputeMs`, computeStartedAt);
+    }
 }
 
 function runWorker(worker, id, action, payload, signal, onProgress) {
     return new Promise((resolve, reject) => {
         let settled = false;
         let requestStarted = false;
+        let postedAt = null;
+        let computeStartedAt = null;
         const finish = (callback, value) => {
             if (settled) return;
             settled = true;
@@ -50,15 +57,21 @@ function runWorker(worker, id, action, payload, signal, onProgress) {
             const message = event?.data || {};
             if (message.id !== id || settled) return;
             if (message.kind === 'progress') {
-                requestStarted = true;
+                if (!requestStarted) {
+                    requestStarted = true;
+                    hybridPerfEnd(`task.${action}.workerStartupMs`, postedAt);
+                    computeStartedAt = hybridPerfStart();
+                }
                 onProgress?.(message.phase);
                 return;
             }
             if (message.kind === 'result') {
+                hybridPerfEnd(`task.${action}.workerComputeMs`, computeStartedAt);
                 finish(resolve, message.result);
                 return;
             }
             if (message.kind === 'error') {
+                hybridPerfEnd(`task.${action}.workerComputeMs`, computeStartedAt);
                 const error = new Error(message.error?.message || 'Hybrid worker failed');
                 error.name = message.error?.name || 'Error';
                 if (message.error?.stack) error.stack = message.error.stack;
@@ -71,9 +84,13 @@ function runWorker(worker, id, action, payload, signal, onProgress) {
                 fallBackLocally();
                 return;
             }
+            hybridPerfEnd(`task.${action}.workerComputeMs`, computeStartedAt);
             finish(reject, new Error(event?.message || 'Hybrid worker failed'));
         };
-        try { worker.postMessage({ id, action, payload }); }
+        try {
+            postedAt = hybridPerfStart();
+            worker.postMessage({ id, action, payload });
+        }
         catch (_) { fallBackLocally(); }
     });
 }
