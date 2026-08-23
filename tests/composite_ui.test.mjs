@@ -4,14 +4,21 @@ import test from 'node:test';
 
 import { renderHybridSetupView } from '../src/composite/setup-view.js';
 import {
+    beginHybridAnalysis,
     beginHybridCreation,
+    cancelHybridAnalysis,
     cancelHybridCreation,
+    completeHybridAnalysis,
     completeHybridCreation,
     createHybridBuilderSession,
+    hybridAnalysisIsCurrent,
     hybridCloseAction,
     hybridCloseGuardKind,
     hybridCreationIsCurrent,
     markHybridReviewWork,
+    installHybridPlan,
+    markHybridResolutionChanged,
+    markHybridViewChanged,
     resetHybridBuilderReview,
 } from '../src/composite/session.js';
 
@@ -339,6 +346,46 @@ test('Hybrid creation accepts one request and rejects double creation', () => {
     assert.equal(hybridCreationIsCurrent(session, request, {
         sessionId: 'song-a', plan,
     }), false);
+});
+
+test('Hybrid analysis requests are cancellable and stale results cannot replace newer work', () => {
+    const session = createHybridBuilderSession();
+    const first = beginHybridAnalysis(session, {
+        sessionId: 'song-a', configToken: 'automatic:1',
+    });
+    assert.ok(first);
+    assert.equal(beginHybridAnalysis(session, {
+        sessionId: 'song-a', configToken: 'automatic:1',
+    }), null, 'one analysis owns the session at a time');
+    assert.equal(hybridAnalysisIsCurrent(session, first, {
+        sessionId: 'song-a', configToken: 'automatic:1',
+    }), true);
+    assert.equal(cancelHybridAnalysis(session), true);
+    assert.equal(first.controller.signal.aborted, true);
+    assert.equal(hybridAnalysisIsCurrent(session, first, {
+        sessionId: 'song-a', configToken: 'automatic:1',
+    }), false);
+
+    const second = beginHybridAnalysis(session, {
+        sessionId: 'song-a', configToken: 'guided:2',
+    });
+    assert.ok(second);
+    assert.equal(completeHybridAnalysis(session, first), false,
+        'an old completion cannot clear a newer request');
+    assert.equal(completeHybridAnalysis(session, second), true);
+});
+
+test('Hybrid revisions distinguish plan, resolution, and view-only changes', () => {
+    const session = createHybridBuilderSession();
+    const plan = { strategy: 'guided' };
+    assert.equal(installHybridPlan(session, plan), 1);
+    assert.equal(session.plan, plan);
+    assert.equal(session.resolutionRevision, 0);
+    assert.equal(markHybridResolutionChanged(session), 1);
+    assert.equal(markHybridViewChanged(session), 3);
+    assert.equal(session.planRevision, 1);
+    assert.equal(session.resolutionRevision, 1);
+    assert.equal(session.viewRevision, 3);
 });
 
 test('Hybrid creation becomes stale after a song switch or plan replacement', () => {

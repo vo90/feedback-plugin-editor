@@ -7,10 +7,17 @@
 export function createHybridBuilderSession() {
     return {
         plan: null,
+        planRevision: 0,
+        resolutionRevision: 0,
+        viewRevision: 0,
         analysisConfig: null,
         setupDirty: false,
         setupDirtyMessage: '',
         analyzing: false,
+        analysisRequestId: 0,
+        analysisController: null,
+        analysisSessionId: null,
+        analysisConfigToken: null,
         stage: 'setup',
         hasReviewWork: false,
         conflictIndex: 0,
@@ -38,6 +45,77 @@ export function createHybridBuilderSession() {
         closeDecisionPromise: null,
         closeDecisionResolve: null,
     };
+}
+
+export function beginHybridAnalysis(session, { sessionId, configToken } = {}) {
+    if (!session || session.analyzing || !sessionId || !configToken) return null;
+    const controller = new AbortController();
+    const request = {
+        id: ++session.analysisRequestId,
+        sessionId,
+        configToken,
+        controller,
+    };
+    session.analyzing = true;
+    session.analysisController = controller;
+    session.analysisSessionId = sessionId;
+    session.analysisConfigToken = configToken;
+    return request;
+}
+
+export function hybridAnalysisIsCurrent(session, request, { sessionId, configToken } = {}) {
+    return !!(session && request && session.analyzing
+        && session.analysisRequestId === request.id
+        && session.analysisController === request.controller
+        && session.analysisSessionId === request.sessionId
+        && session.analysisConfigToken === request.configToken
+        && sessionId === request.sessionId
+        && configToken === request.configToken
+        && !request.controller.signal.aborted);
+}
+
+export function completeHybridAnalysis(session, request) {
+    if (!session || !request || session.analysisRequestId !== request.id
+            || session.analysisController !== request.controller) return false;
+    session.analyzing = false;
+    session.analysisController = null;
+    session.analysisSessionId = null;
+    session.analysisConfigToken = null;
+    return true;
+}
+
+export function cancelHybridAnalysis(session) {
+    if (!session) return false;
+    const controller = session.analysisController;
+    const wasAnalyzing = !!session.analyzing;
+    session.analysisRequestId++;
+    session.analyzing = false;
+    session.analysisController = null;
+    session.analysisSessionId = null;
+    session.analysisConfigToken = null;
+    if (controller && !controller.signal.aborted) controller.abort();
+    return wasAnalyzing;
+}
+
+export function installHybridPlan(session, plan) {
+    if (!session) return 0;
+    session.plan = plan || null;
+    session.planRevision++;
+    session.resolutionRevision = 0;
+    session.viewRevision++;
+    return session.planRevision;
+}
+
+export function markHybridResolutionChanged(session) {
+    if (!session) return 0;
+    session.resolutionRevision++;
+    session.viewRevision++;
+    return session.resolutionRevision;
+}
+
+export function markHybridViewChanged(session) {
+    if (!session) return 0;
+    return ++session.viewRevision;
 }
 
 export function markHybridReviewWork(session) {
@@ -109,12 +187,12 @@ export function cancelHybridCreation(session) {
 }
 
 export function resetHybridBuilderReview(session) {
+    cancelHybridAnalysis(session);
     cancelHybridCreation(session);
-    session.plan = null;
+    installHybridPlan(session, null);
     session.analysisConfig = null;
     session.setupDirty = false;
     session.setupDirtyMessage = '';
-    session.analyzing = false;
     session.stage = 'setup';
     session.hasReviewWork = false;
     session.conflictIndex = 0;
