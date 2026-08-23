@@ -1061,13 +1061,15 @@ export function analyzeExperimentalAutoComposite({
 } = {}) {
     const normalizedProfile = normalizeExperimentalProfile(profile);
     const options = normalizeCompositeGapFillOptions(gapFill);
-    const standardPlan = analyzeGapFillComposite({ primary, secondary, beats, gapFill: options });
+    const prepared = prepareCompositeSources({ primary, secondary, beats });
+    const standardPlan = analyzeGapFillComposite({
+        primary, secondary, beats, gapFill: options, preparedSources: prepared,
+    });
     if (!standardPlan.ok) return {
         ...standardPlan, strategy: 'experimental',
         engineVersion: HYBRID_EXPERIMENTAL_ENGINE_VERSION,
         profile: normalizedProfile,
     };
-    const prepared = prepareCompositeSources({ primary, secondary, beats });
     const classified = classifyExperimentalDuplicates(prepared, beats);
     const sync = experimentalSyncPreflight(classified.primaryEntries, classified.secondaryEntries, beats);
     if (sync.blocked) {

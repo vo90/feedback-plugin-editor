@@ -52,6 +52,11 @@ test('experimental analysis keeps Standard Automatic as an unchanged control res
     assert.deepEqual(experimental.standardPlan.stats, standard.stats);
     assert.deepEqual(experimental.standardPlan.fixedEntries.map(entry => entry.id),
         standard.fixedEntries.map(entry => entry.id));
+    assert.deepEqual(experimental.standardPlan.skippedEntries.map(entry => entry.id),
+        standard.skippedEntries.map(entry => entry.id));
+    assert.deepEqual(experimental.standardPlan.duplicates.map(pair =>
+        [pair.primary.id, pair.secondary.id]), standard.duplicates.map(pair =>
+        [pair.primary.id, pair.secondary.id]));
     assert.equal(standard.strategy, 'gap-fill');
     assert.equal(experimental.strategy, 'experimental');
     assert.equal(experimental.profile, 'balanced');

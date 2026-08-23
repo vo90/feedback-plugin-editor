@@ -119,8 +119,17 @@ export function compositeGroupFitsWindowPure(group, windows, coordinate = value 
         && end <= window.end + COMPOSITE_BEAT_EPS;
 }
 
-export function analyzeGapFillComposite({ primary, secondary, beats = [], gapFill = {} } = {}) {
-    const prepared = prepareCompositeSources({ primary, secondary, beats });
+export function analyzeGapFillComposite({
+    primary, secondary, beats = [], gapFill = {}, preparedSources = null,
+} = {}) {
+    // Experimental analysis needs the unchanged Standard result as its control
+    // and then classifies the same prepared entries. Reusing that immutable
+    // preparation avoids cloning/normalizing both complete arrangements twice.
+    const prepared = preparedSources?.ok
+        && Array.isArray(preparedSources.primaryEntries)
+        && Array.isArray(preparedSources.secondaryEntries)
+        && Array.isArray(preparedSources.uniqueSecondaryEntries)
+        ? preparedSources : prepareCompositeSources({ primary, secondary, beats });
     const compatibility = prepared.compatibility;
     if (!prepared.ok) {
         return { ok: false, compatibility, strategy: 'gap-fill', fixedEntries: [], conflicts: [], stats: {} };
