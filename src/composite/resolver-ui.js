@@ -88,6 +88,7 @@ import {
     compositeTimelineCameraOffsetPure,
     compositeTimelineCenteredScrollPure,
     compositeTimelineContentWidthPure,
+    compositeTimelineDisplayBeatPure,
     compositeTimelineFitZoomPure,
     compositeTimelineLaneHeightPure,
     compositeTimelineMapViewportPure,
@@ -97,6 +98,7 @@ import {
     compositeTimelineSteppedZoomPure,
     compositeTimelineStripGeometryPure,
     compositeTimelineViewportRangePure,
+    compositeTimelineXForBeatPure,
     compositeTimelineZoomAtPure,
     compositeTimelineZoomPure,
     renderCompositeTimelineLaneContents,
@@ -173,6 +175,13 @@ let dialogResizeObserver = null;
 let dialogResizeSaveTimer = 0;
 let timelineViewCache = null;
 let timelineViewportDom = null;
+let compositeModalDocumentKeydown = null;
+
+function stopCompositeModalDocumentKeyboard() {
+    if (!compositeModalDocumentKeydown || typeof document === 'undefined') return;
+    document.removeEventListener('keydown', compositeModalDocumentKeydown, true);
+    compositeModalDocumentKeydown = null;
+}
 
 function stopHybridDialogSizePersistence() {
     dialogResizeObserver?.disconnect();
@@ -414,7 +423,7 @@ export function _compositeTimelineStageActivePure(stage) {
 
 export function _compositeModalShortcutPure({
     key = '', editable = false, modified = false, stage = 'review',
-    previewActive = false, repeat = false,
+    previewActive = false, repeat = false, nativeActivation = false,
 } = {}) {
     // The Hybrid modal's generic keyboard trap closes on Escape. Consume the
     // first Escape here while auditioning so it behaves as Stop instead. A held
@@ -424,8 +433,10 @@ export function _compositeModalShortcutPure({
     if (key === 'Escape' && previewActive && !modified) return { kind: 'stop-preview' };
     if (editable || modified) return null;
     const modes = { '1': 'song', '2': 'primary', '3': 'secondary', '4': 'result' };
+    if (repeat && (key === ' ' || modes[key])) return { kind: 'consume' };
     if (modes[key]) return { kind: 'preview', mode: modes[key] };
-    if (key === ' ') return { kind: 'play-toggle' };
+    if (key === ' ') return nativeActivation
+        ? { kind: 'native-activation' } : { kind: 'play-toggle' };
     if (stage === 'review' && key === 'ArrowLeft') return { kind: 'previous' };
     if (stage === 'review' && key === 'ArrowRight') return { kind: 'next' };
     if (stage === 'review' && key === 'Home') return { kind: 'focus-review' };
@@ -434,6 +445,83 @@ export function _compositeModalShortcutPure({
 
 function byId(id) {
     return document.getElementById(id);
+}
+
+function compositeModalNativeActivationTarget(target) {
+    const control = target?.closest?.('button, summary');
+    return !!(control && control.isConnected && !control.disabled
+        && control.id !== 'editor-composite-timeline-map'
+        && !control.closest?.('[hidden], [inert]'));
+}
+
+function compositeModalVisibleFocusTarget(modal = byId('editor-composite-modal')) {
+    if (!modal) return null;
+    const resultWorkspace = byId('editor-composite-result-workspace');
+    if (resultWorkspace && !resultWorkspace.hidden) {
+        return byId('editor-composite-timeline-scroller')
+            || resultWorkspace.querySelector('[data-composite-preview]:not([disabled])')
+            || resultWorkspace;
+    }
+    const setup = byId('editor-composite-setup');
+    if (setup && !setup.hidden) {
+        return byId('editor-composite-primary')
+            || setup.querySelector('button:not([disabled]), input:not([disabled]), select:not([disabled])');
+    }
+    return byId('editor-composite-cancel');
+}
+
+function recoverCompositeModalFocus(modal = byId('editor-composite-modal')) {
+    if (!modal) return false;
+    const active = document.activeElement;
+    const usable = !!(active && modal.contains(active)
+        && !active.closest?.('[hidden], [inert]'));
+    if (usable) return false;
+    const target = compositeModalVisibleFocusTarget(modal);
+    if (!target?.focus) return false;
+    try { target.focus({ preventScroll: true }); }
+    catch (_) { target.focus(); }
+    return true;
+}
+
+// A stage change can hide the focused Setup/Review control. Chromium then
+// sends the next key to <body>, outside the modal's normal focus trap. Bridge
+// only that escaped-focus state so an underlying Editor shortcut can never
+// start transport behind a visible Hybrid workspace.
+function installCompositeModalDocumentKeyboard(modal) {
+    stopCompositeModalDocumentKeyboard();
+    if (!modal || typeof document === 'undefined') return;
+    compositeModalDocumentKeydown = event => {
+        if (byId('editor-composite-modal') !== modal || modal.contains(event.target)) return;
+        // Choice/text prompts deliberately sit above the Hybrid modal and own
+        // their own keyboard trap. Never redirect their events underneath.
+        const nestedPrompt = byId('editor-choice-prompt') || byId('editor-text-prompt');
+        if (nestedPrompt) {
+            if (nestedPrompt.contains(event.target)) return;
+            nestedPrompt.querySelector('input, button, [tabindex]:not([tabindex="-1"])')?.focus();
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+        }
+        const resultWorkspace = byId('editor-composite-result-workspace');
+        const timelineVisible = !!(resultWorkspace && !resultWorkspace.hidden);
+        recoverCompositeModalFocus(modal);
+        if (timelineVisible) {
+            const previewActive = hybridSession.previewPlaying || hybridSession.previewLoading;
+            if (event.key === 'Escape' && !event.repeat && !previewActive) {
+                event.preventDefault();
+                editorHideCompositeArrangementModal();
+            } else {
+                handleCompositeModalShortcut(event);
+            }
+        } else if (event.key === 'Escape') {
+            event.preventDefault();
+            editorHideCompositeArrangementModal();
+        } else if (event.key === ' ') {
+            event.preventDefault();
+        }
+        event.stopImmediatePropagation();
+    };
+    document.addEventListener('keydown', compositeModalDocumentKeydown, true);
 }
 
 function selectedHybridPreviewTone() {
@@ -523,8 +611,20 @@ function endCompositePreviewPlayback() {
     if (timelinePlayheadFrame) cancelAnimationFrame(timelinePlayheadFrame);
     timelinePlayheadFrame = 0;
     updateCompositePreviewButtons();
+    // Leave both the main line and overview marker at the exact captured
+    // transport position instead of the previous animation-frame sample.
+    refreshCompositeTimelinePlayheadNow();
     setCompositePreviewHelp('One source at a time · level-matched.');
     if (hadPreview) setStatus('Composite preview stopped.');
+}
+
+function toggleCompositePreview(mode) {
+    if (hybridSession.previewMode === mode
+            && (hybridSession.previewPlaying || hybridSession.previewLoading)) {
+        endCompositePreviewPlayback();
+        return;
+    }
+    startCompositePreview(mode);
 }
 
 function restoreCompositePreviewSession() {
@@ -549,6 +649,7 @@ function restoreCompositePreviewSession() {
 
 function clearTransientState() {
     hybridSession.closeDecisionResolve?.('discard');
+    stopCompositeModalDocumentKeyboard();
     stopHybridDialogSizePersistence();
     stopCompositeTimelineUi();
     resetHybridBuilderReview(hybridSession);
@@ -1251,7 +1352,8 @@ function bindResultEvents() {
     byId('editor-composite-prev')?.addEventListener('click', () => moveDecision(-1));
     byId('editor-composite-next')?.addEventListener('click', () => moveDecision(1));
     for (const button of result.querySelectorAll('[data-composite-preview]')) {
-        button.addEventListener('click', () => startCompositePreview(button.dataset.compositePreview));
+        button.addEventListener('click', () => toggleCompositePreview(
+            button.dataset.compositePreview));
     }
     byId('editor-composite-preview-stop')?.addEventListener('click', endCompositePreviewPlayback);
     byId('editor-composite-preview-restart')?.addEventListener('click', restartCompositePreview);
@@ -1551,11 +1653,17 @@ export function _compositeTimelineZoomControlsPure(zoom) {
         + `<output id="editor-composite-time-zoom-value" for="editor-composite-time-zoom" class="inline-block w-24 text-right text-xs tabular-nums text-gray-100">${rounded} px/beat</output>`;
 }
 
+function compositeTimelineDisplayBeatAtTime(view, time = hybridSession.timelineSeekTime) {
+    const seconds = Number(time);
+    const rawBeat = beatOf(view?.beats || hybridSession.plan?.beats || [],
+        Number.isFinite(seconds) ? Math.max(0, seconds) : 0);
+    return compositeTimelineDisplayBeatPure(rawBeat, view?.context);
+}
+
 function renderCompositeTimelineMapOverlays(view, viewportRange) {
     const viewport = compositeTimelineMapViewportPure(view, viewportRange);
-    const initialBeat = hybridSession.plan?.beats
-        ? beatOf(hybridSession.plan.beats, hybridSession.timelineSeekTime)
-        : view.context.startBeat;
+    const initialBeat = compositeTimelineDisplayBeatAtTime(
+        view, hybridSession.timelineSeekTime);
     const span = Math.max(1, view.context.endBeat - view.context.startBeat);
     const playheadX = Math.max(0, Math.min(1000,
         ((initialBeat - view.context.startBeat) / span) * 1000));
@@ -1569,6 +1677,10 @@ function renderCompositeTimelineMapOverlays(view, viewportRange) {
 function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar = '') {
     const zoom = hybridPreviewPreferences.timelineZoom;
     const width = compositeTimelineContentWidthPure(view.context, zoom);
+    const initialPlayheadBeat = compositeTimelineDisplayBeatAtTime(
+        view, hybridSession.timelineSeekTime);
+    const initialPlayheadX = compositeTimelineXForBeatPure(
+        initialPlayheadBeat, view.context, zoom);
     const initialGeometry = compositeTimelineStripGeometryPure({
         context: view.context,
         zoom,
@@ -1651,7 +1763,7 @@ function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar
         + `<svg data-composite-timeline-ruler-svg width="${initialGeometry.surfaceWidth}" height="${COMPOSITE_TIMELINE_RULER_HEIGHT}" role="img" aria-label="Bar and beat ruler; click to seek" style="position:absolute;inset:0;display:block;width:${initialGeometry.surfaceWidth}px;height:${COMPOSITE_TIMELINE_RULER_HEIGHT}px;max-width:none;cursor:pointer;contain:paint">${renderCompositeTimelineRulerContents(view, visible, zoom, renderOptions)}</svg>`
         + `</div>${rows}</div>`
         + fixedHeaders
-        + renderCompositeTimelinePlayhead()
+        + renderCompositeTimelinePlayhead(initialPlayheadX)
         + `</div></div></section>`;
 }
 
@@ -2153,9 +2265,9 @@ function applyCompositeTimelineCamera(dom = timelineViewportDom, rawVisualScroll
         dom.nativeScrollLeft, visualScroll);
     const layerTransform = `translate3d(${cameraOffset}px,0,0)`;
     if (dom.camera) dom.camera.style.transform = layerTransform;
-    const playheadX = Number(rawPlayheadX);
+    const playheadX = rawPlayheadX == null ? Number.NaN : Number(rawPlayheadX);
     if (Number.isFinite(playheadX)) dom.playheadX = playheadX;
-    if (dom.playhead && Number.isFinite(Number(dom.playheadX))) {
+    if (dom.playhead && dom.playheadX != null && Number.isFinite(Number(dom.playheadX))) {
         dom.playhead.style.transform = `translate3d(${Number(dom.playheadX) + cameraOffset}px,0,0)`;
     }
     dom.visualScrollLeft = visualScroll;
@@ -2306,16 +2418,26 @@ function updateCompositeTimelinePlayhead(frameTime = 0) {
     const playhead = dom?.playhead;
     if (!view || !scroller || !playhead) return;
     const activelyPlaying = hybridSession.previewPlaying && S.playing;
+    const playbackSettled = hybridSession.previewPlaying && !S.playing;
+    if (playbackSettled && Number.isFinite(Number(S.cursorTime))) {
+        // Natural completion resets the Editor transport to zero. Adopt that
+        // exact stopped position before the Hybrid animation loop ends.
+        hybridSession.timelineSeekTime = Math.max(0, Number(S.cursorTime));
+    }
     const time = activelyPlaying
         ? editorPlaybackVisualTime() : hybridSession.timelineSeekTime;
-    const beat = beatOf(hybridSession.plan.beats, time);
+    const beat = compositeTimelineDisplayBeatAtTime(view, time);
     const frame = compositeTimelineCameraFramePure({
         beat,
         context: view.context,
         zoom: hybridPreviewPreferences.timelineZoom,
         viewportWidth: dom.viewportWidth,
         visualScrollLeft: compositeTimelineVisualScrollLeft(dom),
-        follow: activelyPlaying && hybridPreviewPreferences.followPlayhead,
+        // A naturally completed preview adopts the Editor's stopped cursor
+        // (normally zero). Give that one settling frame the same Follow
+        // behavior so a long-song camera and overview box return with it.
+        follow: (activelyPlaying || playbackSettled)
+            && hybridPreviewPreferences.followPlayhead,
     });
     const visualScroll = frame.visualScrollLeft;
     if (activelyPlaying) {
@@ -2324,7 +2446,7 @@ function updateCompositeTimelinePlayhead(frameTime = 0) {
         applyCompositeTimelineCamera(dom, visualScroll, frame.contentX);
         updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime);
         timelinePlayheadFrame = requestAnimationFrame(updateCompositeTimelinePlayhead);
-    } else if (hybridSession.previewPlaying && !S.playing) {
+    } else if (playbackSettled) {
         applyCompositeTimelineCamera(dom, visualScroll, frame.contentX);
         updateCompositeTimelineMapFrame(dom, beat, visualScroll, frameTime, true);
         syncCompositeTimelineNativeCamera(dom);
@@ -2451,7 +2573,9 @@ function bindCompositeTimelineEvents() {
         surfaceWidth: 0,
         visualScrollLeft: scroller.scrollLeft,
         nativeScrollLeft: scroller.scrollLeft,
-        playheadX: null,
+        playheadX: compositeTimelineXForBeatPure(
+            compositeTimelineDisplayBeatAtTime(view, hybridSession.timelineSeekTime),
+            view.context, hybridPreviewPreferences.timelineZoom),
         mapPaintAt: 0,
         mapViewportWidth: '',
         standbyPending: false,
@@ -2804,6 +2928,7 @@ function renderResult() {
         finish.disabled = unresolvedBlocks > 0;
     }
     bindResultEvents();
+    recoverCompositeModalFocus();
 }
 
 function compositeAnalyzeButtonLabel() {
@@ -3174,7 +3299,10 @@ export async function editorHideCompositeArrangementModal() {
     if (hybridSession.closeDecisionResolve === settleCloseDecision) hybridSession.closeDecisionResolve = null;
     hybridSession.closePromptPending = false;
     const closeAction = hybridCloseAction(guardKind, choice);
-    if (closeAction === 'keep' || byId('editor-composite-modal') !== modal) return false;
+    if (closeAction === 'keep' || byId('editor-composite-modal') !== modal) {
+        if (byId('editor-composite-modal') === modal) recoverCompositeModalFocus(modal);
+        return false;
+    }
     closeCompositeModalImmediately(modal);
     return true;
 }
@@ -3189,8 +3317,15 @@ function handleCompositeModalShortcut(event) {
         stage: hybridSession.stage,
         previewActive: hybridSession.previewPlaying || hybridSession.previewLoading,
         repeat: event.repeat,
+        nativeActivation: compositeModalNativeActivationTarget(target),
     });
     if (!action) return;
+    if (action.kind === 'native-activation') {
+        // Keep the focused control's normal Space activation, but never let
+        // the same key continue into the Editor transport behind the modal.
+        event.stopImmediatePropagation();
+        return;
+    }
     if (action.kind === 'consume') {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -3208,12 +3343,13 @@ function handleCompositeModalShortcut(event) {
             `[data-composite-preview="${action.mode}"]:not([disabled])`);
         if (!button) return;
         event.preventDefault();
+        event.stopImmediatePropagation();
         button.click();
         return;
     }
     if (action.kind === 'play-toggle') {
-        if (target?.matches?.('button, summary')) return;
         event.preventDefault();
+        event.stopImmediatePropagation();
         if (hybridSession.previewPlaying || hybridSession.previewLoading) {
             endCompositePreviewPlayback();
         } else {
@@ -3227,13 +3363,15 @@ function handleCompositeModalShortcut(event) {
     if (action.kind === 'previous' || action.kind === 'next') {
         const button = byId(action.kind === 'previous'
             ? 'editor-composite-prev' : 'editor-composite-next');
-        if (!button || button.disabled) return;
         event.preventDefault();
+        event.stopImmediatePropagation();
+        if (!button || button.disabled) return;
         button.click();
         return;
     }
     if (action.kind === 'focus-review') {
         event.preventDefault();
+        event.stopImmediatePropagation();
         byId('editor-composite-focus-review')?.click();
     }
 }
@@ -3480,6 +3618,14 @@ export async function editorShowCompositeArrangementModal() {
     updateCompositeStageIndicator('setup');
     modal.addEventListener('keydown', handleCompositeModalShortcut);
     _installModalKeyboard(modal, modal.firstElementChild, editorHideCompositeArrangementModal);
+    installCompositeModalDocumentKeyboard(modal);
     byId('editor-composite-primary').focus();
     return true;
+}
+
+// Screen reinjection is not a user-requested close and must never leave this
+// module's document capture listener, rAF, observers, or body-mounted modal
+// attached to the replacement Editor instance.
+export function editorTeardownCompositeArrangementUi() {
+    closeCompositeModalImmediately(byId('editor-composite-modal'));
 }

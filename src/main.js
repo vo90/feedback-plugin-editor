@@ -109,7 +109,8 @@ import {
     editorShowNewTrackModal
 } from './new-track.js';
 import {
-    editorHideCompositeArrangementModal, editorShowCompositeArrangementModal
+    editorHideCompositeArrangementModal, editorShowCompositeArrangementModal,
+    editorTeardownCompositeArrangementUi
 } from './composite/resolver-ui.js';
 import {
     _editorTogglePartsView, _partsViewDraw, _partsViewOnDblClick, _partsViewOnMouseDown,
@@ -890,6 +891,9 @@ window.__editorScreenTeardown = () => {
     // Unblock any awaiting session-transition prompt before its listener is
     // swept below, so a re-injection can't strand guardSessionTransition.
     try { dismissSessionPrompt(); } catch (_) {}
+    if (typeof editorTeardownCompositeArrangementUi === 'function') {
+        try { editorTeardownCompositeArrangementUi(); } catch (_) {}
+    }
     _globalListeners.removeAll();
     // Stop any playback this injection owns — the audio graph outlives the
     // DOM, so a replaced screen would otherwise keep sounding.

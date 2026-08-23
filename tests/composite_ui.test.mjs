@@ -47,7 +47,7 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
     const playheadBody = resolver.slice(playheadStart, playheadEnd);
     const activePlaybackBody = playheadBody.slice(
         playheadBody.indexOf('if (activelyPlaying)'),
-        playheadBody.indexOf('} else if (hybridSession.previewPlaying'));
+        playheadBody.indexOf('} else if (playbackSettled)'));
     assert.doesNotMatch(playheadBody, /innerHTML\s*=/,
         'the animation frame may move geometry but never regenerate note markup');
     assert.match(playheadBody,
@@ -69,6 +69,61 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
         'only the cancel-before-refresh helper invokes the self-rescheduling callback directly');
     assert.match(resolver, /function refreshCompositeTimelinePlayheadNow\(\)[\s\S]*cancelAnimationFrame\(timelinePlayheadFrame\)[\s\S]*updateCompositeTimelinePlayhead\(\)/,
         'seek, bind, and maximize cannot multiply the playback animation loop');
+});
+
+test('Hybrid playhead is visible and exact before, during, and after playback', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    assert.match(resolver, /function compositeTimelineDisplayBeatAtTime/);
+    assert.match(resolver,
+        /initialPlayheadX\s*=\s*compositeTimelineXForBeatPure[\s\S]*renderCompositeTimelinePlayhead\(initialPlayheadX\)/,
+        'the first rendered frame uses the current clamped Hybrid position');
+    assert.match(resolver,
+        /playheadX:\s*compositeTimelineXForBeatPure\([\s\S]*compositeTimelineDisplayBeatAtTime/,
+        'the compositor cache starts with a finite visible marker instead of null/zero');
+    assert.doesNotMatch(resolver, /playheadX:\s*null/);
+    assert.match(resolver,
+        /const playbackSettled = hybridSession\.previewPlaying && !S\.playing;[\s\S]*timelineSeekTime = Math\.max\(0, Number\(S\.cursorTime\)\)/,
+        'natural completion adopts the exact stopped transport position');
+    assert.match(resolver,
+        /follow:\s*\(activelyPlaying \|\| playbackSettled\)[\s\S]*hybridPreviewPreferences\.followPlayhead/,
+        'natural completion also returns the followed camera and overview box to that position');
+    const stopStart = resolver.indexOf('function endCompositePreviewPlayback');
+    const stopEnd = resolver.indexOf('function restoreCompositePreviewSession', stopStart);
+    assert.match(resolver.slice(stopStart, stopEnd), /refreshCompositeTimelinePlayheadNow\(\)/,
+        'explicit Stop leaves both timeline markers at the captured position');
+});
+
+test('Hybrid modal recovers escaped focus and owns its transport shortcuts', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const main = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+    assert.match(resolver, /function recoverCompositeModalFocus/);
+    assert.match(resolver,
+        /bindResultEvents\(\);\s*recoverCompositeModalFocus\(\);/,
+        'a hidden Setup or Review control cannot leave keyboard focus on the page body');
+    assert.match(resolver, /function installCompositeModalDocumentKeyboard/);
+    assert.match(resolver,
+        /const nestedPrompt = byId\('editor-choice-prompt'\)[\s\S]*handleCompositeModalShortcut\(event\)[\s\S]*event\.stopImmediatePropagation\(\)/,
+        'outside focus is contained without stealing keys from a nested Hybrid prompt');
+    assert.match(resolver,
+        /event\.key === 'Escape' && !event\.repeat && !previewActive[\s\S]*editorHideCompositeArrangementModal\(\)/,
+        'escaped inactive Escape still reaches the normal guarded close path');
+    assert.match(resolver,
+        /closeAction === 'keep'[\s\S]*recoverCompositeModalFocus\(modal\)/,
+        'keeping a guarded review restores focus immediately after its nested prompt closes');
+    assert.match(resolver,
+        /action\.kind === 'play-toggle'[\s\S]*event\.preventDefault\(\);\s*event\.stopImmediatePropagation\(\)/,
+        'claimed Space playback cannot leak into a second transport handler');
+    assert.match(resolver, /action\.kind === 'native-activation'/,
+        'Space still activates a visible focused button without reaching the Editor');
+    assert.match(resolver,
+        /function toggleCompositePreview[\s\S]*hybridSession\.previewMode === mode[\s\S]*endCompositePreviewPlayback\(\)/,
+        'Space or click on the active sound button toggles it off instead of restarting it');
+    assert.match(resolver, /control\.id !== 'editor-composite-timeline-map'/,
+        'the overview button keeps Space available as the documented transport shortcut');
+    assert.match(resolver, /export function editorTeardownCompositeArrangementUi/);
+    assert.match(main,
+        /window\.__editorScreenTeardown = \(\) => \{[\s\S]*editorTeardownCompositeArrangementUi\(\)/,
+        'Editor reinjection removes the Hybrid document listener and body-mounted modal');
 });
 
 test('Hybrid follow uses bounded double-buffered cameras and compositor-only overview movers', () => {

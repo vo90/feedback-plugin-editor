@@ -114,6 +114,16 @@ export function compositeTimelineSongRangePure({ beats = [], durationSeconds = 0
     return { startBeat: 0, endBeat };
 }
 
+// The transport may legitimately sit before the first authored grid beat
+// (Majesty starts beat zero a little after t=0) or just beyond the last beat
+// while playback settles. The timeline still needs a visible marker in those
+// states, so display geometry parks it on the nearest song edge.
+export function compositeTimelineDisplayBeatPure(beat, context = {}) {
+    const start = finite(context.startBeat);
+    const end = Math.max(start, finite(context.endBeat, start));
+    return Math.max(start, Math.min(end, finite(beat, start)));
+}
+
 export function buildCompositeTimelineViewModel({
     plan,
     primaryName = 'Base track',

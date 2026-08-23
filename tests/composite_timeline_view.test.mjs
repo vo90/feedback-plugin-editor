@@ -11,6 +11,7 @@ import {
     compositeTimelineCameraOffsetPure,
     compositeTimelineCenteredScrollPure,
     compositeTimelineContentWidthPure,
+    compositeTimelineDisplayBeatPure,
     compositeTimelineEntriesInRangePure,
     compositeTimelineFitZoomPure,
     compositeTimelineGlobalToLocalXPure,
@@ -82,6 +83,16 @@ test('whole-song range starts at zero and includes audio beyond the beat grid', 
     assert.equal(model.hasFillAdditions, true);
 });
 
+test('display playhead beat always remains on a visible song edge', () => {
+    const context = { startBeat: 0, endBeat: 24 };
+    assert.equal(compositeTimelineDisplayBeatPure(-0.345, context), 0,
+        'audio before Majesty\'s first grid beat parks at the padded start edge');
+    assert.equal(compositeTimelineDisplayBeatPure(7.25, context), 7.25);
+    assert.equal(compositeTimelineDisplayBeatPure(25.5, context), 24,
+        'a settling transport beyond the tail parks at the song end');
+    assert.equal(compositeTimelineDisplayBeatPure(Number.NaN, context), 0);
+});
+
 test('timeline uses one stable beat-to-x map and culls entries outside the buffered view', () => {
     const model = view();
     const x2 = compositeTimelineXForBeatPure(2, model.context, 32);
@@ -136,6 +147,12 @@ test('the virtual camera glides fractionally without native-scroll catch-up', ()
     });
     assert.equal(end.visualScrollLeft, end.maxScroll);
     assert.equal(end.screenX, 1000 - COMPOSITE_TIMELINE_EDGE_PADDING);
+    const settledAtStart = compositeTimelineCameraFramePure({
+        beat: 0, context, zoom: 60, viewportWidth: 1000,
+        visualScrollLeft: end.maxScroll, follow: true,
+    });
+    assert.equal(settledAtStart.visualScrollLeft, 0,
+        'natural completion can return a long-song camera from the tail to the stopped marker');
     const paused = compositeTimelineCameraFramePure({
         beat: 12, context, zoom: 60, viewportWidth: 1000,
         visualScrollLeft: 321.5, follow: false,

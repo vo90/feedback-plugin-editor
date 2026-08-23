@@ -218,6 +218,16 @@ test('the shared timeline and modal shortcuts cover review and final preview coh
         kind: 'preview', mode: 'result',
     });
     assert.deepEqual(_compositeModalShortcutPure({ key: ' ' }), { kind: 'play-toggle' });
+    assert.deepEqual(_compositeModalShortcutPure({
+        key: ' ', nativeActivation: true,
+    }), { kind: 'native-activation' },
+    'a visible focused control keeps native Space activation inside the modal');
+    assert.deepEqual(_compositeModalShortcutPure({ key: ' ', repeat: true }), {
+        kind: 'consume',
+    }, 'holding Space cannot rapidly start and stop the preview');
+    assert.deepEqual(_compositeModalShortcutPure({ key: '2', repeat: true }), {
+        kind: 'consume',
+    }, 'holding a sound shortcut cannot repeatedly reload its preview');
     assert.deepEqual(_compositeModalShortcutPure({ key: 'ArrowRight', stage: 'review' }), {
         kind: 'next',
     });
