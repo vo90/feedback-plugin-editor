@@ -1,7 +1,7 @@
 /* Hybrid-track review visualization.
  *
- * Converts a DOM-free merge plan into the three synchronized tab lanes used by
- * the resolver.  Keeping the view model and SVG generation pure makes the
+ * Converts a DOM-free merge plan into synchronized review metadata used by
+ * the shared Hybrid timeline. Keeping this model pure makes selection and
  * musical alignment testable without alphaTab or a browser.
  */
 
@@ -34,12 +34,6 @@ const TECHNIQUE_LABELS = Object.freeze({
     scale_degree: 'Scale degree',
     strum_group: 'Strum group',
     hand: 'Hand',
-});
-
-const LANE_COLORS = Object.freeze({
-    primary: Object.freeze({ main: '#38bdf8', soft: '#082f49', text: '#bae6fd' }),
-    secondary: Object.freeze({ main: '#a78bfa', soft: '#2e1065', text: '#ddd6fe' }),
-    result: Object.freeze({ main: '#34d399', soft: '#022c22', text: '#a7f3d0' }),
 });
 
 function finite(value, fallback = 0) {
@@ -210,6 +204,10 @@ function propertyDifferences(conflict) {
 }
 
 function conflictExplanation(conflict, names, stringCount) {
+    if (conflict.reason === 'experimental-handoff-review') {
+        return conflict.explanation
+            || `This fill passage fits the hard timing gap, but its musical handoff is uncertain. Add the complete passage, leave it out, or choose complete gestures manually.`;
+    }
     if ((conflict.reasons || []).includes('guided-choice')) {
         if ((conflict.reasons || []).includes('transition')) {
             return `Notes or trails cross the edge of this section. Choose which track should play through the handoff; no trail will be cut off.`;
@@ -278,140 +276,71 @@ export function buildCompositeConflictViewModel({
         explanation: conflictExplanation(conflict, names, stringCount),
         differences: propertyDifferences(conflict),
         lanes: [
-            { id: 'primary', label: names.primary, subtitle: 'Base track · always kept outside reviewed sections', entries: primary },
-            { id: 'secondary', label: names.secondary, subtitle: 'Fill track · alternative part for this section', entries: secondary },
-            { id: 'result', label: 'Hybrid result', subtitle: conflict.resolution || custom ? 'Your current choice' : 'Choose what to play here', entries: result },
+            { id: 'primary', label: names.primary, subtitle: plan.strategy === 'experimental'
+                ? 'Base track · your starting arrangement' : 'Base track · kept outside reviewed sections', entries: primary },
+            { id: 'secondary', label: names.secondary, subtitle: plan.strategy === 'experimental'
+                ? 'Optional fill passage under review' : 'Fill track · alternative part for this section', entries: secondary },
+            { id: 'result', label: 'Hybrid result', subtitle: conflict.resolution || custom
+                ? 'Your current choice' : plan.strategy === 'experimental'
+                    ? 'Base track shown until you choose whether to add the passage'
+                    : 'Choose what to play here', entries: result },
         ],
     };
 }
 
-function xForBeat(beat, context, plotLeft, plotWidth) {
-    const span = Math.max(1, context.endBeat - context.startBeat);
-    const ratio = Math.max(0, Math.min(1, (beat - context.startBeat) / span));
-    return plotLeft + ratio * plotWidth;
-}
-
-function techniqueSummary(entry) {
-    return entry.techniques.length ? entry.techniques.join(', ') : 'No techniques';
-}
-
-function techniqueBadgeSummary(entry) {
-    if (!entry.inConflict || !entry.techniques.length) return '';
-    const aliases = {
-        'Hammer-on': 'HO', 'Pull-off': 'PO', 'Palm mute': 'PM',
-        'Fret-hand mute': 'FM', 'String mute': 'X', Harmonic: 'H',
-        'Pinch harmonic': 'PH', Accent: '>', Vibrato: 'VIB', Tremolo: 'TR',
-        Tap: 'T', Slap: 'SL', Pop: 'POP', 'Linked note': 'LINK',
-        Slide: 'GL', 'Unpitched slide': 'UG', Bend: 'B',
-        'Bend curve': 'B', 'Bend intent': 'B',
+export function buildCompositeReviewToolbarModel({
+    plan, conflict, primaryName = 'Base', secondaryName = 'Fill',
+    customEntryIds = null, decisionNumber = 1, decisionTotal = 1,
+    unresolvedDecisions = 0, repeatCount = 1, canReset = null,
+} = {}) {
+    if (!plan || !conflict) return null;
+    const experimental = plan.strategy === 'experimental';
+    const draftActive = Array.isArray(customEntryIds);
+    const manualActive = draftActive || conflict.resolution === 'custom';
+    const selection = draftActive ? customEntryIds
+        : conflict.resolution === 'custom' ? conflict.selectedEntryIds || [] : [];
+    const selectedIds = new Set(selection);
+    const primarySelected = (conflict.primaryEntries || [])
+        .filter(entry => selectedIds.has(entry.id)).length;
+    const secondarySelected = (conflict.secondaryEntries || [])
+        .filter(entry => selectedIds.has(entry.id)).length;
+    const validationError = String(conflict.validationError || '');
+    const resolution = manualActive ? 'custom' : conflict.resolution || '';
+    const state = validationError ? 'invalid' : conflict.resolution ? 'resolved' : 'unresolved';
+    const choices = experimental ? [
+        { id: 'primary', label: 'Leave fill out', hint: `Keep ${primaryName} unchanged` },
+        { id: 'secondary', label: 'Add fill', hint: `Add the complete ${secondaryName} passage` },
+        { id: 'custom', label: 'Choose notes', hint: 'Choose connected fill gestures' },
+    ] : [
+        { id: 'primary', label: `Use ${primaryName}`, hint: 'Use the base track here' },
+        { id: 'secondary', label: `Use ${secondaryName}`, hint: 'Use the fill track here' },
+        { id: 'custom', label: 'Mix notes', hint: 'Choose notes from either track' },
+    ];
+    return {
+        experimental,
+        profile: experimental ? String(plan.profile || 'balanced') : '',
+        decisionNumber: Math.max(1, Math.trunc(finite(decisionNumber, 1))),
+        decisionTotal: Math.max(1, Math.trunc(finite(decisionTotal, 1))),
+        unresolvedDecisions: Math.max(0, Math.trunc(finite(unresolvedDecisions))),
+        repeatCount: Math.max(1, Math.trunc(finite(repeatCount, 1))),
+        resolution,
+        state,
+        stateLabel: state === 'invalid' ? 'Needs attention'
+            : state === 'resolved' ? 'Choice made' : 'Needs review',
+        selectedLaneId: resolution === 'primary' || resolution === 'secondary'
+            ? resolution : resolution === 'custom' ? 'result' : '',
+        choices: choices.map(choice => ({
+            ...choice,
+            selected: resolution === choice.id,
+        })),
+        canReset: canReset === null
+            ? Boolean(conflict.resolution || draftActive) : Boolean(canReset),
+        canContinue: Boolean(conflict.resolution),
+        manualActive,
+        primarySelected,
+        secondarySelected,
+        validationError,
     };
-    const badges = [];
-    for (const technique of entry.techniques) {
-        const badge = aliases[technique] || technique.slice(0, 4).toUpperCase();
-        if (!badges.includes(badge)) badges.push(badge);
-    }
-    const visible = badges.slice(0, 3);
-    if (badges.length > visible.length) visible.push(`+${badges.length - visible.length}`);
-    return visible.join(' · ');
-}
-
-function entryTitle(entry, stringCount) {
-    const string = Math.max(1, stringCount - entry.string);
-    const duration = Math.max(0, entry.endBeat - entry.startBeat).toFixed(3);
-    return `String ${string}, fret ${entry.fret}, beat ${entry.startBeat.toFixed(3)}, ${duration} beat trail. ${techniqueSummary(entry)}.`;
-}
-
-function trailMarkup(entry, y, context, plotLeft, plotWidth, color) {
-    const startX = xForBeat(entry.startBeat, context, plotLeft, plotWidth);
-    const authoredEndX = xForBeat(Math.max(entry.startBeat, entry.endBeat), context, plotLeft, plotWidth);
-    const effectiveEndX = xForBeat(entryEnd(entry), context, plotLeft, plotWidth);
-    let markup = '';
-    if (authoredEndX > startX + 2) {
-        const dashed = entry.techniques.includes('Tremolo') ? ' stroke-dasharray="3 3"' : '';
-        markup += `<line x1="${startX.toFixed(1)}" y1="${y}" x2="${authoredEndX.toFixed(1)}" y2="${y}" stroke="${color}" stroke-width="5" stroke-linecap="round" opacity="0.68"${dashed}/>`;
-    }
-    if (effectiveEndX > authoredEndX + 2) {
-        markup += `<line x1="${Math.max(startX, authoredEndX).toFixed(1)}" y1="${y}" x2="${effectiveEndX.toFixed(1)}" y2="${y}" stroke="${color}" stroke-width="3" stroke-dasharray="5 4" opacity="0.8"/>`;
-    }
-    return markup;
-}
-
-function noteMarkup(entry, lane, y, context, stringCount, plotLeft, plotWidth) {
-    const colors = LANE_COLORS[lane.id];
-    const x = xForBeat(entry.startBeat, context, plotLeft, plotWidth);
-    const fret = String(entry.fret);
-    const width = Math.max(20, 10 + fret.length * 8);
-    const outline = entry.invalid ? '#f87171' : entry.selected && entry.inConflict ? '#f8fafc' : colors.main;
-    const fill = entry.invalid ? '#7f1d1d' : colors.soft;
-    const cursor = entry.selectable ? ' cursor="pointer"' : '';
-    const interaction = entry.selectable
-        ? ` data-composite-entry-id="${escapeMarkup(entry.id)}" tabindex="0" role="checkbox" aria-checked="${entry.selected}"` : '';
-    const badge = techniqueBadgeSummary(entry);
-    const tech = badge
-        ? `<text x="${x.toFixed(1)}" y="${y - 12}" text-anchor="middle" fill="#fcd34d" font-size="8" font-weight="700">${escapeMarkup(badge)}</text>` : '';
-    return `<g${interaction}${cursor}><title>${escapeMarkup(entryTitle(entry, stringCount))}</title>`
-        + trailMarkup(entry, y, context, plotLeft, plotWidth, colors.main)
-        + `<rect x="${(x - width / 2).toFixed(1)}" y="${y - 9}" width="${width}" height="18" rx="7" fill="${fill}" stroke="${outline}" stroke-width="${entry.selected && entry.inConflict ? 2.5 : 1.5}"/>`
-        + `<text x="${x.toFixed(1)}" y="${y + 4}" text-anchor="middle" fill="#f8fafc" font-size="11" font-weight="700">${escapeMarkup(fret)}</text>`
-        + (entry.selected && entry.inConflict ? `<circle cx="${(x + width / 2 - 1).toFixed(1)}" cy="${y - 8}" r="4" fill="#f8fafc"/><path d="M${(x + width / 2 - 3).toFixed(1)} ${y - 8}l1.5 1.5 3-3" fill="none" stroke="#065f46" stroke-width="1.5"/>` : '')
-        + tech + '</g>';
-}
-
-export function renderCompositeConflictTabSvg(view) {
-    if (!view) return '';
-    const width = 1120;
-    const plotLeft = 174;
-    const plotWidth = width - plotLeft - 22;
-    const stringGap = 20;
-    const laneHeight = 58 + (view.stringCount - 1) * stringGap;
-    const laneGap = 14;
-    const top = 42;
-    const height = top + view.lanes.length * laneHeight + (view.lanes.length - 1) * laneGap + 18;
-    const conflictX = xForBeat(view.conflict.startBeat, view.context, plotLeft, plotWidth);
-    const conflictEndX = xForBeat(view.conflict.endBeat, view.context, plotLeft, plotWidth);
-    const conflictWidth = Math.max(8, conflictEndX - conflictX);
-    const beatLines = [];
-    for (let beat = Math.ceil(view.context.startBeat); beat <= Math.floor(view.context.endBeat); beat++) {
-        const x = xForBeat(beat, view.context, plotLeft, plotWidth);
-        beatLines.push(`<line x1="${x.toFixed(1)}" y1="24" x2="${x.toFixed(1)}" y2="${height - 8}" stroke="#334155" stroke-width="0.7" opacity="0.55"/>`);
-    }
-    const measureLines = (view.context.measureMarkers || []).map(marker => {
-        const x = xForBeat(marker.beat, view.context, plotLeft, plotWidth);
-        return `<line x1="${x.toFixed(1)}" y1="18" x2="${x.toFixed(1)}" y2="${height - 8}" stroke="#64748b" stroke-width="1.5" opacity="0.8"/>`
-            + `<text x="${(x + 4).toFixed(1)}" y="15" fill="#94a3b8" font-size="10">Bar ${escapeMarkup(marker.measure)}</text>`;
-    }).join('');
-    const lanes = view.lanes.map((lane, laneIndex) => {
-        const laneY = top + laneIndex * (laneHeight + laneGap);
-        const colors = LANE_COLORS[lane.id];
-        const strings = [];
-        for (let row = 0; row < view.stringCount; row++) {
-            const y = laneY + 34 + row * stringGap;
-            strings.push(`<text x="${plotLeft - 12}" y="${y + 4}" text-anchor="end" fill="#64748b" font-size="9">${row + 1}</text>`
-                + `<line x1="${plotLeft}" y1="${y}" x2="${plotLeft + plotWidth}" y2="${y}" stroke="#64748b" stroke-width="1" opacity="0.72"/>`);
-        }
-        const notes = lane.entries.map(entry => {
-            const row = Math.max(0, Math.min(view.stringCount - 1, view.stringCount - 1 - entry.string));
-            return noteMarkup(entry, lane, laneY + 34 + row * stringGap,
-                view.context, view.stringCount, plotLeft, plotWidth);
-        }).join('');
-        const noChoice = lane.id === 'result' && !view.conflict.resolution && !view.custom
-            ? `<text x="${(conflictX + conflictWidth / 2).toFixed(1)}" y="${laneY + 22}" text-anchor="middle" fill="#fcd34d" font-size="10">Choose what to play here</text>` : '';
-        return `<g><rect x="8" y="${laneY}" width="${width - 16}" height="${laneHeight}" rx="10" fill="${colors.soft}" opacity="0.38" stroke="${colors.main}" stroke-opacity="0.38"/>`
-            + `<rect x="${conflictX.toFixed(1)}" y="${laneY + 3}" width="${conflictWidth.toFixed(1)}" height="${laneHeight - 6}" rx="4" fill="#ef4444" opacity="0.14" stroke="#f87171" stroke-dasharray="4 3"/>`
-            + `<text x="20" y="${laneY + 27}" fill="${colors.text}" font-size="13" font-weight="700">${escapeMarkup(lane.label)}</text>`
-            + `<text x="20" y="${laneY + 44}" fill="#94a3b8" font-size="9">${escapeMarkup(lane.subtitle)}</text>`
-            + strings.join('') + notes + noChoice + '</g>';
-    }).join('');
-    const aria = `Three aligned tablature lanes for review section ${view.conflictIndex + 1} of ${view.conflictCount}. ${view.explanation}`;
-    // Keep notation at one stable pixel scale. The resizable dialog owns the
-    // viewport; a wider/taller window should reveal more workspace, not magnify
-    // all three lanes and their note glyphs through a 100%-wide SVG.
-    return `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="${escapeMarkup(aria)}" style="display:block;width:${width}px;height:${height}px;max-width:none">`
-        + `<rect width="${width}" height="${height}" rx="12" fill="#0f172a"/>`
-        + beatLines.join('') + measureLines + lanes
-        + `<path d="M${conflictX.toFixed(1)} 28v8M${conflictEndX.toFixed(1)} 28v8M${conflictX.toFixed(1)} 32H${conflictEndX.toFixed(1)}" stroke="#f87171" stroke-width="2"/>`
-        + `<text x="${(conflictX + conflictWidth / 2).toFixed(1)}" y="27" text-anchor="middle" fill="#fcd34d" font-size="10" font-weight="700">REVIEW</text>`
-        + '</svg>';
 }
 
 export function renderCompositeDifferenceTable(view) {

@@ -11,6 +11,10 @@ import {
     compositePreviewVolumeGainPure,
     compositeRecordingPreviewLevelPure,
 } from '../src/composite/preview.js';
+import {
+    COMPOSITE_BEAT_EPS,
+    prepareCompositeSources,
+} from '../src/composite/merge-engine.js';
 
 const beats = Array.from({ length: 12 }, (_, index) => ({ time: index * 0.5 }));
 
@@ -24,6 +28,74 @@ test('composite preview converts tuning, capo, and the complete effective trail'
         fret: 3,
     }], arrangement, beats, 6);
     assert.deepEqual(events, [{ t: 0.5, midi: 43, sus: 1 }]);
+});
+
+test('composite preview restores the MIDI fallback for merge epsilon-only notes', () => {
+    const arrangement = {
+        type: 'guitar', tuning: [0, 0, 0, 0, 0, 0], capo: 0,
+        notes: [{ time: 1, string: 0, fret: 3, sustain: 0 }], chords: [],
+    };
+    const prepared = prepareCompositeSources({
+        primary: arrangement,
+        secondary: { ...arrangement, notes: [] },
+        beats,
+    });
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.primaryEntries.length, 1);
+    assert.ok(Math.abs(prepared.primaryEntries[0].effectiveEndBeat
+        - prepared.primaryEntries[0].startBeat - COMPOSITE_BEAT_EPS) < 1e-12);
+
+    const events = compositePreviewEventsPure(
+        prepared.primaryEntries, arrangement, beats, 6);
+    assert.deepEqual(events, [{ t: 1, midi: 43, sus: 0 }]);
+});
+
+test('composite preview preserves meaningful effective connections from zero-trail notes', () => {
+    const variableBeats = [
+        { time: 0 }, { time: 0.4 }, { time: 1.1 }, { time: 1.6 },
+    ];
+    const arrangement = {
+        type: 'guitar', tuning: [0, 0, 0, 0, 0, 0], capo: 0, chords: [],
+        notes: [
+            { time: 0.4, string: 0, fret: 3, sustain: 0,
+                techniques: { link_next: true } },
+            { time: 1.1, string: 0, fret: 5, sustain: 0, techniques: {} },
+        ],
+    };
+    const prepared = prepareCompositeSources({
+        primary: arrangement,
+        secondary: { ...arrangement, notes: [] },
+        beats: variableBeats,
+    });
+    assert.equal(prepared.primaryEntries[0].connectedToId, 'primary:1');
+
+    const events = compositePreviewEventsPure(
+        prepared.primaryEntries, arrangement, variableBeats, 6);
+    assert.equal(events.length, 2);
+    assert.deepEqual(events.map(event => [event.t, event.midi]), [[0.4, 43], [1.1, 45]]);
+    assert.ok(Math.abs(events[0].sus - 0.7) < 1e-12);
+    assert.equal(events[1].sus, 0);
+});
+
+test('composite preview restores zero sustain for flattened chord entries too', () => {
+    const arrangement = {
+        type: 'guitar', tuning: [0, 0, 0, 0, 0, 0], capo: 0, notes: [],
+        chords: [{ time: 1.5, notes: [
+            { string: 0, fret: 3, sustain: 0 },
+            { string: 1, fret: 2, sustain: 0.5 },
+        ] }],
+    };
+    const prepared = prepareCompositeSources({
+        primary: arrangement,
+        secondary: { ...arrangement, chords: [] },
+        beats,
+    });
+    const events = compositePreviewEventsPure(
+        prepared.primaryEntries, arrangement, beats, 6);
+    assert.deepEqual(events, [
+        { t: 1.5, midi: 43, sus: 0 },
+        { t: 1.5, midi: 47, sus: 0.5 },
+    ]);
 });
 
 test('composite preview sorts chords and skips entries that cannot sound', () => {

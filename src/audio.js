@@ -1027,6 +1027,13 @@ export function stopPlayback() {
 
 export function playbackTick() {
     if (!S.playing) return;
+    // Focused tools such as the Hybrid Track reviewer paint their own visible
+    // timeline over the editor. Repainting the obscured editor canvas as well
+    // competes with that timeline for every animation frame (especially on a
+    // dense song) and makes its camera look as though it is advancing at only
+    // a handful of frames per second. The transport clock and audio scheduler
+    // keep running normally; only the invisible duplicate paint is suppressed.
+    const paintEditor = _editorPlaybackPaintRequiredPure(!!_editorGuidePreview);
     // Clamped at the start position while a count-in pre-roll runs (the
     // anchor sits in the future, so the raw chart time would read negative).
     S.cursorTime = Math.max(S.playStartTime,
@@ -1076,15 +1083,19 @@ export function playbackTick() {
             S.cursorTime = loopRestart;
             startPlayback();
             if (_abActive()) { _abPhase = abPhase; _abApplyRefGain(); }
-            host.updateTimeDisplay();
-            host.drawNow();
+            if (paintEditor) {
+                host.updateTimeDisplay();
+                host.drawNow();
+            }
             return;   // startPlayback scheduled its own tick.
         }
         _restartPlaybackAt(loopRestart);
-        host.updateTimeDisplay();
-        // playbackTick already runs once per animation frame — paint
-        // synchronously rather than queueing a second rAF via host.draw().
-        host.drawNow();
+        if (paintEditor) {
+            host.updateTimeDisplay();
+            // playbackTick already runs once per animation frame — paint
+            // synchronously rather than queueing a second rAF via host.draw().
+            host.drawNow();
+        }
         rafId = requestAnimationFrame(playbackTick);
         return;
     }
@@ -1098,8 +1109,10 @@ export function playbackTick() {
             stopPlayback();
         }
         S.cursorTime = 0;
-        host.updateTimeDisplay(); // reflect the reset immediately before returning
-        host.drawNow();
+        if (paintEditor) {
+            host.updateTimeDisplay(); // reflect the reset immediately before returning
+            host.drawNow();
+        }
         return; // stopPlayback() already cancelled rafId; don't re-schedule.
     }
 
@@ -1115,9 +1128,15 @@ export function playbackTick() {
         if (target !== null) S.scrollX = host.editorClampScrollX(target);
     }
 
-    host.updateTimeDisplay();
-    host.drawNow();
+    if (paintEditor) {
+        host.updateTimeDisplay();
+        host.drawNow();
+    }
     rafId = requestAnimationFrame(playbackTick);
+}
+
+export function _editorPlaybackPaintRequiredPure(focusedPreviewActive) {
+    return !focusedPreviewActive;
 }
 
 /* @pure:follow-scroll:start */
@@ -1424,7 +1443,10 @@ export function _metroSubdivClicksPure(beats, from, to, div) {
 }
 /* @pure:audition-trainer:end */
 
-const GUIDE_LOOKAHEAD = 0.12;  // seconds scheduled ahead of the transport
+const GUIDE_LOOKAHEAD = 0.12;          // ordinary editor guide look-ahead
+const GUIDE_PREVIEW_LOOKAHEAD = 0.3;   // dense focused tools share the UI thread
+const GUIDE_LATE_GRACE = 0.005;
+const GUIDE_PREVIEW_LATE_GRACE = 0.04;
 const GUIDE_TICK_MS = 25;      // scheduler cadence
 let _guideTimer = null;
 let _guideScheduledUntil = 0;  // chart-seconds watermark (exclusive)
@@ -1434,6 +1456,24 @@ let _guideLastFiredKey = null; // last-fired 1 ms bucket key, PERSISTED across
                                // ticks so a chord straddling a window boundary
                                // (same bucket, split by the 25 ms tick) can't
                                // double-fire — per-window dedupe alone resets.
+
+// Focused Hybrid previews can render hundreds of visible tablature marks. A
+// deeper look-ahead keeps their WebAudio voices scheduled across a short paint
+// stall, while the bounded grace recovers only the most recent late attacks
+// instead of machine-gunning an arbitrary backlog. Ordinary Editor playback
+// keeps its established latency policy.
+export function _guideScheduleWindowPure(nowChart, scheduledUntil,
+    previewActive = false, loopEnabled = false, loopEndTime = Number.NaN) {
+    const now = Number.isFinite(Number(nowChart)) ? Number(nowChart) : 0;
+    const scheduled = Number.isFinite(Number(scheduledUntil))
+        ? Number(scheduledUntil) : now;
+    const lookahead = previewActive ? GUIDE_PREVIEW_LOOKAHEAD : GUIDE_LOOKAHEAD;
+    const grace = previewActive ? GUIDE_PREVIEW_LATE_GRACE : GUIDE_LATE_GRACE;
+    return {
+        from: Math.max(scheduled, now - grace),
+        to: _guideWindowEndPure(now + lookahead, !!loopEnabled, loopEndTime),
+    };
+}
 
 export function editorGuideClapEnabled() {
     try {
@@ -2623,9 +2663,12 @@ export async function editorPrepareGuidePreview(kind = 'guitar', options = {}) {
 // while the policy decides whether the imported song audio is audible.
 export function editorSetGuidePreview(events = [], kind = 'guitar', options = {}) {
     const sanitized = _gmSanitizeEventsPure(events);
+    const requestedVoiceCap = Math.trunc(Number(options.voiceCap));
     _editorGuidePreview = {
         events: sanitized,
         gm: sanitized.length ? _guidePreviewProgram(kind, options) : null,
+        voiceCap: Number.isInteger(requestedVoiceCap)
+            ? Math.max(1, Math.min(12, requestedVoiceCap)) : 4,
         referenceAudio: options.referenceAudio === 'muted' ? 'muted' : 'audible',
         referenceGain: _previewGainValuePure(options.referenceGain, 1),
         guideGain: _previewGainValuePure(options.guideGain, 1),
@@ -2688,12 +2731,10 @@ function _guideTick() {
     // Clamp the lookahead end to the loop-region end while looping, so no clap
     // is scheduled past the boundary before the rAF wrap cancels the window.
     const loopRegion = S.loopEnabled ? _normalizeLoopRegionPure(S.barSel, S.duration) : null;
-    const to = _guideWindowEndPure(
-        nowChart + GUIDE_LOOKAHEAD, !!loopRegion, loopRegion ? loopRegion.endTime : NaN);
-    // If the timer stalled (hidden tab), skip events that are already in the
-    // past rather than machine-gunning them late; 5 ms of grace keeps an
-    // event exactly at the cursor audible.
-    const from = Math.max(_guideScheduledUntil, nowChart - 0.005);
+    const scheduleWindow = _guideScheduleWindowPure(
+        nowChart, _guideScheduledUntil, previewActive,
+        !!loopRegion, loopRegion ? loopRegion.endTime : Number.NaN);
+    const { from, to } = scheduleWindow;
     if (to <= from) return;
     // Per-part mute/solo (mixer panel, B6): the active surface's part gates
     // its own guide here (only the guide — the reference audio rides its own
@@ -2772,7 +2813,9 @@ function _guideTick() {
         const gm = (previewActive || editorGuideVoiceMode() === 'gm') ? _guideGmProgram() : null;
         if (gm !== null && gmPresetReady(gm)) {
             const bus = _ensureMasterBus();
-            const groups = _gmEventsInWindowPure(_guidePitchedEvents(), from, to, 4);
+            const voiceCap = previewActive ? _editorGuidePreview.voiceCap : 4;
+            const groups = _gmEventsInWindowPure(
+                _guidePitchedEvents(), from, to, voiceCap);
             for (const gp of groups) {
                 // Same cross-tick dedupe as the clap path (bucket split by a
                 // window boundary must not re-fire).

@@ -206,6 +206,14 @@ t('voice duration: sustain honored, capped at 1.6 s, staccato floor 0.35 s', () 
     }
 });
 
+t('focused fretted previews can retain a complete six-string chord', () => {
+    const evs = _gmSanitizeEventsPure(
+        [40, 45, 50, 55, 59, 64].map(m => ({ t: 1, midi: m, sus: 1 })));
+    const groups = _gmEventsInWindowPure(evs, 0.5, 1.5, 6);
+    assert.strictEqual(groups.length, 1);
+    assert.deepStrictEqual(groups[0].voices.map(v => v.midi), [40, 45, 50, 55, 59, 64]);
+});
+
 t('focused chord voices use constant-power scaling', () => {
     assert.strictEqual(_gmChordVoiceGainPure(1), 0.5);
     assert.ok(Math.abs(_gmChordVoiceGainPure(2) - 0.5 / Math.sqrt(2)) < 1e-12);

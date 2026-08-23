@@ -3,9 +3,9 @@ import test from 'node:test';
 
 import {
     buildCompositeConflictViewModel,
+    buildCompositeReviewToolbarModel,
     compositeConflictContextPure,
     compositeTechniqueLabels,
-    renderCompositeConflictTabSvg,
     renderCompositeDifferenceTable,
 } from '../src/composite/conflict-view.js';
 import { resolveCompositeConflict } from '../src/composite/merge-engine.js';
@@ -90,17 +90,10 @@ test('custom source notes are keyboard-selectable and invalid drafts stay visibl
     });
     assert.equal(view.invalid, true);
     assert.equal(view.lanes[2].entries.filter(entry => entry.invalid).length, 2);
-    const svg = renderCompositeConflictTabSvg(view);
-    assert.match(svg, /data-composite-entry-id="primary:0"/);
-    assert.match(svg, /role="checkbox"/);
-    assert.match(svg, /Hybrid result/);
-    assert.match(svg, /Your current choice/);
-    assert.match(svg, />REVIEW</);
-    assert.match(svg, /stroke="#f87171"/);
-    assert.match(svg, /width="1120"/);
-    assert.match(svg, /style="display:block;width:1120px;/);
-    assert.doesNotMatch(svg, /width="100%"/,
-        'resizing the review dialog must expand its viewport, not scale the notation');
+    assert.equal(view.lanes[0].entries[0].selectable, true);
+    assert.equal(view.lanes[0].entries[0].selected, true);
+    assert.equal(view.lanes[2].label, 'Hybrid result');
+    assert.equal(view.lanes[2].subtitle, 'Your current choice');
 });
 
 test('note variants provide a compact escaped property comparison', () => {
@@ -119,4 +112,47 @@ test('note variants provide a compact escaped property comparison', () => {
     assert.ok(view.differences.some(difference => difference.property === 'Techniques'));
     assert.match(renderCompositeDifferenceTable(view), /&lt;Lead&gt;/);
     assert.doesNotMatch(renderCompositeDifferenceTable(view), /<Lead>/);
+});
+
+test('review toolbar model keeps compact Guided choice and manual-selection state together', () => {
+    const plan = conflictPlan([note(8, 1, 3)], [note(9, 2, 7)]);
+    const conflict = plan.conflicts[0];
+    const primaryId = conflict.primaryEntries[0].id;
+    const model = buildCompositeReviewToolbarModel({
+        plan,
+        conflict,
+        primaryName: 'Lead',
+        secondaryName: 'Rhythm',
+        customEntryIds: [primaryId],
+        decisionNumber: 2,
+        decisionTotal: 6,
+        unresolvedDecisions: 4,
+        repeatCount: 3,
+        canReset: true,
+    });
+    assert.deepEqual(model.choices.map(choice => choice.label),
+        ['Use Lead', 'Use Rhythm', 'Mix notes']);
+    assert.equal(model.resolution, 'custom');
+    assert.equal(model.selectedLaneId, 'result');
+    assert.equal(model.primarySelected, 1);
+    assert.equal(model.secondarySelected, 0);
+    assert.equal(model.repeatCount, 3);
+    assert.equal(model.canReset, true);
+    assert.equal(model.canContinue, false,
+        'an invalid or incomplete draft cannot continue until the resolver accepts it');
+});
+
+test('review toolbar model gives Experimental choices plain, distinct labels', () => {
+    const plan = conflictPlan([note(8, 1, 3)], [note(9, 2, 7)]);
+    plan.strategy = 'experimental';
+    plan.profile = 'balanced';
+    const conflict = plan.conflicts[0];
+    conflict.resolution = 'secondary';
+    const model = buildCompositeReviewToolbarModel({ plan, conflict });
+    assert.deepEqual(model.choices.map(choice => choice.label),
+        ['Leave fill out', 'Add fill', 'Choose notes']);
+    assert.equal(model.experimental, true);
+    assert.equal(model.profile, 'balanced');
+    assert.equal(model.selectedLaneId, 'secondary');
+    assert.equal(model.canContinue, true);
 });

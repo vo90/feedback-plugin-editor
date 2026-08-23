@@ -1,0 +1,578 @@
+/* Shared whole-song tablature timeline for the Hybrid Track builder.
+ *
+ * The final preview deliberately owns its geometry instead of borrowing the
+ * stateful main Editor canvas. Every helper here is DOM-free: the controller
+ * supplies the current scroll/viewport and replaces only the visible SVG
+ * contents while the wide timeline surface keeps one shared scrollbar.
+ */
+
+import { beatOf } from '../beats.js';
+import { compositeTechniqueLabels } from './conflict-view.js';
+import {
+    HYBRID_PREVIEW_DEFAULTS,
+    HYBRID_TIMELINE_LANE_MAX,
+    HYBRID_TIMELINE_LANE_MIN,
+    HYBRID_TIMELINE_ZOOM_CONTROL_MIN,
+    HYBRID_TIMELINE_ZOOM_MAX,
+    HYBRID_TIMELINE_ZOOM_MIN,
+    HYBRID_TIMELINE_ZOOM_STEP,
+} from './preferences.js';
+
+export const COMPOSITE_TIMELINE_GUTTER = 168;
+export const COMPOSITE_TIMELINE_RULER_HEIGHT = 34;
+// Display-only breathing room around the real musical range. This never adds
+// beats or seconds: beat 0 remains beat 0, but its centered note head no longer
+// sits underneath the sticky track labels. The same amount protects the final
+// note/trail at the right edge.
+export const COMPOSITE_TIMELINE_EDGE_PADDING = 28;
+const RANGE_BUFFER_PX = 900;
+
+const COLORS = Object.freeze({
+    primary: Object.freeze({ main: '#38bdf8', soft: '#082f49', text: '#bae6fd' }),
+    secondary: Object.freeze({ main: '#a78bfa', soft: '#2e1065', text: '#ddd6fe' }),
+    result: Object.freeze({ main: '#34d399', soft: '#022c22', text: '#a7f3d0' }),
+});
+
+function finite(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+}
+
+function escapeMarkup(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+}
+
+function entryEndBeat(entry) {
+    const start = finite(entry && entry.startBeat);
+    return Math.max(start, finite(entry && entry.endBeat, start),
+        finite(entry && entry.effectiveEndBeat, start));
+}
+
+function uniqueSortedEntries(entries) {
+    const unique = new Map();
+    for (const entry of entries || []) if (entry && entry.id) unique.set(entry.id, entry);
+    return [...unique.values()].sort((a, b) => finite(a.startBeat) - finite(b.startBeat)
+        || finite(a.string) - finite(b.string) || finite(a.fret) - finite(b.fret)
+        || String(a.id).localeCompare(String(b.id)));
+}
+
+function measureMarkers(beats, endBeat) {
+    const markers = [];
+    for (let index = 0; index < (beats || []).length && index <= endBeat + 1e-6; index++) {
+        const measure = Number(beats[index] && beats[index].measure);
+        if (Number.isFinite(measure) && measure >= 1) markers.push({ beat: index, measure });
+    }
+    return markers;
+}
+
+export function compositeTimelineZoomPure(value) {
+    return Math.max(HYBRID_TIMELINE_ZOOM_MIN,
+        Math.min(HYBRID_TIMELINE_ZOOM_MAX,
+            finite(value, HYBRID_PREVIEW_DEFAULTS.timelineZoom)));
+}
+
+// Manual zoom controls live on a five-pixel grid. Fit-song is deliberately
+// exempt so a long song can still shrink below the slider's useful floor.
+export function compositeTimelineSteppedZoomPure(value, direction = 0) {
+    const current = compositeTimelineZoomPure(value);
+    if (direction > 0) {
+        if (current < HYBRID_TIMELINE_ZOOM_CONTROL_MIN) {
+            return HYBRID_TIMELINE_ZOOM_CONTROL_MIN;
+        }
+        return Math.min(HYBRID_TIMELINE_ZOOM_MAX,
+            (Math.floor((current + 1e-6) / HYBRID_TIMELINE_ZOOM_STEP) + 1)
+                * HYBRID_TIMELINE_ZOOM_STEP);
+    }
+    if (direction < 0) {
+        if (current <= HYBRID_TIMELINE_ZOOM_CONTROL_MIN) return current;
+        return Math.max(HYBRID_TIMELINE_ZOOM_CONTROL_MIN,
+            (Math.ceil((current - 1e-6) / HYBRID_TIMELINE_ZOOM_STEP) - 1)
+                * HYBRID_TIMELINE_ZOOM_STEP);
+    }
+    return Math.max(HYBRID_TIMELINE_ZOOM_CONTROL_MIN,
+        Math.min(HYBRID_TIMELINE_ZOOM_MAX,
+            Math.round(current / HYBRID_TIMELINE_ZOOM_STEP)
+                * HYBRID_TIMELINE_ZOOM_STEP));
+}
+
+export function compositeTimelineLaneHeightPure(value) {
+    return Math.max(HYBRID_TIMELINE_LANE_MIN,
+        Math.min(HYBRID_TIMELINE_LANE_MAX, Math.round(finite(value, 158))));
+}
+
+export function compositeTimelineSongRangePure({ beats = [], durationSeconds = 0, entries = [] } = {}) {
+    const lastGridBeat = Math.max(0, beats.length - 1);
+    const durationBeat = Math.max(0, beatOf(beats, Math.max(0, finite(durationSeconds))));
+    let endBeat = Math.max(1, lastGridBeat, durationBeat);
+    for (const entry of entries || []) endBeat = Math.max(endBeat, entryEndBeat(entry));
+    return { startBeat: 0, endBeat };
+}
+
+export function buildCompositeTimelineViewModel({
+    plan,
+    primaryName = 'Base track',
+    secondaryName = 'Fill track',
+    resultEntries = [],
+    durationSeconds = 0,
+    review = null,
+    passageFocusId = '',
+} = {}) {
+    if (!plan) return null;
+    const primary = uniqueSortedEntries(plan.sourceEntries?.primary || []);
+    const secondary = uniqueSortedEntries(plan.sourceEntries?.secondary || []);
+    const result = uniqueSortedEntries(resultEntries);
+    const hasFillAdditions = result.some(entry => entry.source === 'secondary'
+        && !(entry.sources || []).includes('primary'));
+    const all = [...primary, ...secondary, ...result];
+    const context = compositeTimelineSongRangePure({
+        beats: plan.beats || [], durationSeconds, entries: all,
+    });
+    context.measureMarkers = measureMarkers(plan.beats || [], context.endBeat);
+    const stringCount = Math.max(1,
+        Math.trunc(finite(plan.compatibility && plan.compatibility.stringCount, 6)));
+    const decisions = (plan.conflicts || []).map((conflict, index) => ({
+        id: conflict.id,
+        index,
+        startBeat: finite(conflict.startBeat),
+        endBeat: Math.max(finite(conflict.startBeat), finite(conflict.endBeat)),
+        state: conflict.validationError ? 'invalid' : conflict.resolution ? 'resolved' : 'unresolved',
+        label: conflict.label || `Decision ${index + 1}`,
+    }));
+    const passages = (plan.passages || []).map((passage, index) => {
+        const conflict = (plan.conflicts || []).find(candidate => candidate.id === passage.id);
+        const selected = new Set(conflict?.selectedEntryIds || []);
+        const selectedNotes = (passage.entries || []).filter(entry => selected.has(entry.id)).length;
+        let state = passage.status;
+        if (passage.status === 'review' && conflict?.resolution) {
+            state = selectedNotes === 0 ? 'declined'
+                : selectedNotes === passage.noteCount ? 'accepted' : 'accepted-partial';
+        }
+        return {
+            id: passage.id,
+            index,
+            startBeat: finite(passage.startBeat),
+            endBeat: Math.max(finite(passage.startBeat), finite(passage.endBeat)),
+            state,
+            label: passage.label || `Passage ${index + 1}`,
+            explanation: passage.explanation || '',
+            score: finite(passage.handoffScore),
+            reasons: (passage.reasons || []).slice(),
+            active: passage.id === passageFocusId,
+        };
+    });
+    return {
+        wholeSong: true,
+        names: { primary: primaryName || 'Base track', secondary: secondaryName || 'Fill track' },
+        context,
+        conflict: { resolution: 'ready' },
+        stringCount,
+        beats: plan.beats || [],
+        review,
+        decisions,
+        passages,
+        passageFocus: passages.find(passage => passage.active) || null,
+        hasFillAdditions,
+        lanes: [
+            { id: 'primary', label: primaryName || 'Base track', subtitle: 'Base track', entries: primary },
+            { id: 'secondary', label: secondaryName || 'Fill track', subtitle: 'Fill track', entries: secondary },
+            { id: 'result', label: 'Hybrid', subtitle: 'Hybrid result', entries: result },
+        ],
+    };
+}
+
+function reviewBandMarkup(view, height, zoom, includeContextDimming = true) {
+    const review = view && view.review;
+    if (!review) return '';
+    const width = compositeTimelineContentWidthPure(view.context, zoom);
+    const focusStart = compositeTimelineXForBeatPure(review.contextStartBeat, view.context, zoom);
+    const focusEnd = compositeTimelineXForBeatPure(review.contextEndBeat, view.context, zoom);
+    const decisionStart = compositeTimelineXForBeatPure(review.startBeat, view.context, zoom);
+    const decisionEnd = compositeTimelineXForBeatPure(review.endBeat, view.context, zoom);
+    const decisionWidth = Math.max(4, decisionEnd - decisionStart);
+    const dim = includeContextDimming
+        ? `<rect x="0" y="0" width="${Math.max(0, focusStart).toFixed(1)}" height="${height}" fill="#020617" opacity="0.52" pointer-events="none"/>`
+            + `<rect x="${Math.max(0, focusEnd).toFixed(1)}" y="0" width="${Math.max(0, width - focusEnd).toFixed(1)}" height="${height}" fill="#020617" opacity="0.52" pointer-events="none"/>`
+        : '';
+    const color = review.state === 'invalid' ? '#f87171'
+        : review.state === 'resolved' ? '#34d399' : '#fbbf24';
+    return dim
+        + `<rect x="${decisionStart.toFixed(1)}" y="1" width="${decisionWidth.toFixed(1)}" height="${Math.max(1, height - 2)}" fill="${color}" fill-opacity="0.08" stroke="${color}" stroke-width="2" stroke-dasharray="6 4" pointer-events="none"/>`;
+}
+
+export function compositeTimelineXForBeatPure(beat, context, zoom) {
+    return COMPOSITE_TIMELINE_GUTTER + COMPOSITE_TIMELINE_EDGE_PADDING
+        + (finite(beat) - finite(context && context.startBeat)) * compositeTimelineZoomPure(zoom);
+}
+
+export function compositeTimelineMapBeatPure({
+    clientX = 0, mapLeft = 0, mapWidth = 1, context = {},
+} = {}) {
+    const start = finite(context.startBeat);
+    const end = Math.max(start, finite(context.endBeat, start));
+    const ratio = Math.max(0, Math.min(1,
+        (finite(clientX) - finite(mapLeft)) / Math.max(1, finite(mapWidth, 1))));
+    return start + ratio * (end - start);
+}
+
+export function compositeTimelineCenteredScrollPure({
+    beat = 0, context = {}, zoom = HYBRID_PREVIEW_DEFAULTS.timelineZoom,
+    viewportWidth = 1200, gutter = COMPOSITE_TIMELINE_GUTTER,
+} = {}) {
+    const width = Math.max(1, finite(viewportWidth, 1200));
+    const stickyGutter = Math.max(0, Math.min(width, finite(gutter)));
+    const tablatureCenter = stickyGutter + (width - stickyGutter) / 2;
+    return compositeTimelineXForBeatPure(beat, context, zoom) - tablatureCenter;
+}
+
+export function compositeTimelineBeatForXPure(x, context, zoom) {
+    return finite(context && context.startBeat)
+        + (finite(x) - COMPOSITE_TIMELINE_GUTTER
+            - COMPOSITE_TIMELINE_EDGE_PADDING) / compositeTimelineZoomPure(zoom);
+}
+
+export function compositeTimelineContentWidthPure(context, zoom) {
+    const span = Math.max(1, finite(context && context.endBeat, 1)
+        - finite(context && context.startBeat));
+    return Math.ceil(COMPOSITE_TIMELINE_GUTTER
+        + COMPOSITE_TIMELINE_EDGE_PADDING * 2
+        + span * compositeTimelineZoomPure(zoom));
+}
+
+export function compositeTimelineFitZoomPure(context, viewportWidth) {
+    const span = Math.max(1, finite(context && context.endBeat, 1)
+        - finite(context && context.startBeat));
+    const usable = Math.max(1, finite(viewportWidth) - COMPOSITE_TIMELINE_GUTTER
+        - COMPOSITE_TIMELINE_EDGE_PADDING * 2);
+    return compositeTimelineZoomPure(usable / span);
+}
+
+export function compositeTimelineVisibleRangePure({
+    context,
+    zoom,
+    scrollLeft = 0,
+    viewportWidth = 1200,
+    bufferPx = RANGE_BUFFER_PX,
+} = {}) {
+    const z = compositeTimelineZoomPure(zoom);
+    const start = finite(context && context.startBeat);
+    const end = Math.max(start + 1, finite(context && context.endBeat, start + 1));
+    const loX = finite(scrollLeft) - Math.max(0, finite(bufferPx));
+    const hiX = finite(scrollLeft) + Math.max(1, finite(viewportWidth)) + Math.max(0, finite(bufferPx));
+    return {
+        startBeat: Math.max(start, start + (loX - COMPOSITE_TIMELINE_GUTTER
+            - COMPOSITE_TIMELINE_EDGE_PADDING) / z),
+        endBeat: Math.min(end, start + (hiX - COMPOSITE_TIMELINE_GUTTER
+            - COMPOSITE_TIMELINE_EDGE_PADDING) / z),
+    };
+}
+
+export function compositeTimelineViewportRangePure({
+    context,
+    zoom,
+    scrollLeft = 0,
+    viewportWidth = 1200,
+    gutter = COMPOSITE_TIMELINE_GUTTER,
+} = {}) {
+    const z = compositeTimelineZoomPure(zoom);
+    const start = finite(context && context.startBeat);
+    const end = Math.max(start + 1, finite(context && context.endBeat, start + 1));
+    const width = Math.max(1, finite(viewportWidth, 1200));
+    const stickyGutter = Math.max(0, Math.min(width, finite(gutter)));
+    const visibleLeftX = finite(scrollLeft) + stickyGutter;
+    const visibleRightX = finite(scrollLeft) + width;
+    return {
+        startBeat: Math.max(start, Math.min(end,
+            start + (visibleLeftX - COMPOSITE_TIMELINE_GUTTER
+                - COMPOSITE_TIMELINE_EDGE_PADDING) / z)),
+        endBeat: Math.max(start, Math.min(end,
+            start + (visibleRightX - COMPOSITE_TIMELINE_GUTTER
+                - COMPOSITE_TIMELINE_EDGE_PADDING) / z)),
+    };
+}
+
+// Follow keeps a floating visual camera on the compositor and only commits the
+// browser's native scrollbar periodically. This offset moves each time-bearing
+// SVG by the exact amount needed to make `visualScrollLeft` look like the real
+// scroll position: screenX = contentX - native + (native - visual).
+export function compositeTimelineCameraOffsetPure(nativeScrollLeft = 0,
+    visualScrollLeft = nativeScrollLeft) {
+    const native = finite(nativeScrollLeft);
+    return native - finite(visualScrollLeft, native);
+}
+
+export function compositeTimelineCameraShouldCommitPure(nativeScrollLeft = 0,
+    visualScrollLeft = nativeScrollLeft, thresholdPx = 192) {
+    const threshold = Math.max(1, finite(thresholdPx, 192));
+    return Math.abs(compositeTimelineCameraOffsetPure(
+        nativeScrollLeft, visualScrollLeft)) >= threshold;
+}
+
+// The notes are rendered with a generous buffer on either side. Reuse that
+// markup until the visual viewport approaches an inner guard; rebuilding three
+// dense SVG lanes for every pixel of movement stalls both paint and the shared
+// audio scheduler. Song boundaries count as permanently protected edges so a
+// viewport at beat zero does not invalidate its own cache forever.
+export function compositeTimelineRenderWindowNeedsRefreshPure({
+    context,
+    zoom,
+    renderedZoom,
+    renderedRange,
+    viewportRange,
+    guardPx = 300,
+    force = false,
+} = {}) {
+    if (force || !renderedRange || !viewportRange) return true;
+    const z = compositeTimelineZoomPure(zoom);
+    const previousZoom = Number(renderedZoom);
+    if (Number.isFinite(previousZoom) && Math.abs(previousZoom - z) > 1e-6) return true;
+    const start = finite(context && context.startBeat);
+    const end = Math.max(start + 1, finite(context && context.endBeat, start + 1));
+    const renderedStart = finite(renderedRange.startBeat, Number.NaN);
+    const renderedEnd = finite(renderedRange.endBeat, Number.NaN);
+    const visibleStart = finite(viewportRange.startBeat, Number.NaN);
+    const visibleEnd = finite(viewportRange.endBeat, Number.NaN);
+    if (![renderedStart, renderedEnd, visibleStart, visibleEnd].every(Number.isFinite)
+            || renderedEnd < renderedStart || visibleEnd < visibleStart) return true;
+    const guardBeats = Math.max(0, finite(guardPx)) / z;
+    const leftProtected = renderedStart <= start + 1e-6
+        || visibleStart >= renderedStart + guardBeats;
+    const rightProtected = renderedEnd >= end - 1e-6
+        || visibleEnd <= renderedEnd - guardBeats;
+    return !leftProtected || !rightProtected;
+}
+
+export function compositeTimelineZoomAtPure({
+    context,
+    oldZoom,
+    newZoom,
+    scrollLeft = 0,
+    anchorX = 0,
+    viewportWidth = 1200,
+} = {}) {
+    const from = compositeTimelineZoomPure(oldZoom);
+    const to = compositeTimelineZoomPure(newZoom);
+    const start = finite(context && context.startBeat);
+    const beat = start + (finite(scrollLeft) + finite(anchorX)
+        - COMPOSITE_TIMELINE_GUTTER - COMPOSITE_TIMELINE_EDGE_PADDING) / from;
+    const wanted = COMPOSITE_TIMELINE_GUTTER + COMPOSITE_TIMELINE_EDGE_PADDING
+        + (beat - start) * to - finite(anchorX);
+    const maxScroll = Math.max(0, compositeTimelineContentWidthPure(context, to)
+        - Math.max(1, finite(viewportWidth)));
+    return { zoom: to, scrollLeft: Math.max(0, Math.min(maxScroll, wanted)), anchorBeat: beat };
+}
+
+export function compositeTimelineEntriesInRangePure(entries, range) {
+    const start = finite(range && range.startBeat);
+    const end = Math.max(start, finite(range && range.endBeat, start));
+    return (entries || []).filter(entry => finite(entry && entry.startBeat) <= end + 1e-4
+        && entryEndBeat(entry) >= start - 1e-4);
+}
+
+function badgeSummary(entry) {
+    const aliases = {
+        'Hammer-on': 'HO', 'Pull-off': 'PO', 'Palm mute': 'PM',
+        'Fret-hand mute': 'FM', 'String mute': 'X', Harmonic: 'H',
+        'Pinch harmonic': 'PH', Accent: '>', Vibrato: 'VIB', Tremolo: 'TR',
+        Tap: 'T', Slap: 'SL', Pop: 'POP', 'Linked note': 'LINK',
+        Slide: 'GL', 'Unpitched slide': 'UG', Bend: 'B',
+        'Bend curve': 'B', 'Bend intent': 'B',
+    };
+    const badges = [];
+    for (const technique of compositeTechniqueLabels(entry && entry.note)) {
+        const badge = aliases[technique] || technique.slice(0, 4).toUpperCase();
+        if (!badges.includes(badge)) badges.push(badge);
+    }
+    const visible = badges.slice(0, 2);
+    if (badges.length > visible.length) visible.push(`+${badges.length - visible.length}`);
+    return visible.join(' · ');
+}
+
+function noteTitle(entry, stringCount) {
+    const string = Math.max(1, stringCount - Math.trunc(finite(entry && entry.string)));
+    const trail = Math.max(0, finite(entry && entry.endBeat) - finite(entry && entry.startBeat));
+    const techniques = compositeTechniqueLabels(entry && entry.note).join(', ') || 'No techniques';
+    return `String ${string}, fret ${finite(entry && entry.fret)}, beat ${finite(entry && entry.startBeat).toFixed(3)}, ${trail.toFixed(3)} beat trail. ${techniques}.`;
+}
+
+function lineMarkup(view, height, visibleRange, zoom) {
+    const lines = [];
+    const firstBeat = Math.ceil(visibleRange.startBeat);
+    const lastBeat = Math.floor(visibleRange.endBeat);
+    for (let beat = firstBeat; beat <= lastBeat; beat++) {
+        const x = compositeTimelineXForBeatPure(beat, view.context, zoom);
+        lines.push(`<line x1="${x.toFixed(1)}" y1="0" x2="${x.toFixed(1)}" y2="${height}" stroke="#334155" stroke-width="0.7" opacity="0.5"/>`);
+    }
+    for (const marker of view.context.measureMarkers || []) {
+        if (marker.beat < visibleRange.startBeat - 1e-4 || marker.beat > visibleRange.endBeat + 1e-4) continue;
+        const x = compositeTimelineXForBeatPure(marker.beat, view.context, zoom);
+        lines.push(`<line x1="${x.toFixed(1)}" y1="0" x2="${x.toFixed(1)}" y2="${height}" stroke="#64748b" stroke-width="1.4" opacity="0.85"/>`);
+    }
+    return lines.join('');
+}
+
+export function renderCompositeTimelineLaneContents(view, laneId, height, visibleRange, zoom) {
+    const lane = view && view.lanes && view.lanes.find(candidate => candidate.id === laneId);
+    if (!lane) return '';
+    const laneHeight = compositeTimelineLaneHeightPure(height);
+    const z = compositeTimelineZoomPure(zoom);
+    const contentWidth = compositeTimelineContentWidthPure(view.context, z);
+    const colors = COLORS[lane.id] || COLORS.result;
+    const top = 28;
+    const bottom = 22;
+    const stringGap = view.stringCount > 1
+        ? (laneHeight - top - bottom) / (view.stringCount - 1) : 0;
+    const strings = [];
+    for (let row = 0; row < view.stringCount; row++) {
+        const y = top + row * stringGap;
+        strings.push(`<line x1="${COMPOSITE_TIMELINE_GUTTER}" y1="${y.toFixed(1)}" x2="${contentWidth}" y2="${y.toFixed(1)}" stroke="#64748b" stroke-width="1" opacity="0.75"/>`);
+    }
+    const notes = compositeTimelineEntriesInRangePure(lane.entries, visibleRange).map(entry => {
+        const row = Math.max(0, Math.min(view.stringCount - 1,
+            view.stringCount - 1 - Math.trunc(finite(entry.string))));
+        const y = top + row * stringGap;
+        const x = compositeTimelineXForBeatPure(entry.startBeat, view.context, z);
+        const authoredEndX = compositeTimelineXForBeatPure(
+            Math.max(finite(entry.startBeat), finite(entry.endBeat)), view.context, z);
+        const effectiveEndX = compositeTimelineXForBeatPure(entryEndBeat(entry), view.context, z);
+        const fret = String(finite(entry.fret));
+        const width = Math.max(20, 10 + fret.length * 8);
+        const badge = z >= 22 ? badgeSummary(entry) : '';
+        const colorsForEntry = entry.invalid
+            ? { main: '#f87171', soft: '#7f1d1d' } : colors;
+        const outline = entry.selected && entry.inConflict ? '#f8fafc' : colorsForEntry.main;
+        const interaction = entry.selectable
+            ? ` data-composite-entry-id="${escapeMarkup(entry.id)}" tabindex="0" role="checkbox" aria-label="${escapeMarkup(noteTitle(entry, view.stringCount))}" aria-checked="${!!entry.selected}" style="cursor:pointer"`
+            : '';
+        let trails = '';
+        if (authoredEndX > x + 2) {
+            const tremolo = compositeTechniqueLabels(entry.note).includes('Tremolo')
+                ? ' stroke-dasharray="3 3"' : '';
+            trails += `<line x1="${x.toFixed(1)}" y1="${y.toFixed(1)}" x2="${authoredEndX.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${colors.main}" stroke-width="5" stroke-linecap="round" opacity="0.68"${tremolo}/>`;
+        }
+        if (effectiveEndX > authoredEndX + 2) {
+            trails += `<line x1="${Math.max(x, authoredEndX).toFixed(1)}" y1="${y.toFixed(1)}" x2="${effectiveEndX.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${colors.main}" stroke-width="3" stroke-dasharray="5 4" opacity="0.8"/>`;
+        }
+        return `<g${interaction}><title>${escapeMarkup(noteTitle(entry, view.stringCount))}</title>${trails}`
+            + `<rect x="${(x - width / 2).toFixed(1)}" y="${(y - 9).toFixed(1)}" width="${width}" height="18" rx="7" fill="${colorsForEntry.soft}" stroke="${outline}" stroke-width="${entry.selected && entry.inConflict ? 2.5 : 1.5}"/>`
+            + `<text x="${x.toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="middle" fill="#f8fafc" font-size="11" font-weight="700">${escapeMarkup(fret)}</text>`
+            + (entry.selected && entry.inConflict ? `<circle cx="${(x + width / 2 - 1).toFixed(1)}" cy="${(y - 8).toFixed(1)}" r="4" fill="#f8fafc"/><path d="M${(x + width / 2 - 3).toFixed(1)} ${(y - 8).toFixed(1)}l1.5 1.5 3-3" fill="none" stroke="#065f46" stroke-width="1.5"/>` : '')
+            + (badge ? `<text x="${x.toFixed(1)}" y="${(y - 12).toFixed(1)}" text-anchor="middle" fill="#fcd34d" font-size="8" font-weight="700">${escapeMarkup(badge)}</text>` : '')
+            + '</g>';
+    }).join('');
+    return `<rect width="${contentWidth}" height="${laneHeight}" fill="#0f172a"/>`
+        + `<rect x="0" y="0" width="${contentWidth}" height="${laneHeight}" fill="${colors.soft}" opacity="0.18"/>`
+        + lineMarkup(view, laneHeight, visibleRange, z) + strings.join('') + notes
+        + reviewBandMarkup(view, laneHeight, z);
+}
+
+export function renderCompositeTimelineRulerContents(view, visibleRange, zoom) {
+    const z = compositeTimelineZoomPure(zoom);
+    const width = compositeTimelineContentWidthPure(view.context, z);
+    const ticks = [];
+    const markerByBeat = new Map((view.context.measureMarkers || [])
+        .map(marker => [marker.beat, marker]));
+    let lastBarLabelX = -Infinity;
+    for (let beat = Math.ceil(visibleRange.startBeat); beat <= Math.floor(visibleRange.endBeat); beat++) {
+        const x = compositeTimelineXForBeatPure(beat, view.context, z);
+        const marker = markerByBeat.get(beat);
+        // At whole-song fit zoom, individual beat ticks and every bar label
+        // become a dark picket fence. Keep all bar boundaries, then restore
+        // beat ticks and denser labels progressively as the user zooms in.
+        if (marker || z >= 6) ticks.push(`<line x1="${x.toFixed(1)}" y1="${marker ? 12 : 22}" x2="${x.toFixed(1)}" y2="34" stroke="${marker ? '#94a3b8' : '#475569'}" stroke-width="${marker ? 1.5 : 1}"/>`);
+        if (marker && x - lastBarLabelX >= (z >= 18 ? 0 : 44)) {
+            ticks.push(`<text x="${(x + 4).toFixed(1)}" y="11" fill="#cbd5e1" font-size="10">Bar ${escapeMarkup(marker.measure)}</text>`);
+            lastBarLabelX = x;
+        }
+        else if (z >= 24) ticks.push(`<text x="${(x + 3).toFixed(1)}" y="20" fill="#64748b" font-size="8">${beat + 1}</text>`);
+    }
+    return `<rect width="${width}" height="34" fill="#111827"/>${ticks.join('')}`
+        + reviewBandMarkup(view, 34, z, false)
+        + (view.review ? `<text x="${(compositeTimelineXForBeatPure(view.review.startBeat, view.context, z) + 5).toFixed(1)}" y="29" fill="#fef3c7" font-size="9" font-weight="700">REVIEW</text>` : '');
+}
+
+export function renderCompositeTimelineLaneHeader(view, laneId, height) {
+    const lane = view.lanes.find(candidate => candidate.id === laneId);
+    const laneHeight = compositeTimelineLaneHeightPure(height);
+    const colors = COLORS[laneId] || COLORS.result;
+    const selected = Boolean(view.review && view.selectedLaneId === laneId);
+    const top = 28;
+    const bottom = 22;
+    const gap = view.stringCount > 1 ? (laneHeight - top - bottom) / (view.stringCount - 1) : 0;
+    const strings = Array.from({ length: view.stringCount }, (_, row) => {
+        const y = top + row * gap;
+        return `<span class="absolute right-2 text-[10px] text-slate-400" style="top:${(y - 7).toFixed(1)}px">${row + 1}</span>`;
+    }).join('');
+    const selectedStyle = selected
+        ? `;box-shadow:inset 4px 0 0 ${colors.main},0 0 0 1px ${colors.main};background:${colors.soft}` : '';
+    const selectedLabel = selected ? ', selected for this decision' : '';
+    return `<div data-composite-timeline-header="${laneId}" data-composite-choice-active="${selected}" aria-label="${escapeMarkup(`${lane.label}${selectedLabel}`)}" class="sticky left-0 z-50 border-r border-slate-600/80 px-3 py-2 shadow-lg" style="width:${COMPOSITE_TIMELINE_GUTTER}px;height:${laneHeight}px;background:#111827${selectedStyle}">`
+        + `<b class="block truncate text-sm" style="color:${colors.text}" title="${escapeMarkup(lane.label)}">${escapeMarkup(lane.label)}</b>`
+        + `<span class="block pr-5 text-xs leading-snug text-slate-400" title="${escapeMarkup(lane.subtitle)}">${escapeMarkup(lane.subtitle)}</span>`
+        + (selected ? `<span class="mt-1 inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold" style="color:${colors.text};background:${colors.soft};border:1px solid ${colors.main}">Selected</span>` : '')
+        + strings + '</div>';
+}
+
+export function renderCompositeTimelinePlayhead(left = COMPOSITE_TIMELINE_GUTTER
+    + COMPOSITE_TIMELINE_EDGE_PADDING) {
+    const x = finite(left, COMPOSITE_TIMELINE_GUTTER
+        + COMPOSITE_TIMELINE_EDGE_PADDING);
+    // Keep all essential geometry and color inline. The Editor consumes the
+    // Nightly precompiled Tailwind sheet, which may not contain newly added
+    // utility classes until a later core build.
+    return `<div id="editor-composite-timeline-playhead" aria-hidden="true" class="pointer-events-none absolute top-0 z-40" style="left:0;transform:translate3d(${x}px,0,0);will-change:transform;height:100%;width:2px;background:#fb7185;box-shadow:0 0 6px #fb7185"><span style="position:absolute;left:-5px;top:0;width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-top:8px solid #fb7185"></span></div>`;
+}
+
+export function compositeTimelineMapViewportPure(view, viewportRange) {
+    const width = 1000;
+    const start = finite(view?.context?.startBeat);
+    const end = Math.max(start + 1, finite(view?.context?.endBeat, start + 1));
+    const span = end - start;
+    const toX = beat => ((finite(beat) - start) / span) * width;
+    const lo = Math.max(0, Math.min(width, toX(viewportRange?.startBeat ?? start)));
+    const hi = Math.max(lo + 4, Math.min(width, toX(viewportRange?.endBeat ?? end)));
+    return { x: lo, width: Math.max(4, hi - lo) };
+}
+
+export function renderCompositeTimelineMapSvg(view, viewportRange, playheadBeat = 0) {
+    const width = 1000;
+    const height = 42;
+    const span = Math.max(1, view.context.endBeat - view.context.startBeat);
+    const x = beat => ((finite(beat) - view.context.startBeat) / span) * width;
+    const result = view.lanes.find(lane => lane.id === 'result');
+    const entries = (result?.entries || []).slice(0, 4000).map(entry => {
+        const x1 = Math.max(0, Math.min(width, x(entry.startBeat)));
+        const x2 = Math.max(x1 + 1, Math.min(width, x(entryEndBeat(entry))));
+        const fillAddition = entry.source === 'secondary'
+            && !(entry.sources || []).includes('primary');
+        return `<rect x="${x1.toFixed(1)}" y="17" width="${Math.max(1, x2 - x1).toFixed(1)}" height="9" rx="1" fill="${fillAddition ? '#c084fc' : '#34d399'}" opacity="0.68"/>`;
+    }).join('');
+    const viewport = compositeTimelineMapViewportPure(view, viewportRange);
+    const decisions = (view.decisions || []).map(decision => {
+        const x1 = Math.max(0, Math.min(width, x(decision.startBeat)));
+        const x2 = Math.max(x1 + 2, Math.min(width, x(decision.endBeat)));
+        const color = decision.state === 'invalid' ? '#f87171'
+            : decision.state === 'resolved' ? '#34d399' : '#fbbf24';
+        const active = view.review && view.review.id === decision.id;
+        return `<rect data-composite-map-decision="${decision.index}" x="${x1.toFixed(1)}" y="5" width="${Math.max(2, x2 - x1).toFixed(1)}" height="8" rx="2" fill="${color}" opacity="${active ? 1 : 0.72}"/>`;
+    }).join('');
+    const passageColors = {
+        automatic: '#c084fc', review: '#fbbf24', accepted: '#34d399',
+        'accepted-partial': '#2dd4bf', declined: '#64748b', 'left-out': '#475569',
+    };
+    const passages = (view.passages || []).map(passage => {
+        const x1 = Math.max(0, Math.min(width, x(passage.startBeat)));
+        const x2 = Math.max(x1 + 2, Math.min(width, x(passage.endBeat)));
+        return `<rect data-composite-map-passage="${escapeMarkup(passage.id)}" x="${x1.toFixed(1)}" y="31" width="${Math.max(2, x2 - x1).toFixed(1)}" height="7" rx="2" fill="${passageColors[passage.state] || '#64748b'}" opacity="${passage.active ? 1 : 0.76}"${passage.active ? ' stroke="#f8fafc" stroke-width="1.5"' : ''}><title>${escapeMarkup(`${passage.label}: ${passage.state}`)}</title></rect>`;
+    }).join('');
+    const playheadX = Math.max(0, Math.min(width, x(playheadBeat)));
+    return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" width="100%" height="42" role="img" aria-label="Whole-song Hybrid overview; the outlined window is the visible timeline" style="display:block">`
+        + `<rect width="${width}" height="${height}" rx="7" fill="#0f172a"/>${entries}${decisions}${passages}`
+        + `<rect id="editor-composite-map-viewport" x="${viewport.x.toFixed(1)}" y="3" width="${viewport.width.toFixed(1)}" height="36" rx="5" fill="#38bdf8" fill-opacity="0.08" stroke="#7dd3fc" stroke-width="2" pointer-events="none"/>`
+        + `<line id="editor-composite-map-playhead" x1="${playheadX.toFixed(1)}" y1="2" x2="${playheadX.toFixed(1)}" y2="40" stroke="#fb7185" stroke-width="2" pointer-events="none"/>`
+        + '</svg>';
+}

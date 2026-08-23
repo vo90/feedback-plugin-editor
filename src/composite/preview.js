@@ -7,6 +7,7 @@
 
 import { timeOf } from '../beats.js';
 import { _openMidiForArr, _soundingPitchPure } from '../lanes.js';
+import { COMPOSITE_BEAT_EPS } from './merge-engine.js';
 
 function finite(value, fallback = 0) {
     const number = Number(value);
@@ -128,6 +129,27 @@ function entryEndBeat(entry) {
         finite(entry && entry.effectiveEndBeat, start));
 }
 
+// The merge engine gives a zero-trail note COMPOSITE_BEAT_EPS of effective
+// occupancy so collision/selection geometry never has an empty interval. That
+// epsilon is not authored sustain. Passing it to the GM scheduler as a tiny
+// positive duration bypasses the scheduler's intentional zero-sustain audible
+// fallback and makes the note effectively silent. Preserve every meaningful
+// effective extension (including links/slides), but translate the engine-only
+// sentinel back to zero for playback.
+function entryPreviewEndBeat(entry) {
+    const start = finite(entry && entry.startBeat);
+    const authoredEnd = Math.max(start, finite(entry && entry.endBeat, start));
+    const effectiveEnd = entryEndBeat(entry);
+    const rawSustain = entry && entry.note
+        ? entry.note.sustain ?? entry.note.sus : undefined;
+    const hasRawSustain = rawSustain !== null && rawSustain !== undefined
+        && rawSustain !== '' && Number.isFinite(Number(rawSustain));
+    const authoredZero = hasRawSustain
+        ? Number(rawSustain) <= 0 : authoredEnd <= start + Number.EPSILON;
+    const epsilonOnly = effectiveEnd <= start + COMPOSITE_BEAT_EPS + Number.EPSILON;
+    return authoredZero && epsilonOnly ? start : effectiveEnd;
+}
+
 export function compositePreviewEventsPure(entries, arrangement, beats, stringCount = 6) {
     const count = Math.max(1, Math.trunc(finite(stringCount, 6)));
     const openMidi = _openMidiForArr(arrangement || {}, count);
@@ -142,7 +164,7 @@ export function compositePreviewEventsPure(entries, arrangement, beats, stringCo
         const midi = _soundingPitchPure(openMidi, tuning, capo, string, fret);
         if (!Number.isFinite(midi) || midi < 0 || midi > 127) continue;
         const startTime = timeOf(beats, startBeat);
-        const endTime = timeOf(beats, entryEndBeat(entry));
+        const endTime = timeOf(beats, entryPreviewEndBeat(entry));
         if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) continue;
         events.push({
             t: startTime,

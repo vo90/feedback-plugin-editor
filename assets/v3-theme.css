@@ -721,3 +721,409 @@ html.fb-immersive #plugin-editor .editor-root {
 #plugin-editor .editor-mixer-strip.editor-mixer-selected { border-color: #38bdf8; box-shadow: 0 0 0 1px rgba(56,189,248,.65); }
 #plugin-editor .editor-mixer-master-strip { margin-left: .2rem; border-color: #0891b2; background: linear-gradient(#164e63,#111827); }
 #plugin-editor .editor-mixer-master-meter { width: .72rem; }
+
+/* ── Hybrid Track review workspace ────────────────────────────────── */
+#editor-composite-modal .editor-composite-header {
+    display: grid;
+    grid-template-columns: minmax(16rem, 1fr) auto auto;
+    align-items: center;
+    gap: .75rem;
+    min-height: 3.35rem;
+    padding: .55rem 1rem;
+    border-bottom: 1px solid #374151;
+}
+#editor-composite-modal .editor-composite-window-actions {
+    display: flex;
+    align-items: center;
+    gap: .25rem;
+}
+#editor-composite-modal .editor-composite-window-button {
+    display: inline-flex;
+    width: 2rem;
+    height: 2rem;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: .4rem;
+    color: #9ca3af;
+    line-height: 1;
+}
+#editor-composite-modal .editor-composite-window-button:hover {
+    border-color: #4b5563;
+    background: #1f2937;
+    color: #f9fafb;
+}
+#editor-composite-modal #editor-composite-dialog.editor-composite-maximized {
+    inset: 0 !important;
+    width: auto !important;
+    height: auto !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    max-width: none !important;
+    max-height: none !important;
+    resize: none !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+}
+#editor-composite-modal .editor-composite-stage-indicator {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: .55rem;
+    min-height: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: #6b7280;
+    font-size: .75rem;
+}
+#editor-composite-modal .editor-composite-stage-indicator span {
+    border-radius: 999px;
+    padding: .2rem .6rem;
+}
+#editor-composite-modal .editor-composite-stage-indicator .editor-composite-stage-active {
+    background: #164e63;
+    color: #cffafe;
+    font-weight: 700;
+}
+#editor-composite-modal .editor-composite-footer-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: .65rem;
+}
+#editor-composite-modal .editor-composite-footer {
+    min-height: 3.25rem;
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: .75rem;
+    padding: .5rem 1rem;
+    border-top: 1px solid #374151;
+}
+#editor-composite-modal footer > #editor-composite-error {
+    min-width: 0;
+    flex: 1;
+}
+#editor-composite-modal #editor-composite-resize-grip {
+    position: absolute;
+    right: 2px;
+    bottom: 2px;
+    z-index: 70;
+    width: 17px;
+    height: 17px;
+    pointer-events: none;
+    background: linear-gradient(135deg, transparent 0 46%, #64748b 47% 54%, transparent 55% 64%, #94a3b8 65% 72%, transparent 73%);
+    opacity: .9;
+}
+#editor-composite-modal .editor-composite-source-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) minmax(0, 1fr);
+    gap: .65rem;
+    align-items: stretch;
+}
+#editor-composite-modal .editor-composite-swap-sources {
+    align-self: center;
+    white-space: nowrap;
+}
+#editor-composite-modal .editor-composite-map-key {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .45rem 1rem;
+    margin: 0 0 .35rem;
+    color: #94a3b8;
+    font-size: .7rem;
+}
+#editor-composite-modal .editor-composite-map-key span {
+    display: inline-flex;
+    align-items: center;
+    gap: .32rem;
+}
+#editor-composite-modal .editor-composite-map-key i {
+    width: .65rem;
+    height: .42rem;
+    border-radius: 2px;
+    background: #34d399;
+}
+#editor-composite-modal .editor-composite-map-key .editor-composite-map-fill { background: #c084fc; }
+#editor-composite-modal .editor-composite-map-key .editor-composite-map-review { background: #fbbf24; }
+#editor-composite-modal .editor-composite-map-key .editor-composite-map-resolved { background: #34d399; }
+#editor-composite-modal .editor-composite-map-key .editor-composite-map-invalid { background: #f87171; }
+#editor-composite-modal .editor-composite-map-key .editor-composite-map-passage-auto { background: #c084fc; }
+#editor-composite-modal .editor-composite-map-key .editor-composite-map-passage-out { background: #475569; }
+#editor-composite-modal [data-composite-entry-id]:focus { outline: none; }
+#editor-composite-modal [data-composite-entry-id]:focus rect {
+    stroke: #f8fafc;
+    stroke-width: 3;
+    filter: drop-shadow(0 0 3px rgba(248, 250, 252, .8));
+}
+#editor-composite-modal .editor-composite-review-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .45rem .6rem;
+    margin: 0 0 .45rem;
+    padding: .5rem;
+    border: 1px solid #475569;
+    border-radius: .6rem;
+    background: rgba(17, 24, 39, .96);
+}
+#editor-composite-modal .editor-composite-review-summary {
+    flex: 0 1 19rem;
+    min-height: 0;
+    min-width: 13rem;
+}
+#editor-composite-modal .editor-composite-review-summary > div {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .3rem .45rem;
+}
+#editor-composite-modal .editor-composite-review-summary b { color: #f8fafc; }
+#editor-composite-modal .editor-composite-review-mode,
+#editor-composite-modal .editor-composite-review-location,
+#editor-composite-modal .editor-composite-review-left,
+#editor-composite-modal .editor-composite-review-repeat,
+#editor-composite-modal .editor-composite-review-state {
+    border-radius: 999px;
+    padding: .16rem .48rem;
+    font-size: .68rem;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+#editor-composite-modal .editor-composite-review-mode {
+    color: #bae6fd;
+    background: #082f49;
+}
+#editor-composite-modal .editor-composite-review-location {
+    display: block;
+    max-width: 11rem;
+    overflow: hidden;
+    color: #cbd5e1;
+    background: #1e293b;
+    text-overflow: ellipsis;
+}
+#editor-composite-modal .editor-composite-review-left { color: #94a3b8; }
+#editor-composite-modal .editor-composite-review-repeat {
+    color: #bae6fd;
+    background: #082f49;
+}
+#editor-composite-modal .editor-composite-review-state-unresolved {
+    color: #fef3c7;
+    background: #78350f;
+}
+#editor-composite-modal .editor-composite-review-state-resolved {
+    color: #d1fae5;
+    background: #064e3b;
+}
+#editor-composite-modal .editor-composite-review-state-invalid {
+    color: #fee2e2;
+    background: #7f1d1d;
+}
+#editor-composite-modal .editor-composite-review-choices {
+    flex: 1 1 28rem;
+    display: flex;
+    min-width: 20rem;
+    overflow: hidden;
+    border: 1px solid #475569;
+    border-radius: .5rem;
+}
+#editor-composite-modal .editor-composite-review-choice {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: .48rem .65rem;
+    overflow: hidden;
+    border: 0;
+    border-right: 1px solid #475569;
+    color: #cbd5e1;
+    background: #1f2937;
+    font-size: .76rem;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#editor-composite-modal .editor-composite-review-choice:last-child { border-right: 0; }
+#editor-composite-modal .editor-composite-review-choice:hover { background: #334155; }
+#editor-composite-modal .editor-composite-review-choice-primary { color: #bae6fd; }
+#editor-composite-modal .editor-composite-review-choice-secondary { color: #ddd6fe; }
+#editor-composite-modal .editor-composite-review-choice-custom { color: #fde68a; }
+#editor-composite-modal .editor-composite-review-choice-primary.editor-composite-review-choice-active {
+    color: #f8fafc;
+    background: #075985;
+    box-shadow: inset 0 0 0 2px #38bdf8;
+}
+#editor-composite-modal .editor-composite-review-choice-secondary.editor-composite-review-choice-active {
+    color: #f8fafc;
+    background: #5b21b6;
+    box-shadow: inset 0 0 0 2px #a78bfa;
+}
+#editor-composite-modal .editor-composite-review-choice-custom.editor-composite-review-choice-active {
+    color: #fffbeb;
+    background: #92400e;
+    box-shadow: inset 0 0 0 2px #fbbf24;
+}
+#editor-composite-modal .editor-composite-review-choice:focus-visible,
+#editor-composite-modal .editor-composite-review-actions button:focus-visible,
+#editor-composite-modal .editor-composite-review-actions summary:focus-visible {
+    outline: 2px solid #f8fafc;
+    outline-offset: -2px;
+}
+#editor-composite-modal .editor-composite-manual-status {
+    flex: 1 0 100%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .25rem .65rem;
+    padding: .38rem .55rem;
+    border: 1px solid rgba(217, 119, 6, .65);
+    border-radius: .45rem;
+    color: #fde68a;
+    background: rgba(120, 53, 15, .24);
+    font-size: .72rem;
+}
+#editor-composite-modal .editor-composite-manual-status span:nth-of-type(2) { color: #cbd5e1; }
+#editor-composite-modal .editor-composite-review-error { color: #fecaca !important; }
+#editor-composite-modal .editor-composite-review-actions {
+    flex: 0 1 auto;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: .35rem;
+    margin-left: auto;
+}
+#editor-composite-modal .editor-composite-review-actions > button,
+#editor-composite-modal .editor-composite-review-actions > details > summary {
+    padding: .45rem .65rem;
+    border: 1px solid #4b5563;
+    border-radius: .4rem;
+    color: #e5e7eb;
+    background: #1f2937;
+    font-size: .72rem;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+#editor-composite-modal .editor-composite-review-actions > button:hover,
+#editor-composite-modal .editor-composite-review-actions > details > summary:hover {
+    border-color: #94a3b8;
+    background: #334155;
+}
+#editor-composite-modal .editor-composite-review-actions button:disabled {
+    cursor: not-allowed;
+    opacity: .38;
+}
+#editor-composite-modal .editor-composite-review-actions .editor-composite-review-continue {
+    border-color: #0891b2;
+    color: #ecfeff;
+    background: #0e7490;
+    font-weight: 700;
+}
+#editor-composite-modal .editor-composite-review-details,
+#editor-composite-modal .editor-composite-review-more { position: relative; }
+#editor-composite-modal .editor-composite-review-details > summary,
+#editor-composite-modal .editor-composite-review-more > summary {
+    cursor: pointer;
+    list-style: none;
+}
+#editor-composite-modal .editor-composite-review-details > summary::-webkit-details-marker,
+#editor-composite-modal .editor-composite-review-more > summary::-webkit-details-marker { display: none; }
+#editor-composite-modal .editor-composite-review-details-panel {
+    position: absolute;
+    top: calc(100% + .4rem);
+    right: 0;
+    z-index: 90;
+    width: min(42rem, calc(100vw - 5rem));
+    max-height: min(30rem, 55vh);
+    display: flex;
+    flex-direction: column;
+    gap: .75rem;
+    overflow-y: auto;
+    padding: .8rem;
+    border: 1px solid #64748b;
+    border-radius: .65rem;
+    color: #cbd5e1;
+    background: #0f172a;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, .55);
+}
+#editor-composite-modal .editor-composite-review-details-open-up .editor-composite-review-details-panel {
+    top: auto;
+    bottom: calc(100% + .4rem);
+}
+#editor-composite-modal .editor-composite-review-details-heading {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: .3rem .65rem;
+    font-size: .75rem;
+}
+#editor-composite-modal .editor-composite-review-details-heading span { color: #94a3b8; }
+#editor-composite-modal .editor-composite-review-more > div {
+    position: absolute;
+    top: calc(100% + .4rem);
+    right: 0;
+    z-index: 91;
+    min-width: 15rem;
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+    padding: .5rem;
+    border: 1px solid #64748b;
+    border-radius: .5rem;
+    background: #0f172a;
+    box-shadow: 0 14px 32px rgba(0, 0, 0, .48);
+}
+#editor-composite-modal .editor-composite-review-more button {
+    padding: .5rem .6rem;
+    border: 0;
+    border-radius: .35rem;
+    color: #e5e7eb;
+    background: #1f2937;
+    text-align: left;
+    font-size: .74rem;
+}
+#editor-composite-modal .editor-composite-review-more button:hover { background: #334155; }
+}
+@media (max-width: 72rem) {
+    #editor-composite-modal .editor-composite-header {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+    #editor-composite-modal .editor-composite-stage-indicator {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        justify-self: center;
+    }
+    #editor-composite-modal .editor-composite-window-actions {
+        grid-column: 2;
+        grid-row: 1;
+    }
+    #editor-composite-modal .editor-composite-source-grid {
+        grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    }
+    #editor-composite-modal .editor-composite-source-grid > label:last-child {
+        grid-column: 1 / -1;
+    }
+}
+@media (max-width: 56rem) {
+    #editor-composite-modal .editor-composite-review-summary { flex: 1 0 100%; }
+    #editor-composite-modal .editor-composite-review-choices { flex-basis: 100%; }
+    #editor-composite-modal .editor-composite-review-actions { margin-left: 0; }
+}
+@media (max-width: 48rem) {
+    #editor-composite-modal .editor-composite-source-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+    #editor-composite-modal .editor-composite-source-grid > label:last-child { grid-column: auto; }
+    #editor-composite-modal .editor-composite-swap-sources { justify-self: start; }
+    #editor-composite-modal .editor-composite-review-choices { min-width: 0; }
+    #editor-composite-modal .editor-composite-review-choice { padding-inline: .35rem; }
+    #editor-composite-modal .editor-composite-review-actions { justify-content: flex-start; }
+    #editor-composite-modal .editor-composite-review-details-panel {
+        right: auto;
+        left: 0;
+        width: min(34rem, calc(100vw - 3rem));
+    }
+}
+@media (max-height: 44rem) {
+    #editor-composite-modal .editor-composite-review-details-panel { max-height: 48vh; }
+}

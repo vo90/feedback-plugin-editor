@@ -22,7 +22,11 @@ globalThis.localStorage = globalThis.localStorage || { getItem: () => null, setI
 globalThis.window = globalThis.window || globalThis;
 
 const { _cursorDrawTimePure, _transportChartTimePure } = await import('../src/transport.js');
-const { _guideChartToCtxPure } = await import('../src/audio.js');
+const {
+    _editorPlaybackPaintRequiredPure,
+    _guideChartToCtxPure,
+    _guideScheduleWindowPure,
+} = await import('../src/audio.js');
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -66,6 +70,30 @@ t('a chart event maps to a LATER wall time when slowed (guide stays aligned)', (
     // At 0.5×, a chart event 1s ahead of the anchor sounds 2s of wall time later.
     assert.ok(near(_guideChartToCtxPure(1, 100, 0, 0.5), 102));
     assert.ok(near(_guideChartToCtxPure(1, 100, 0, 1), 101), 'rate 1 unchanged');
+});
+
+t('focused Hybrid previews get a deeper look-ahead and bounded late-event recovery', () => {
+    const ordinary = _guideScheduleWindowPure(10, 9, false, false, NaN);
+    const focused = _guideScheduleWindowPure(10, 9, true, false, NaN);
+    assert.ok(near(ordinary.to, 10.12));
+    assert.ok(near(ordinary.from, 9.995));
+    assert.ok(near(focused.to, 10.3));
+    assert.ok(near(focused.from, 9.96));
+    assert.ok(focused.from > 9.9,
+        'a long stall may recover a few recent attacks but never machine-guns its full backlog');
+});
+
+t('focused look-ahead still stops exactly at a loop boundary', () => {
+    const focused = _guideScheduleWindowPure(4.9, 4.8, true, true, 5);
+    assert.ok(near(focused.to, 5));
+    assert.ok(focused.from < focused.to);
+});
+
+t('a focused Hybrid preview owns the visible frame and suppresses the hidden editor paint', () => {
+    assert.equal(_editorPlaybackPaintRequiredPure(false), true,
+        'ordinary editor playback still paints the editor canvas');
+    assert.equal(_editorPlaybackPaintRequiredPure(true), false,
+        'focused preview playback does not repaint the obscured editor canvas');
 });
 
 // ── 4. output-latency compensation is a paint-only chart-time offset ──────────

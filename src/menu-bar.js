@@ -150,7 +150,7 @@ export const EDITOR_MENUS = Object.freeze([
     ] },
     { title: 'Track', items: [
         { label: 'New Track…', fn: 'editorShowNewTrackModal' },
-        { label: 'Create Hybrid Guitar Track…', fn: 'editorShowCompositeArrangementModal' },
+        { label: 'Create Hybrid Track…', fn: 'editorShowCompositeArrangementModal' },
         { cmd: 'renamePart' },
         { cmd: 'movePartEarlier' },
         { cmd: 'movePartLater' },

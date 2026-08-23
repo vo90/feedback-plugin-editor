@@ -6,8 +6,65 @@ import { GUIDED_REPEAT_MODE_EVERY, GUIDED_REPEAT_MODE_MATCHING } from './guided-
 const GAP_FILL_KEY = 'editorCompositeGapFill';
 const GUIDED_KEY = 'editorCompositeGuided';
 const PREVIEW_KEY = 'editorCompositePreview';
+const EXPERIMENTAL_KEY = 'editorCompositeExperimental';
+const DIALOG_SIZE_KEY = 'editorCompositeDialogSize';
+const TIMELINE_PREF_VERSION_KEY = 'editorCompositeTimelineVersion';
+const TIMELINE_PREF_VERSION = 2;
+// Increment whenever the opt-in engine changes its musical decision rules.
+// A prior opt-in must never silently authorize materially different choices.
+export const HYBRID_EXPERIMENTAL_PREF_VERSION = 2;
+export const HYBRID_EXPERIMENTAL_PROFILE_STRICT = 'strict';
+export const HYBRID_EXPERIMENTAL_PROFILE_BALANCED = 'balanced';
+export const HYBRID_EXPERIMENTAL_PROFILE_FILL_MORE = 'fill-more';
+export const HYBRID_EXPERIMENTAL_DEFAULTS = Object.freeze({
+    enabled: false,
+    profile: HYBRID_EXPERIMENTAL_PROFILE_BALANCED,
+    version: HYBRID_EXPERIMENTAL_PREF_VERSION,
+});
 
-export const HYBRID_PREVIEW_DEFAULTS = Object.freeze({ tone: 'clean', volume: 75 });
+export const HYBRID_TIMELINE_ZOOM_MIN = 1;
+export const HYBRID_TIMELINE_ZOOM_MAX = 480;
+export const HYBRID_TIMELINE_ZOOM_CONTROL_MIN = 5;
+export const HYBRID_TIMELINE_ZOOM_STEP = 5;
+export const HYBRID_TIMELINE_LANE_MIN = 128;
+export const HYBRID_TIMELINE_LANE_MAX = 320;
+export const HYBRID_PREVIEW_DEFAULTS = Object.freeze({
+    tone: 'clean',
+    volume: 75,
+    timelineZoom: 120,
+    laneHeights: Object.freeze({ primary: 158, secondary: 158, result: 158 }),
+    followPlayhead: true,
+});
+
+export function hybridDialogSizePure(raw) {
+    let parsed = raw;
+    if (typeof raw === 'string') {
+        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+    }
+    if (!parsed || typeof parsed !== 'object') parsed = {};
+    const normalize = (value, minimum) => {
+        const number = Number(value);
+        return Number.isFinite(number) && number >= minimum
+            ? Math.min(10000, Math.round(number)) : null;
+    };
+    return {
+        width: normalize(parsed.width, 480),
+        height: normalize(parsed.height, 400),
+        maximized: parsed.maximized === true,
+    };
+}
+
+export function loadHybridDialogSize() {
+    let raw = null;
+    try { raw = localStorage.getItem(DIALOG_SIZE_KEY); } catch (_) { /* blocked storage */ }
+    return hybridDialogSizePure(raw);
+}
+
+export function saveHybridDialogSize(size) {
+    const normalized = hybridDialogSizePure(size);
+    try { localStorage.setItem(DIALOG_SIZE_KEY, JSON.stringify(normalized)); } catch (_) { /* blocked storage */ }
+    return normalized;
+}
 
 // These are Hybrid-builder audition presets, deliberately separate from the
 // Editor's general per-instrument guide voice.  The trims level-match the
@@ -77,6 +134,44 @@ export function saveHybridGuidedPreferences(preferences) {
     try { localStorage.setItem(GUIDED_KEY, JSON.stringify(preferences)); } catch (_) { /* blocked storage */ }
 }
 
+export function hybridExperimentalPreferencesPure(raw) {
+    let parsed = raw;
+    if (typeof raw === 'string') {
+        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+    }
+    if (!parsed || typeof parsed !== 'object') parsed = {};
+    const knownProfiles = new Set([
+        HYBRID_EXPERIMENTAL_PROFILE_STRICT,
+        HYBRID_EXPERIMENTAL_PROFILE_BALANCED,
+        HYBRID_EXPERIMENTAL_PROFILE_FILL_MORE,
+    ]);
+    const currentVersion = Number(parsed.version) === HYBRID_EXPERIMENTAL_PREF_VERSION;
+    return {
+        // A future/old preference shape may describe materially different
+        // rules. Requiring a fresh opt-in is safer than silently changing an
+        // automatic merge the user had previously enabled.
+        enabled: currentVersion && parsed.enabled === true,
+        profile: knownProfiles.has(parsed.profile)
+            ? parsed.profile : HYBRID_EXPERIMENTAL_DEFAULTS.profile,
+        version: HYBRID_EXPERIMENTAL_PREF_VERSION,
+    };
+}
+
+export function loadHybridExperimentalPreferences() {
+    let raw = null;
+    try { raw = localStorage.getItem(EXPERIMENTAL_KEY); } catch (_) { /* blocked storage */ }
+    return hybridExperimentalPreferencesPure(raw);
+}
+
+export function saveHybridExperimentalPreferences(preferences) {
+    const normalized = hybridExperimentalPreferencesPure({
+        ...(preferences || {}),
+        version: HYBRID_EXPERIMENTAL_PREF_VERSION,
+    });
+    try { localStorage.setItem(EXPERIMENTAL_KEY, JSON.stringify(normalized)); } catch (_) { /* blocked storage */ }
+    return normalized;
+}
+
 export function hybridPreviewPreferencesPure(raw) {
     let parsed = raw;
     if (typeof raw === 'string') {
@@ -90,17 +185,59 @@ export function hybridPreviewPreferencesPure(raw) {
     const volume = Number.isFinite(rawVolume)
         ? Math.max(0, Math.min(100, Math.round(rawVolume)))
         : HYBRID_PREVIEW_DEFAULTS.volume;
-    return { tone, volume };
+    const rawZoom = Number(parsed.timelineZoom);
+    const timelineZoom = Number.isFinite(rawZoom)
+        ? Math.max(HYBRID_TIMELINE_ZOOM_MIN,
+            Math.min(HYBRID_TIMELINE_ZOOM_MAX, Math.round(rawZoom)))
+        : HYBRID_PREVIEW_DEFAULTS.timelineZoom;
+    const rawHeights = parsed.laneHeights && typeof parsed.laneHeights === 'object'
+        ? parsed.laneHeights : {};
+    const laneHeights = {};
+    for (const id of ['primary', 'secondary', 'result']) {
+        const value = Number(rawHeights[id]);
+        laneHeights[id] = Number.isFinite(value)
+            ? Math.max(HYBRID_TIMELINE_LANE_MIN,
+                Math.min(HYBRID_TIMELINE_LANE_MAX, Math.round(value)))
+            : HYBRID_PREVIEW_DEFAULTS.laneHeights[id];
+    }
+    const followPlayhead = parsed.followPlayhead === undefined
+        ? HYBRID_PREVIEW_DEFAULTS.followPlayhead : parsed.followPlayhead !== false;
+    return { tone, volume, timelineZoom, laneHeights, followPlayhead };
 }
 
 export function loadHybridPreviewPreferences() {
     let raw = null;
+    let version = 0;
     try { raw = localStorage.getItem(PREVIEW_KEY); } catch (_) { /* blocked storage */ }
-    return hybridPreviewPreferencesPure(raw);
+    try { version = Number(localStorage.getItem(TIMELINE_PREF_VERSION_KEY)) || 0; } catch (_) { /* blocked storage */ }
+    const normalized = hybridPreviewPreferencesMigrationPure(raw, version);
+    if (version < TIMELINE_PREF_VERSION) {
+        try {
+            localStorage.setItem(PREVIEW_KEY, JSON.stringify(normalized));
+            localStorage.setItem(TIMELINE_PREF_VERSION_KEY, String(TIMELINE_PREF_VERSION));
+        } catch (_) { /* blocked storage */ }
+    }
+    return normalized;
 }
 
 export function saveHybridPreviewPreferences(preferences) {
     const normalized = hybridPreviewPreferencesPure(preferences);
-    try { localStorage.setItem(PREVIEW_KEY, JSON.stringify(normalized)); } catch (_) { /* blocked storage */ }
+    try {
+        localStorage.setItem(PREVIEW_KEY, JSON.stringify(normalized));
+        localStorage.setItem(TIMELINE_PREF_VERSION_KEY, String(TIMELINE_PREF_VERSION));
+    } catch (_) { /* blocked storage */ }
     return normalized;
+}
+
+export function hybridPreviewPreferencesMigrationPure(raw, version = 0) {
+    if (Number(version) >= TIMELINE_PREF_VERSION) return hybridPreviewPreferencesPure(raw);
+    let parsed = raw;
+    if (typeof raw === 'string') {
+        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+    }
+    if (!parsed || typeof parsed !== 'object') parsed = {};
+    return hybridPreviewPreferencesPure({
+        ...parsed,
+        timelineZoom: HYBRID_PREVIEW_DEFAULTS.timelineZoom,
+    });
 }

@@ -126,10 +126,13 @@ function extendConnectedPlayableSpans(entries) {
 
 function flattenArrangement(arrangement, source, beats) {
     const raw = [];
-    for (const note of arrangement.notes || []) raw.push(note);
-    for (const chord of arrangement.chords || []) {
+    for (const note of arrangement.notes || []) raw.push({ note, metadata: { kind: 'note' } });
+    for (let chordIndex = 0; chordIndex < (arrangement.chords || []).length; chordIndex++) {
+        const chord = arrangement.chords[chordIndex];
+        const templateId = Math.trunc(finite(chord && chord.chord_id, -1));
+        const template = templateId >= 0 ? arrangement.chord_templates?.[templateId] : null;
         for (const chordNote of chord.notes || []) {
-            raw.push({
+            raw.push({ note: {
                 ...chordNote,
                 time: chordNote.time ?? chord.time,
                 // Some importers author one duration on the chord, others put
@@ -139,10 +142,18 @@ function flattenArrangement(arrangement, source, beats) {
                     ?? chord.sustain ?? chord.sus ?? 0,
                 techniques: clone(chordNote.techniques || {}),
                 _fn: clone(chord.fn || null),
-            });
+            }, metadata: {
+                kind: 'chord-note',
+                chordIndex,
+                chordKey: `${source}:chord:${chordIndex}`,
+                templateId,
+                templateKey: `${source}:template:${templateId}`,
+                chordTemplate: clone(template),
+            } });
         }
     }
-    const entries = raw.map((note, index) => {
+    const entries = raw.map((item, index) => {
+        const note = item.note;
         const startBeat = noteBeat(note, beats);
         const endBeat = noteEndBeat(note, beats, startBeat);
         return {
@@ -157,6 +168,7 @@ function flattenArrangement(arrangement, source, beats) {
             fret: Math.trunc(finite(note.fret, -1)),
             techniqueSignature: techniqueSignature(note),
             note: clone(note),
+            metadata: clone(item.metadata),
         };
     }).filter(e => Number.isFinite(e.startBeat) && e.string >= 0 && e.fret >= 0)
         .sort(compareEntries);
@@ -193,7 +205,9 @@ function normalizeTinySourceBoundaries(entries, beats, { preserveConnections = f
             if (!Number.isFinite(overlapSeconds) || overlapSeconds <= 0
                 || overlapSeconds > compositeTimingToleranceSeconds(beats, next.startBeat) + 1e-9) continue;
             const fromEndBeat = entry.endBeat;
+            if (!Number.isFinite(entry.authoredEndBeat)) entry.authoredEndBeat = fromEndBeat;
             entry.endBeat = next.startBeat;
+            entry.collisionEndBeat = next.startBeat;
             entry.effectiveEndBeat = Math.max(entry.startBeat + COMPOSITE_BEAT_EPS, entry.endBeat);
             entry.timingAdjustment = {
                 kind: 'boundary-clamp',
@@ -570,6 +584,200 @@ function prepareCompositeEntries(entries, beats) {
     return prepared.sort(compareEntries);
 }
 
+function toneDefinitionKey(definition) {
+    if (!definition || typeof definition !== 'object') return '';
+    return String(definition.Key ?? definition.key ?? definition.Name ?? definition.name ?? '').trim();
+}
+
+function activeToneName(tones, time) {
+    if (!tones || typeof tones !== 'object') return '';
+    let active = typeof tones.base === 'string' ? tones.base : '';
+    for (const change of (tones.changes || []).slice().sort((left, right) =>
+        finite(left?.t, Infinity) - finite(right?.t, Infinity))) {
+        if (finite(change?.t, Infinity) > time + 1e-6) break;
+        if (typeof change?.name === 'string' && change.name) active = change.name;
+    }
+    return active;
+}
+
+function preserveExperimentalPhrases(plan, selectedOriginalIds) {
+    const output = [];
+    const add = phrase => {
+        const time = finite(phrase?.start_time, Number.NaN);
+        if (!Number.isFinite(time)) return;
+        if (output.some(existing => Math.abs(finite(existing.start_time) - time) <= 0.005)) return;
+        output.push(clone(phrase));
+    };
+    for (const phrase of plan.primary?.phrases || []) add(phrase);
+    const secondaryPhrases = (plan.secondary?.phrases || []).slice().sort((left, right) =>
+        finite(left?.start_time) - finite(right?.start_time));
+    const secondaryEntries = plan.sourceEntries?.secondary || [];
+    for (let index = 0; index < secondaryPhrases.length; index++) {
+        const phrase = secondaryPhrases[index];
+        const start = finite(phrase?.start_time, Number.NaN);
+        const end = index + 1 < secondaryPhrases.length
+            ? finite(secondaryPhrases[index + 1]?.start_time, Infinity) : Infinity;
+        if (!Number.isFinite(start)) continue;
+        const span = secondaryEntries.filter(entry => {
+            const time = timeOf(plan.beats, entry.startBeat);
+            return time >= start - 1e-4 && time < end - 1e-4;
+        });
+        if (span.length && span.every(entry => selectedOriginalIds.has(entry.id))) add(phrase);
+    }
+    return output.sort((left, right) => finite(left.start_time) - finite(right.start_time));
+}
+
+function preserveExperimentalTones(plan, selectedOriginalIds) {
+    const warnings = [];
+    const primary = plan.primary?.tones;
+    const secondary = plan.secondary?.tones;
+    if (!primary || typeof primary !== 'object') {
+        if (secondary && (plan.passages || []).some(passage =>
+            !passage.partialSourcePassage
+            && (passage.entries || []).length
+            && passage.entries.every(entry => selectedOriginalIds.has(entry.id)))) {
+            warnings.push('Secondary tone changes were not copied because the base track has no tone schedule to restore afterward.');
+        }
+        return { tones: null, warnings };
+    }
+    const tones = clone(primary);
+    tones.changes = Array.isArray(tones.changes) ? tones.changes.map(clone) : [];
+    tones.definitions = Array.isArray(tones.definitions) ? tones.definitions.map(clone) : [];
+    if (!secondary || typeof secondary !== 'object') return { tones, warnings };
+    const definitionByKey = new Map(tones.definitions.map(definition =>
+        [toneDefinitionKey(definition), definition]).filter(([key]) => key));
+    const secondaryDefinitions = new Map((secondary.definitions || []).map(definition =>
+        [toneDefinitionKey(definition), definition]).filter(([key]) => key));
+    const availableNames = new Set([
+        tones.base,
+        ...(tones.changes || []).map(change => change?.name),
+        ...(tones.slots || []),
+        ...definitionByKey.keys(),
+    ].filter(Boolean));
+    const canImportName = name => {
+        if (!name) return false;
+        const incoming = secondaryDefinitions.get(name);
+        const existing = definitionByKey.get(name);
+        if (!incoming && !existing && !availableNames.has(name)) {
+            warnings.push(`Tone “${name}” was not copied because its sound definition is missing.`);
+            return false;
+        }
+        if (incoming && existing && stable(incoming) !== stable(existing)) {
+            warnings.push(`Tone “${name}” was not copied because both tracks define it differently.`);
+            return false;
+        }
+        if (!existing && incoming) {
+            definitionByKey.set(name, clone(incoming));
+            tones.definitions.push(clone(incoming));
+        }
+        if (Array.isArray(tones.slots) && !tones.slots.includes(name)) {
+            if (tones.slots.length >= 5) {
+                warnings.push(`Tone “${name}” was not copied because the Hybrid already uses all five tone slots.`);
+                return false;
+            }
+            tones.slots.push(name);
+        }
+        availableNames.add(name);
+        return true;
+    };
+    const events = tones.changes.map(change => ({ ...clone(change), _priority: 1 }));
+    for (const passage of plan.passages || []) {
+        if (passage.partialSourcePassage || !(passage.entries || []).length
+            || !passage.entries.every(entry => selectedOriginalIds.has(entry.id))) continue;
+        const start = timeOf(plan.beats, passage.startBeat);
+        const end = timeOf(plan.beats, passage.endBeat);
+        const passageEvents = [
+            { t: start, name: activeToneName(secondary, start), _priority: 2 },
+            ...(secondary.changes || []).filter(change => finite(change?.t, -Infinity) > start + 1e-6
+                && finite(change?.t, Infinity) < end - 1e-6)
+                .map(change => ({ ...clone(change), _priority: 2 })),
+        ];
+        for (const event of passageEvents) if (canImportName(event.name)) events.push(event);
+        const restore = activeToneName(primary, end);
+        if (restore) events.push({ t: end, name: restore, _priority: 3 });
+    }
+    events.sort((left, right) => finite(left.t) - finite(right.t)
+        || finite(left._priority) - finite(right._priority));
+    const byTime = new Map();
+    for (const event of events) byTime.set(Math.round(finite(event.t) * 1000), event);
+    tones.changes = [...byTime.values()].sort((left, right) => finite(left.t) - finite(right.t))
+        .map(({ _priority, ...event }) => event)
+        .filter((event, index, list) => index === 0 || event.name !== list[index - 1].name);
+    return { tones, warnings: [...new Set(warnings)] };
+}
+
+function experimentalMaterializationMetadata(plan, resolvedEntries) {
+    if (plan.strategy !== 'experimental') {
+        return { chordTemplates: [], handshapes: [], phrases: [], tones: null, warnings: [] };
+    }
+    const templates = [];
+    const templateIndex = new Map();
+    const ensureTemplate = (source, oldId, template) => {
+        if (!Number.isInteger(oldId) || oldId < 0 || !template) return -1;
+        const key = `${source}:template:${oldId}`;
+        if (!templateIndex.has(key)) {
+            templateIndex.set(key, templates.length);
+            templates.push(clone(template));
+        }
+        return templateIndex.get(key);
+    };
+    for (const entry of resolvedEntries) {
+        const metadata = entry.metadata || {};
+        ensureTemplate(entry.source, metadata.templateId, metadata.chordTemplate);
+    }
+    const selectedOriginalIds = new Set();
+    for (const entry of resolvedEntries) {
+        selectedOriginalIds.add(entry.id);
+        for (const id of entry.duplicateEntryIds || []) selectedOriginalIds.add(id);
+    }
+    const handshapes = [];
+    const seenHandshapes = new Set();
+    for (const source of ['primary', 'secondary']) {
+        const arrangement = plan[source] || {};
+        const sourceEntries = plan.sourceEntries?.[source] || [];
+        for (const handshape of arrangement.handshapes || []) {
+            const startTime = finite(handshape && handshape.start_time, Number.NaN);
+            const endTime = finite(handshape && handshape.end_time, Number.NaN);
+            const sourceSpan = sourceEntries.filter(entry => {
+                const time = timeOf(plan.beats, entry.startBeat);
+                return Number.isFinite(startTime) && Number.isFinite(endTime)
+                    && time >= startTime - 1e-4 && time <= endTime + 1e-4;
+            });
+            if (!sourceSpan.length || sourceSpan.some(entry => !selectedOriginalIds.has(entry.id))) continue;
+            const oldId = Math.trunc(finite(handshape && handshape.chord_id, -1));
+            const mapped = ensureTemplate(source, oldId, arrangement.chord_templates?.[oldId]);
+            if (mapped < 0) continue;
+            const key = `${source}:${oldId}:${startTime}:${endTime}:${!!handshape.arp}`;
+            if (seenHandshapes.has(key)) continue;
+            seenHandshapes.add(key);
+            handshapes.push({ ...clone(handshape), chord_id: mapped });
+        }
+    }
+    const phrases = preserveExperimentalPhrases(plan, selectedOriginalIds);
+    const toneProjection = preserveExperimentalTones(plan, selectedOriginalIds);
+    return {
+        chordTemplates: templates,
+        handshapes,
+        phrases,
+        tones: toneProjection.tones,
+        warnings: toneProjection.warnings,
+    };
+}
+
+export function compositeExperimentalMetadataPreview(plan) {
+    if (!plan || plan.strategy !== 'experimental') {
+        return { chordTemplates: 0, handshapes: 0, phrases: 0, toneChanges: 0, warnings: [] };
+    }
+    const metadata = experimentalMaterializationMetadata(plan, compositeResolvedEntries(plan));
+    return {
+        chordTemplates: metadata.chordTemplates.length,
+        handshapes: metadata.handshapes.length,
+        phrases: metadata.phrases.length,
+        toneChanges: metadata.tones?.changes?.length || 0,
+        warnings: metadata.warnings.slice(),
+    };
+}
+
 export function materializeCompositeArrangement(plan, name) {
     if (!plan || !plan.ok) throw new Error('A valid merge plan is required.');
     const unresolved = plan.conflicts.filter(c => !c.resolution);
@@ -587,6 +795,7 @@ export function materializeCompositeArrangement(plan, name) {
     const primary = plan.primary || {};
     const resultName = String(name || '').trim();
     if (!resultName) throw new Error('The Hybrid Track needs a name.');
+    const metadata = experimentalMaterializationMetadata(plan, resolvedEntries);
     const arrangement = {
         name: resultName,
         type: plan.compatibility.kind === 'bass' ? 'bass' : 'guitar',
@@ -594,15 +803,16 @@ export function materializeCompositeArrangement(plan, name) {
         capo: finite(primary.capo),
         notes: resolvedEntries.map(entry => materializeNote(entry, plan.beats)),
         chords: [],
-        chord_templates: [],
+        chord_templates: metadata.chordTemplates,
         anchors: [],
         anchors_user: [],
-        handshapes: [],
-        phrases: [],
+        handshapes: metadata.handshapes,
+        phrases: metadata.phrases,
     };
     if (primary.centOffset !== undefined) arrangement.centOffset = finite(primary.centOffset);
     if (primary._extendedStrings !== undefined) arrangement._extendedStrings = primary._extendedStrings;
-    if (primary.tones && typeof primary.tones === 'object') arrangement.tones = clone(primary.tones);
+    const tones = plan.strategy === 'experimental' ? metadata.tones : primary.tones;
+    if (tones && typeof tones === 'object') arrangement.tones = clone(tones);
     arrangement.notes.sort((a, b) => finite(a.beat, a.time) - finite(b.beat, b.time)
         || a.string - b.string || a.fret - b.fret);
     return arrangement;
