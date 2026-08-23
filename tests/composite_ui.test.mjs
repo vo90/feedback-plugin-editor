@@ -242,9 +242,10 @@ test('Hybrid release telemetry covers transport latency, display cadence, and in
     assert.match(resolver,
         /finishCompositeInteraction\('review\.choice'[\s\S]*finishCompositeInteraction\('review\.reset'/,
         'review choice and reset handlers contribute to the strict interaction gate');
+    assert.match(resolver, /interactionStartedAt: hybridPerfStart\(\)/);
     assert.match(resolver,
-        /interactionStartedAt: hybridPerfStart\(\)[\s\S]*finishCompositeInteraction\('zoom\.response'/,
-        'coalesced zoom reports input-to-visible response rather than each raw wheel event');
+        /finishCompositeInteraction\('zoom\.response', request\.interactionStartedAt\)/,
+        'coalesced zoom reports input-to-visible response at the exact camera commit');
     assert.match(resolver, /hybridPerformanceEnabled\(\)[\s\S]*timeline\.domNodes/,
         'expensive DOM-size gauges remain behind the explicit developer opt-in');
 });
@@ -423,9 +424,8 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
         'an uncovered display frame queues repair outside the playhead callback');
     assert.doesNotMatch(coverageBody, /synchronouslyRepairCompositeTimelineCoverage\(/,
         'the display-rate coverage guard never rebuilds SVG synchronously');
-    assert.match(cameraBody,
-        /!dom\.zoomPreviewPending[\s\S]*scheduleCompositeTimelineRenderAhead/,
-        'zoom owns the standby callback until its exact commit clears pending state');
+    assert.doesNotMatch(cameraBody, /scaleX|transformOrigin/,
+        'camera movement never stretches fret numbers or note heads');
     assert.match(resolver, /data-composite-map-viewport-window/);
     const bindFrameStart = resolver.indexOf(
         'timelineBindFrame = requestAnimationFrame');
@@ -502,25 +502,34 @@ test('continuous Hybrid preview preferences update live and persist off the inpu
     assert.match(resultBinding,
         /editor-composite-preview-volume'[\s\S]*'change', flushHybridPreviewPreferences/,
         'releasing the volume control flushes its final value');
-    const zoomStart = resolver.indexOf('function applyCompositeTimelineZoom');
+    const zoomStart = resolver.indexOf('function commitCompositeTimelineZoom');
     const zoomEnd = resolver.indexOf('function updateCompositeTimelineMapFrame', zoomStart);
-    assert.match(resolver.slice(zoomStart, zoomEnd),
-        /setHybridPreviewPreferences\([\s\S]*deferred:\s*true[\s\S]*flushPreference[\s\S]*flushHybridPreviewPreferences\(\)/,
-        'zoom changes update layout live and discrete/change events flush after the coalesced frame');
     const zoomBody = resolver.slice(zoomStart, zoomEnd);
+    assert.match(zoomBody,
+        /setHybridPreviewPreferences\([\s\S]*deferred:\s*!request\.flushPreference/,
+        'continuous zoom persists off the input path while discrete changes save immediately');
     const applyStart = zoomBody.indexOf('function applyCompositeTimelineZoom');
     const scheduleStart = zoomBody.indexOf('function scheduleCompositeTimelineZoom');
     const applyBody = zoomBody.slice(applyStart, scheduleStart);
-    const liveDomStart = applyBody.lastIndexOf('if (dom) {');
-    const liveDomEnd = applyBody.indexOf('\n    else', liveDomStart);
-    assert.doesNotMatch(applyBody.slice(liveDomStart, liveDomEnd),
-        /refreshCompositeTimelineViewport\(true\)/,
-        'continuous zoom does not synchronously rebuild ruler or lane SVG');
-    assert.match(resolver, /const scaleTransform[\s\S]*scaleX\(\$\{zoomScale\}\)/,
-        'visual zoom uses the existing camera instead of regenerating note markup');
+    assert.doesNotMatch(applyBody,
+        /content\.style\.width|refreshCompositeTimelineViewport|scaleX/,
+        'continuous input only records the latest exact zoom request');
+    assert.match(applyBody,
+        /const delay = flushPreference \|\| !timelineLastZoomCommitAt[\s\S]*48 - \(now - timelineLastZoomCommitAt\)[\s\S]*setTimeout\([\s\S]*commitCompositeTimelineZoom/,
+        'continuous input gets a leading crisp commit and bounded exact updates');
+    const commitBody = zoomBody.slice(0, applyStart);
+    assert.match(commitBody,
+        /content\.style\.width[\s\S]*dom\.visualScrollLeft = nextScroll[\s\S]*refreshCompositeTimelineViewport\(true\)/,
+        'the exact zoom updates geometry and camera atomically in one task');
+    assert.doesNotMatch(resolver, /scaleX\(/,
+        'no provisional zoom path can distort visible note glyphs');
+    assert.match(resolver, /timelinePendingZoom = \{\s*id: \+\+timelineZoomRequestGeneration/,
+        'raw zoom input claims its generation before the next display frame');
+    assert.match(resolver, /timelinePendingZoom\?\.id > requestId/,
+        'an older zoom timer refuses to overtake newer raw input');
     assert.match(resolver,
-        /const delay = immediate \? 0 : 100[\s\S]*scheduleCompositeTimelineStandby/,
-        'the existing camera previews every frame and one exact standby render follows quiet input');
+        /const unsettledZoom = timelinePendingZoom \|\| timelineRequestedZoom[\s\S]*timelineZoom: unsettledZoom\.zoom/,
+        'teardown persists the newest visible zoom request even before its exact render');
     const centerStart = resolver.indexOf('function centerCurrentReviewInTimeline');
     const centerEnd = resolver.indexOf('\nfunction refreshCompositeTimelineFollowButton', centerStart);
     assert.doesNotMatch(resolver.slice(centerStart, centerEnd),
@@ -553,7 +562,7 @@ test('Hybrid Follow is an explicit two-state preference and zoom keeps live play
         'the builder session has no automatic Follow override');
     assert.match(resolver, /followPlayhead:\s*!hybridPreviewPreferences\.followPlayhead/,
         'only the Follow button toggles the remembered preference');
-    const zoomStart = resolver.indexOf('function applyCompositeTimelineZoom');
+    const zoomStart = resolver.indexOf('function commitCompositeTimelineZoom');
     const zoomEnd = resolver.indexOf('function updateCompositeTimelineMapFrame', zoomStart);
     const zoomBody = resolver.slice(zoomStart, zoomEnd);
     assert.match(zoomBody, /followsLivePlayback/);
