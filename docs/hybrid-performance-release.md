@@ -80,20 +80,31 @@ version, window size, DPR, power state, and raw JSON with every release run.
 - Repeated-riff grouping and detached individual decisions.
 - Review timeline and Final Preview.
 - Cold and warm Clean, Edge, and Distortion tones.
+- Change to an uncached tone during active playback before changing any tone
+  while stopped; playback and timeline motion must continue from the same point.
 - Original, Lead, Rhythm, and Hybrid playback.
 - Space immediately after opening, before clicking the timeline; the stopped
   playhead and overview marker must already be visible at the current position.
 - Play, Space, Stop, Restart, mode replacement, click-seek, and drag-seek.
-- Restart keeps the main playhead and overview viewport synchronized.
+- Restart while playing and while paused; the main playhead, visible track view,
+  and blue overview viewport must return to the beginning together.
 - Fit, 60, 120, 240, and 480 px/beat plus Ctrl+wheel five-pixel steps.
-- Change presets, Ctrl+wheel zoom, lane height, and window size during playback;
-  Follow remains enabled unless the player explicitly toggles it off.
+- Exercise Centered, Page by page, and Off in both Review and Final Preview,
+  including changing modes during playback and confirming the choice persists.
+- In Page by page, confirm tracks remain still between page boundaries, each
+  display-only jump leaves audio time untouched, and reduced-motion mode changes
+  pages without animation.
+- Change presets, Ctrl+wheel zoom, Notes/Overview display, lane height, and window
+  size during playback; the selected Follow mode must remain unchanged.
+- Seek backward and let a loop wrap in every Follow mode; the playhead, camera,
+  and overview must recover without freezing or seeking the wrong audio time.
 - Click and drag the overview at the first note, label-gutter boundary, middle,
   and song end; the pointer, viewport, and audible seek stay exact.
 - Choose Base/Fill/Custom and use Previous/Next while playback is stopped and
   running; the review workspace and camera stay mounted.
 - Default and maximum lane heights.
-- Restored, maximized, rapidly resized, and 4K/high-DPI windows.
+- Narrow, restored, maximized, rapidly resized, and 4K/high-DPI windows; verify
+  page boundaries use the visible note area rather than the fixed track labels.
 - Sparse, Majesty, 5,000-note, and 20,000-note inputs.
 - Twenty open/analyse/review/close cycles and multiple song switches.
 - Cancel analysis, switch songs during analysis/materialization, and verify a

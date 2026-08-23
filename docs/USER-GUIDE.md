@@ -320,7 +320,13 @@ clicked position. The overview box and centered playhead exclude the fixed track
 labels, so they represent the usable note area. The tablature also keeps a small,
 display-only margin before beat 0 and after the song endpoint, ensuring the first
 and last note heads remain readable without changing their timing. A playhead
-follows all four playback choices. In manual mix mode,
+follows all four playback choices. Use **Follow** to choose how the tracks move:
+**Centered** (the default) keeps the playhead in the middle, **Page by page**
+keeps the tracks still until the playhead reaches the edge and then quickly shows
+the next part, and **Off** leaves the view where you placed it. Page changes never
+skip or seek the music; they change only what you see. They happen instantly when
+your system uses reduced motion. Your choice is remembered and shared between
+manual review and the full-song preview. In manual mix mode,
 the sticky status row shows how many notes come from each track. Select outlined
 notes in the aligned tracks; connected notes, chords, and trails stay together.
 

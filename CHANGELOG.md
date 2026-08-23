@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hybrid previews now offer three remembered Follow modes.** Centered keeps
+  the playhead in the middle, Page by page holds the tracks still before a short
+  display-only jump, and Off leaves the view in place. The same choice applies
+  in manual review and full-song preview and respects reduced-motion settings.
 - **Guided Hybrid can review matching repetitions once.** A remembered setup
   option keeps the existing occurrence-by-occurrence workflow or groups the
   same choice-dependent Lead/Rhythm material across the song. Automatic notes
@@ -146,6 +150,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hybrid Restart now returns the blue overview box with the playhead and track
+  view, including while paused.** The first uncached guide-tone change during
+  playback also no longer leaves the timeline frozen while the song continues.
 - **Creating a project from a multi-track MIDI no longer silently loses the
   drums.** Core's `list_midi_tracks` excludes channel-9 (a keys-import of a
   drum channel is empty), so a full-band MIDI's drum track never reached the

@@ -203,7 +203,7 @@ test('Hybrid playback keeps heavy rendering off the per-frame follow path and sh
     assert.doesNotMatch(playheadBody, /innerHTML\s*=/,
         'the animation frame may move geometry but never regenerate note markup');
     assert.match(playheadBody,
-        /applyCompositeTimelineCamera\(dom, visualScroll, frame\.contentX\)/,
+        /applyCompositeTimelineCamera\(\s*dom, frame\.visualScrollLeft, frame\.contentX\)/,
         'the per-frame path delegates the time surfaces to the shared compositor camera');
     assert.doesNotMatch(activePlaybackBody, /syncCompositeTimelineNativeCamera/,
         'playback never forces the native scrollbar to catch up');
@@ -334,8 +334,11 @@ test('Hybrid playhead is visible and exact before, during, and after playback', 
         /const playbackSettled = hybridSession\.previewPlaying && !controllerPlaying[\s\S]*controller\.presentationTime\(\)/,
         'natural completion adopts the exact private transport endpoint');
     assert.match(resolver,
-        /follow:\s*\(activelyPlaying \|\| playbackSettled\)[\s\S]*hybridPreviewPreferences\.followPlayhead/,
-        'natural completion also returns the followed camera and overview box to that position');
+        /const followsTransport = activelyPlaying \|\| playbackSettled[\s\S]*follow:\s*followsTransport[\s\S]*HYBRID_TIMELINE_FOLLOW_CENTERED/,
+        'natural completion returns the Centered camera and overview box to that position');
+    assert.match(resolver,
+        /followsTransport && followMode === HYBRID_TIMELINE_FOLLOW_PAGED[\s\S]*playbackSettled/,
+        'Page-by-page completion also settles against the exact transport endpoint');
     const playheadStart = resolver.indexOf('function updateCompositeTimelinePlayhead');
     const playheadEnd = resolver.indexOf('function startCompositeTimelinePlayhead', playheadStart);
     const playheadBody = resolver.slice(playheadStart, playheadEnd);
@@ -428,6 +431,32 @@ test('Hybrid preview lifecycle blocks loading races and stale review work', () =
     assert.match(previewBody,
         /previewRequestIsCurrent[\s\S]*hybridPlanSessionIsCurrent[\s\S]*await controller\.setMode[\s\S]*previewRequestIsCurrent[\s\S]*await controller\.setTone[\s\S]*previewRequestIsCurrent/,
         'each asynchronous preview preparation step retains request and song ownership');
+    const controllerStart = resolver.indexOf('function ensureCompositePreviewController');
+    const controllerEnd = resolver.indexOf(
+        '\nfunction updateCompositePreviewButtons', controllerStart);
+    const controllerBody = resolver.slice(controllerStart, controllerEnd);
+    assert.match(controllerBody,
+        /if \(state\.playing\) \{[\s\S]*previewPlaying = true;[\s\S]*wakeCompositeTimelinePlayhead\(\)/,
+        'an active guide preview wakes its visual loop after an asynchronous tone load resumes');
+    const wakeStart = resolver.indexOf('function wakeCompositeTimelinePlayhead');
+    const wakeEnd = resolver.indexOf(
+        '\nfunction refreshCompositeTimelinePlayheadNow', wakeStart);
+    const wakeBody = resolver.slice(wakeStart, wakeEnd);
+    assert.match(wakeBody,
+        /if \(timelinePlayheadFrame[\s\S]*!hybridSession\.previewMode[\s\S]*!hybridSession\.previewPlaying[\s\S]*!compositePreviewControllerPlaying\(\)\) return false;[\s\S]*timelinePlayheadFrame = requestAnimationFrame\(updateCompositeTimelinePlayhead\)/,
+        'tone resume installs exactly one missing animation frame for an active preview');
+    const startPlayheadStart = resolver.indexOf('function startCompositeTimelinePlayhead');
+    const startPlayheadEnd = resolver.indexOf(
+        '\nfunction wakeCompositeTimelinePlayhead', startPlayheadStart);
+    assert.match(resolver.slice(startPlayheadStart, startPlayheadEnd),
+        /wakeCompositeTimelinePlayhead\(\)/,
+        'initial preview start shares the idempotent wake path');
+    assert.doesNotMatch(resolver.slice(startPlayheadStart, startPlayheadEnd),
+        /cancelAnimationFrame|requestAnimationFrame/,
+        'initial start cannot cancel or multiply an animation already woken by controller state');
+    assert.match(resolver,
+        /const playbackSettled = hybridSession\.previewPlaying && !controllerPlaying\s*&& !hybridSession\.previewLoading/,
+        'the temporary tone-loading halt is never mistaken for natural completion');
     const focusStart = resolver.indexOf('function prepareCurrentReviewFocus');
     const focusEnd = resolver.indexOf('function centerCurrentReviewInTimeline', focusStart);
     const focusBody = resolver.slice(focusStart, focusEnd);
@@ -529,6 +558,31 @@ test('Hybrid follow uses bounded double-buffered cameras and compositor-only ove
         'an uncovered display frame queues repair outside the playhead callback');
     assert.doesNotMatch(coverageBody, /synchronouslyRepairCompositeTimelineCoverage\(/,
         'the display-rate coverage guard never rebuilds SVG synchronously');
+    const repairStart = resolver.indexOf(
+        'function settleCompositeTimelineCoverageRepair');
+    const repairEnd = resolver.indexOf(
+        '\n// Critical coverage repair', repairStart);
+    const repairBody = resolver.slice(repairStart, repairEnd);
+    assert.match(repairBody,
+        /const appliedVisualScroll = applyCompositeTimelineCamera\(dom, target\)[\s\S]*rememberCompositeTimelineScroll\(appliedVisualScroll\)[\s\S]*updateCompositeTimelineMapViewport\([\s\S]*appliedVisualScroll/,
+        'a deferred repair reconciles saved position and the blue overview box from the camera position actually applied');
+    assert.doesNotMatch(repairBody,
+        /refreshCompositeTimelineStaticMap|renderCompositeTimelineMapSvg/,
+        'repair completion moves only the existing overview overlay');
+    const repairScheduleStart = resolver.indexOf(
+        'function scheduleCompositeTimelineCoverageRepair');
+    const repairScheduleEnd = resolver.indexOf(
+        '\n// A compositor transform', repairScheduleStart);
+    const repairScheduleBody = resolver.slice(repairScheduleStart, repairScheduleEnd);
+    assert.match(repairScheduleBody,
+        /let repaired = compositeTimelineCameraCoverage[\s\S]*if \(!repaired\)[\s\S]*if \(repaired\) \{\s*settleCompositeTimelineCoverageRepair\(dom, target\)/,
+        'all successful asynchronous coverage paths share the same reconciliation epilogue');
+    const seekStart = resolver.indexOf('function seekCompositeTimelineAtTime');
+    const seekEnd = resolver.indexOf('\nfunction commitCompositeTimelineZoom', seekStart);
+    const seekBody = resolver.slice(seekStart, seekEnd);
+    assert.match(seekBody,
+        /cancelCompositeTimelineCoverageRepair\(dom\)[\s\S]*setCompositeTimelineNativeCamera\(dom, nextScroll/,
+        'Restart and explicit seeks discard any older queued repair before applying the new camera target');
     assert.doesNotMatch(cameraBody, /scaleX|transformOrigin/,
         'camera movement never stretches fret numbers or note heads');
     assert.match(resolver, /data-composite-map-viewport-window/);
@@ -668,7 +722,7 @@ test('continuous Hybrid preview preferences update live and persist off the inpu
         /function settleCompositeTimelineZoomPreference[\s\S]*compositeTimelineZoomAtPure[\s\S]*timelineZoom: normalizedZoom[\s\S]*timelineNotesScrollLeft = settledScroll/,
         'teardown persists the newest zoom and its anchor-derived Notes position before rendering');
     const centerStart = resolver.indexOf('function centerCurrentReviewInTimeline');
-    const centerEnd = resolver.indexOf('\nfunction refreshCompositeTimelineFollowButton', centerStart);
+    const centerEnd = resolver.indexOf('\nfunction refreshCompositeTimelineFollowControl', centerStart);
     assert.doesNotMatch(resolver.slice(centerStart, centerEnd),
         /refreshCompositeTimelineViewport/,
         'initial review centering is camera-only; its bind frame performs the sole exact render');
@@ -693,26 +747,87 @@ test('Hybrid preview owns and destroys its private transport at the feature boun
         'ordinary Hybrid preview does not own Editor audio, loop, or state policy');
 });
 
-test('Hybrid Follow is an explicit two-state preference and zoom keeps live playback centered', () => {
+test('Hybrid Follow exposes three explicit modes without hidden suspension state', () => {
     const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
     const session = fs.readFileSync(new URL('../src/composite/session.js', import.meta.url), 'utf8');
     assert.doesNotMatch(resolver, /timelineFollowSuspended|Follow paused|suspendFollow/,
-        'scrolling, zooming, and stage changes cannot create a hidden third Follow state');
+        'scrolling, zooming, and stage changes cannot create a hidden Follow override');
     assert.doesNotMatch(session, /timelineFollowSuspended/,
         'the builder session has no automatic Follow override');
-    assert.match(resolver, /followPlayhead:\s*!hybridPreviewPreferences\.followPlayhead/,
-        'only the Follow button toggles the remembered preference');
+    assert.match(resolver,
+        /HYBRID_TIMELINE_FOLLOW_CENTERED[\s\S]*HYBRID_TIMELINE_FOLLOW_PAGED[\s\S]*HYBRID_TIMELINE_FOLLOW_OFF/,
+        'Centered, Page by page, and Off are the only player-facing states');
+    assert.match(resolver,
+        /editor-composite-time-follow'[\s\S]*'change'[\s\S]*timelineFollowMode:\s*event\.target\.value/,
+        'the compact selector writes the explicit remembered mode');
     const zoomStart = resolver.indexOf('function commitCompositeTimelineZoom');
     const zoomEnd = resolver.indexOf('function updateCompositeTimelineMapFrame', zoomStart);
     const zoomBody = resolver.slice(zoomStart, zoomEnd);
-    assert.match(zoomBody, /followsLivePlayback/);
+    assert.match(zoomBody, /livePlayback/);
     assert.match(zoomBody, /compositePreviewVisualTime\(\)/,
         'live zoom anchors against the audio clock, not the previous scrollbar position');
-    assert.match(zoomBody, /compositeTimelineCenteredScrollPure/);
+    assert.match(zoomBody,
+        /HYBRID_TIMELINE_FOLLOW_CENTERED[\s\S]*compositeTimelineCenteredScrollPure/,
+        'Centered remains centered across live zoom');
+    assert.match(zoomBody,
+        /pageAnchor[\s\S]*compositeTimelineZoomAtPure[\s\S]*HYBRID_TIMELINE_FOLLOW_PAGED/,
+        'Page by page preserves the marker screen position across live zoom');
     assert.match(zoomBody, /timelinePendingZoom/);
     assert.match(zoomBody, /requestAnimationFrame/,
         'rapid slider and wheel requests are coalesced before rebuilding tracks');
     assert.doesNotMatch(resolver, /setCompositeTimelineFollowSuspended/);
+});
+
+test('Page-by-page Follow advances only display geometry and prepares its bounded destination', () => {
+    const resolver = fs.readFileSync(new URL('../src/composite/resolver-ui.js', import.meta.url), 'utf8');
+    const resetStart = resolver.indexOf('function resetCompositeTimelinePageFollow');
+    const resetEnd = resolver.indexOf('\nfunction scheduleCompositeTimelineIdle', resetStart);
+    const resetBody = resolver.slice(resetStart, resetEnd);
+    assert.match(resetBody,
+        /cancelCoverageRepair = true[\s\S]*cancelCompositeTimelineCoverageRepair\(dom\)[\s\S]*dom\.pageTransition = null/,
+        'invalidating page intent cancels an older queued camera target before clearing state');
+    const pageStart = resolver.indexOf('function compositeTimelinePageFollowFrame');
+    const pageEnd = resolver.indexOf('\nfunction updateCompositeTimelinePlayhead', pageStart);
+    const pageBody = resolver.slice(pageStart, pageEnd);
+    assert.match(pageBody,
+        /compositeTimelinePagedCameraPure[\s\S]*compositeTimelinePageTransitionPure/,
+        'one deterministic camera policy owns page boundaries and easing');
+    assert.doesNotMatch(pageBody,
+        /previewController\.(?:seek|start|stop)|\.scrollLeft\s*=/,
+        'a page boundary never seeks, restarts audio, or writes native scroll');
+    assert.match(pageBody,
+        /playheadOutsideViewport[\s\S]*firstPageSample[\s\S]*immediateCatchup/,
+        'a cold saved camera with an off-screen marker catches up immediately');
+    assert.match(pageBody,
+        /const target = scheduleCompositeTimelinePageTarget[\s\S]*if \(target\.ready\) \{[\s\S]*dom\.pageTransition =/,
+        'the transition clock cannot start until a bounded camera covers its destination');
+    assert.match(pageBody,
+        /else \{[\s\S]*dom\.pageTargetWaiting = target\.pending/,
+        'a cold destination retains explicit waiting state instead of forcing a render hitch');
+    assert.match(resolver,
+        /function scheduleCompositeTimelinePagePrefetch[\s\S]*dom\.pageTargetWaiting/,
+        'next-page prefetch cannot replace a cold catch-up destination that is still rendering');
+    const standbyStart = resolver.indexOf('function scheduleCompositeTimelineStandby');
+    const standbyEnd = resolver.indexOf('\nfunction scheduleCompositeTimelinePageTarget', standbyStart);
+    const standbyBody = resolver.slice(standbyStart, standbyEnd);
+    assert.match(standbyBody,
+        /holdReady[\s\S]*pagePreparedSlotIndex[\s\S]*onPrepared/,
+        'the hidden bounded strip can remain ready until a future page needs it');
+    const targetStart = standbyEnd + 1;
+    const targetEnd = resolver.indexOf(
+        '\nfunction scheduleCompositeTimelinePagePrefetch', targetStart);
+    const targetBody = resolver.slice(targetStart, targetEnd);
+    assert.match(targetBody,
+        /source: 'prepared'[\s\S]*source: 'active'[\s\S]*source: 'pending'/,
+        'page targeting distinguishes ready active/reserved coverage from rendering in progress');
+    const playheadStart = resolver.indexOf('function updateCompositeTimelinePlayhead');
+    const playheadEnd = resolver.indexOf('\nfunction startCompositeTimelinePlayhead', playheadStart);
+    assert.match(resolver.slice(playheadStart, playheadEnd),
+        /playbackSettled[\s\S]*frame\.waitingForPageTarget[\s\S]*requestAnimationFrame\(updateCompositeTimelinePlayhead\)/,
+        'endpoint settlement waits asynchronously for a cold page instead of rebuilding synchronously');
+    assert.match(resolver,
+        /prefers-reduced-motion: reduce[\s\S]*reducedMotion:\s*!!reducedMotionQuery/,
+        'the short page transition becomes immediate for reduced-motion users');
 });
 
 test('Hybrid setup presents the two player-facing workflows and escapes song data', () => {

@@ -6,6 +6,9 @@ import {
     COMPOSITE_TIMELINE_EDGE_PADDING,
     COMPOSITE_TIMELINE_GUTTER,
     COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT,
+    COMPOSITE_TIMELINE_PAGE_EDGE_MAX,
+    COMPOSITE_TIMELINE_PAGE_EDGE_MIN,
+    COMPOSITE_TIMELINE_PAGE_TRANSITION_MS,
     COMPOSITE_TIMELINE_STRIP_MAX_WIDTH,
     COMPOSITE_TIMELINE_STRIP_VIEWPORTS,
     compositeTimelineBeatForXPure,
@@ -13,6 +16,7 @@ import {
     compositeTimelineCameraOffsetPure,
     compositeTimelineCenteredScrollPure,
     compositeTimelineContentWidthPure,
+    compositeTimelineCubicEaseOutPure,
     compositeTimelineDisplayBeatPure,
     compositeTimelineDetailLevelPure,
     compositeTimelineEntriesInRangePure,
@@ -24,6 +28,9 @@ import {
     compositeTimelineNoteGlyphMetricsPure,
     compositeTimelineOverviewIntervalAtBeatPure,
     compositeTimelineOverviewIntervalIndexPure,
+    compositeTimelinePagedCameraPure,
+    compositeTimelinePagedGeometryPure,
+    compositeTimelinePageTransitionPure,
     compositeTimelineRenderBufferPure,
     compositeTimelineRenderGuardPure,
     compositeTimelineRenderOriginPure,
@@ -226,6 +233,150 @@ test('the virtual camera glides fractionally without native-scroll catch-up', ()
     });
     assert.equal(paused.visualScrollLeft, 321.5,
         'Follow off preserves the user camera exactly');
+});
+
+test('paged follow anchors scale with usable track width and remain valid when narrow', () => {
+    const narrow = compositeTimelinePagedGeometryPure({ viewportWidth: 200 });
+    assert.equal(narrow.gutter, COMPOSITE_TIMELINE_GUTTER);
+    assert.equal(narrow.usableWidth, 32);
+    assert.equal(narrow.requestedEdgeInset, COMPOSITE_TIMELINE_PAGE_EDGE_MIN);
+    assert.equal(narrow.edgeInset, 15.5,
+        'a narrow view reduces the inset before its anchors can cross');
+    assert.equal(narrow.pageTravelPx, 1);
+
+    const normal = compositeTimelinePagedGeometryPure({ viewportWidth: 1200 });
+    assert.equal(normal.usableWidth, 1032);
+    assert.equal(normal.edgeInset, 103.2);
+    assert.equal(normal.landingScreenX, 271.2);
+    assert.equal(normal.triggerScreenX, 1096.8);
+
+    const wide = compositeTimelinePagedGeometryPure({ viewportWidth: 3840 });
+    assert.equal(wide.edgeInset, COMPOSITE_TIMELINE_PAGE_EDGE_MAX);
+    assert.equal(wide.landingScreenX, COMPOSITE_TIMELINE_GUTTER
+        + COMPOSITE_TIMELINE_PAGE_EDGE_MAX);
+    assert.equal(wide.triggerScreenX, 3840 - COMPOSITE_TIMELINE_PAGE_EDGE_MAX);
+});
+
+test('paged follow holds before its trigger and advances at or beyond it', () => {
+    const context = { startBeat: 0, endBeat: 100 };
+    const zoom = 60;
+    const viewportWidth = 1000;
+    const contentX = compositeTimelineXForBeatPure(20, context, zoom);
+    const geometry = compositeTimelinePagedGeometryPure({ viewportWidth });
+    const frameAt = screenX => compositeTimelinePagedCameraPure({
+        beat: 20,
+        context,
+        zoom,
+        viewportWidth,
+        visualScrollLeft: contentX - screenX,
+    });
+
+    const before = frameAt(geometry.triggerScreenX - 0.01);
+    assert.equal(before.advance, false);
+    assert.equal(before.reason, 'hold');
+    assert.equal(before.targetScrollLeft, before.currentScrollLeft);
+
+    const at = frameAt(geometry.triggerScreenX);
+    assert.equal(at.advance, true);
+    assert.equal(at.reason, 'right-trigger');
+    assert.ok(Math.abs(at.targetScreenX - geometry.landingScreenX) < 1e-9);
+    assert.equal(at.prefetchScrollLeft, at.targetScrollLeft);
+    assert.ok(at.prefetchViewportRange.startBeat > before.prefetchViewportRange.startBeat);
+
+    const after = frameAt(geometry.triggerScreenX + 0.01);
+    assert.equal(after.advance, true);
+    assert.ok(Math.abs(after.targetScreenX - geometry.landingScreenX) < 1e-9);
+    assert.ok(after.deltaScrollLeft > 0);
+});
+
+test('paged follow recovers backward seeks and clamps both song edges', () => {
+    const context = { startBeat: 0, endBeat: 100 };
+    const backward = compositeTimelinePagedCameraPure({
+        beat: 5,
+        context,
+        zoom: 60,
+        viewportWidth: 1000,
+        visualScrollLeft: 1000,
+    });
+    assert.equal(backward.reason, 'playhead-before-view');
+    assert.equal(backward.advance, true);
+    assert.equal(backward.direction, -1);
+    assert.ok(Math.abs(backward.targetScreenX - backward.landingScreenX) < 1e-9);
+
+    const start = compositeTimelinePagedCameraPure({
+        beat: 0,
+        context,
+        zoom: 60,
+        viewportWidth: 1000,
+        visualScrollLeft: 1000,
+    });
+    assert.equal(start.targetScrollLeft, 0);
+    assert.equal(start.advance, true);
+
+    const end = compositeTimelinePagedCameraPure({
+        beat: 100,
+        context,
+        zoom: 60,
+        viewportWidth: 1000,
+        visualScrollLeft: Number.MAX_SAFE_INTEGER,
+    });
+    assert.equal(end.currentScrollLeft, end.maxScroll);
+    assert.equal(end.targetScrollLeft, end.maxScroll);
+    assert.equal(end.advance, false);
+    assert.equal(end.reason, 'end-clamp');
+
+    const fits = compositeTimelinePagedCameraPure({
+        beat: 2,
+        context: { startBeat: 0, endBeat: 4 },
+        zoom: 60,
+        viewportWidth: 1000,
+        visualScrollLeft: 500,
+    });
+    assert.equal(fits.songFits, true);
+    assert.equal(fits.maxScroll, 0);
+    assert.equal(fits.targetScrollLeft, 0);
+    assert.equal(fits.advance, false);
+    assert.equal(fits.reason, 'song-fits');
+});
+
+test('page transitions use a 120ms cubic ease-out with immediate motion fallbacks', () => {
+    assert.equal(COMPOSITE_TIMELINE_PAGE_TRANSITION_MS, 120);
+    assert.equal(compositeTimelineCubicEaseOutPure(-1), 0);
+    assert.equal(compositeTimelineCubicEaseOutPure(0), 0);
+    assert.equal(compositeTimelineCubicEaseOutPure(0.5), 0.875);
+    assert.equal(compositeTimelineCubicEaseOutPure(1), 1);
+    assert.equal(compositeTimelineCubicEaseOutPure(2), 1);
+
+    const start = compositeTimelinePageTransitionPure({
+        fromScrollLeft: 100, targetScrollLeft: 500, elapsedMs: 0,
+    });
+    assert.equal(start.visualScrollLeft, 100);
+    assert.equal(start.done, false);
+    const middle = compositeTimelinePageTransitionPure({
+        fromScrollLeft: 100, targetScrollLeft: 500, elapsedMs: 60,
+    });
+    assert.equal(middle.progress, 0.5);
+    assert.equal(middle.easedProgress, 0.875);
+    assert.equal(middle.visualScrollLeft, 450);
+    assert.equal(middle.done, false);
+    const end = compositeTimelinePageTransitionPure({
+        fromScrollLeft: 100, targetScrollLeft: 500, elapsedMs: 120,
+    });
+    assert.equal(end.visualScrollLeft, 500);
+    assert.equal(end.done, true);
+
+    for (const option of [{ reducedMotion: true }, { immediate: true }]) {
+        const settled = compositeTimelinePageTransitionPure({
+            fromScrollLeft: 100,
+            targetScrollLeft: 500,
+            elapsedMs: 0,
+            ...option,
+        });
+        assert.equal(settled.visualScrollLeft, 500);
+        assert.equal(settled.progress, 1);
+        assert.equal(settled.done, true);
+        assert.equal(settled.immediate, true);
+    }
 });
 
 test('render-ahead scales with the real viewport instead of a fixed song window', () => {

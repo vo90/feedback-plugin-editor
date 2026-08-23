@@ -23,6 +23,9 @@ import {
     HYBRID_PREVIEW_TONES,
     HYBRID_TIMELINE_DISPLAY_NOTES,
     HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+    HYBRID_TIMELINE_FOLLOW_CENTERED,
+    HYBRID_TIMELINE_FOLLOW_OFF,
+    HYBRID_TIMELINE_FOLLOW_PAGED,
     HYBRID_TIMELINE_ZOOM_MAX,
     hybridDialogSizePure,
     hybridPreviewPreferencesMigrationPure,
@@ -146,7 +149,7 @@ test('Hybrid audition preferences remember a safe shared tone and volume', () =>
         tone: 'clean', volume: 75, timelineZoom: 120,
         timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
         laneHeights: { primary: 158, secondary: 158, result: 158 },
-        followPlayhead: true,
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_CENTERED,
     };
     assert.deepEqual(_compositePreviewPreferencesPure(null), defaults);
     assert.deepEqual(_compositePreviewPreferencesPure('{broken'), defaults);
@@ -173,13 +176,26 @@ test('Hybrid audition preferences remember a safe shared tone and volume', () =>
     assert.deepEqual(_compositePreviewPreferencesPure({
         timelineZoom: 999,
         laneHeights: { primary: 1, secondary: 200, result: 999 },
-        followPlayhead: false,
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_OFF,
     }), {
         ...defaults,
         timelineZoom: 480,
         laneHeights: { primary: 128, secondary: 200, result: 320 },
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_OFF,
+    });
+    assert.deepEqual(_compositePreviewPreferencesPure({
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_PAGED,
+    }), {
+        ...defaults,
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_PAGED,
+    }, 'page-by-page follow is a persisted preview choice');
+    const invalid = _compositePreviewPreferencesPure({
+        timelineFollowMode: 'unknown',
         followPlayhead: false,
     });
+    assert.deepEqual(invalid, defaults, 'invalid modes fall back to centered follow');
+    assert.equal(Object.hasOwn(invalid, 'followPlayhead'), false,
+        'normalized preferences have one follow-mode source of truth');
 });
 
 test('Hybrid timeline zoom defaults migrate once without losing other audition settings', () => {
@@ -192,19 +208,19 @@ test('Hybrid timeline zoom defaults migrate once without losing other audition s
         tone: 'edge', volume: 81, timelineZoom: 120,
         timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
         laneHeights: { primary: 180, secondary: 190, result: 200 },
-        followPlayhead: false,
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_OFF,
     });
     assert.deepEqual(hybridPreviewPreferencesMigrationPure({ timelineZoom: 240 }, 2), {
         tone: 'clean', volume: 75, timelineZoom: 240,
         timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
         laneHeights: { primary: 158, secondary: 158, result: 158 },
-        followPlayhead: true,
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_CENTERED,
     }, 'version-two note zoom choices stay remembered');
     assert.deepEqual(hybridPreviewPreferencesMigrationPure({ timelineZoom: 4 }, 2), {
         tone: 'clean', volume: 75, timelineZoom: 120,
         timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
         laneHeights: { primary: 158, secondary: 158, result: 158 },
-        followPlayhead: true,
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_CENTERED,
     }, 'a pre-mode fit zoom becomes an explicit Overview without replacing note zoom');
     assert.equal(hybridPreviewPreferencesMigrationPure({ timelineZoom: 5 }, 2)
         .timelineDisplayMode, HYBRID_TIMELINE_DISPLAY_NOTES,
@@ -216,8 +232,45 @@ test('Hybrid timeline zoom defaults migrate once without losing other audition s
         tone: 'clean', volume: 75, timelineZoom: 180,
         timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
         laneHeights: { primary: 158, secondary: 158, result: 158 },
-        followPlayhead: true,
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_CENTERED,
     }, 'current explicit mode and note zoom both remain persisted');
+    assert.deepEqual(hybridPreviewPreferencesMigrationPure({
+        tone: 'distortion',
+        volume: 64,
+        timelineZoom: 205,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+        laneHeights: { primary: 170, secondary: 180, result: 190 },
+        followPlayhead: false,
+    }, 3), {
+        tone: 'distortion',
+        volume: 64,
+        timelineZoom: 205,
+        timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_OVERVIEW,
+        laneHeights: { primary: 170, secondary: 180, result: 190 },
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_OFF,
+    }, 'version-three preferences migrate without losing timeline or audition choices');
+    assert.deepEqual(hybridPreviewPreferencesMigrationPure({
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_PAGED,
+        followPlayhead: false,
+    }, 3).timelineFollowMode, HYBRID_TIMELINE_FOLLOW_PAGED,
+    'an already-written valid enum is preserved during an interrupted migration');
+    assert.equal(hybridPreviewPreferencesMigrationPure({ followPlayhead: true }, 0)
+        .timelineFollowMode, HYBRID_TIMELINE_FOLLOW_CENTERED,
+    'legacy enabled follow becomes centered follow');
+    assert.equal(hybridPreviewPreferencesMigrationPure({ followPlayhead: false }, 0)
+        .timelineFollowMode, HYBRID_TIMELINE_FOLLOW_OFF,
+    'legacy disabled follow remains off');
+    assert.equal(hybridPreviewPreferencesMigrationPure({
+        timelineFollowMode: 'invalid', followPlayhead: false,
+    }, 3).timelineFollowMode, HYBRID_TIMELINE_FOLLOW_CENTERED,
+    'an invalid enum falls back safely instead of creating a fourth state');
+    const current = hybridPreviewPreferencesMigrationPure({
+        timelineFollowMode: HYBRID_TIMELINE_FOLLOW_PAGED,
+        followPlayhead: false,
+    }, 4);
+    assert.equal(current.timelineFollowMode, HYBRID_TIMELINE_FOLLOW_PAGED);
+    assert.equal(Object.hasOwn(current, 'followPlayhead'), false,
+        'current preferences never retain the obsolete boolean');
 });
 
 test('the guided review CTA becomes a full-song preview action after the final choice', () => {

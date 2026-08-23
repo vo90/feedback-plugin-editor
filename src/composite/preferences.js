@@ -8,7 +8,7 @@ const GUIDED_KEY = 'editorCompositeGuided';
 const PREVIEW_KEY = 'editorCompositePreview';
 const DIALOG_SIZE_KEY = 'editorCompositeDialogSize';
 const TIMELINE_PREF_VERSION_KEY = 'editorCompositeTimelineVersion';
-const TIMELINE_PREF_VERSION = 3;
+const TIMELINE_PREF_VERSION = 4;
 
 // Display-only Overview may need well below one pixel per beat for unusually
 // long charts. Persisted/readable Notes zoom still has its separate 5 px floor.
@@ -20,13 +20,16 @@ export const HYBRID_TIMELINE_LANE_MIN = 128;
 export const HYBRID_TIMELINE_LANE_MAX = 320;
 export const HYBRID_TIMELINE_DISPLAY_NOTES = 'notes';
 export const HYBRID_TIMELINE_DISPLAY_OVERVIEW = 'overview';
+export const HYBRID_TIMELINE_FOLLOW_CENTERED = 'centered';
+export const HYBRID_TIMELINE_FOLLOW_PAGED = 'paged';
+export const HYBRID_TIMELINE_FOLLOW_OFF = 'off';
 export const HYBRID_PREVIEW_DEFAULTS = Object.freeze({
     tone: 'clean',
     volume: 75,
     timelineZoom: 120,
     timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
     laneHeights: Object.freeze({ primary: 158, secondary: 158, result: 158 }),
-    followPlayhead: true,
+    timelineFollowMode: HYBRID_TIMELINE_FOLLOW_CENTERED,
 });
 
 export function hybridDialogSizePure(raw) {
@@ -148,6 +151,12 @@ export function hybridPreviewPreferencesPure(raw) {
     const timelineDisplayMode = parsed.timelineDisplayMode
             === HYBRID_TIMELINE_DISPLAY_OVERVIEW
         ? HYBRID_TIMELINE_DISPLAY_OVERVIEW : HYBRID_TIMELINE_DISPLAY_NOTES;
+    const timelineFollowMode = [
+        HYBRID_TIMELINE_FOLLOW_CENTERED,
+        HYBRID_TIMELINE_FOLLOW_PAGED,
+        HYBRID_TIMELINE_FOLLOW_OFF,
+    ].includes(parsed.timelineFollowMode)
+        ? parsed.timelineFollowMode : HYBRID_PREVIEW_DEFAULTS.timelineFollowMode;
     const rawHeights = parsed.laneHeights && typeof parsed.laneHeights === 'object'
         ? parsed.laneHeights : {};
     const laneHeights = {};
@@ -158,15 +167,13 @@ export function hybridPreviewPreferencesPure(raw) {
                 Math.min(HYBRID_TIMELINE_LANE_MAX, Math.round(value)))
             : HYBRID_PREVIEW_DEFAULTS.laneHeights[id];
     }
-    const followPlayhead = parsed.followPlayhead === undefined
-        ? HYBRID_PREVIEW_DEFAULTS.followPlayhead : parsed.followPlayhead !== false;
     return {
         tone,
         volume,
         timelineZoom,
         timelineDisplayMode,
         laneHeights,
-        followPlayhead,
+        timelineFollowMode,
     };
 }
 
@@ -238,12 +245,19 @@ export function hybridPreviewPreferencesMigrationPure(raw, version = 0) {
         try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
     }
     if (!parsed || typeof parsed !== 'object') parsed = {};
+    const timelineFollowMode = Object.hasOwn(parsed, 'timelineFollowMode')
+        ? parsed.timelineFollowMode
+        : parsed.followPlayhead === false
+            ? HYBRID_TIMELINE_FOLLOW_OFF : HYBRID_TIMELINE_FOLLOW_CENTERED;
+    const migrated = { ...parsed, timelineFollowMode };
+    delete migrated.followPlayhead;
+    if (Number(version) >= 3) return hybridPreviewPreferencesPure(migrated);
     if (Number(version) >= 2) {
         const previousZoom = Number(parsed.timelineZoom);
         const legacyOverview = Number.isFinite(previousZoom)
             && previousZoom < HYBRID_TIMELINE_ZOOM_CONTROL_MIN;
         return hybridPreviewPreferencesPure({
-            ...parsed,
+            ...migrated,
             timelineZoom: legacyOverview
                 ? HYBRID_PREVIEW_DEFAULTS.timelineZoom : parsed.timelineZoom,
             timelineDisplayMode: legacyOverview
@@ -251,7 +265,7 @@ export function hybridPreviewPreferencesMigrationPure(raw, version = 0) {
         });
     }
     return hybridPreviewPreferencesPure({
-        ...parsed,
+        ...migrated,
         timelineZoom: HYBRID_PREVIEW_DEFAULTS.timelineZoom,
         timelineDisplayMode: HYBRID_TIMELINE_DISPLAY_NOTES,
     });

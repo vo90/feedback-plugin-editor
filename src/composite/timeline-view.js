@@ -30,6 +30,14 @@ export const COMPOSITE_TIMELINE_STRIP_VIEWPORTS = 5;
 // wasteful 19,200 CSS pixels on a 4K window. Keep the renderer below a stable
 // CSS-pixel budget while allowing an unusually wide viewport to cover itself.
 export const COMPOSITE_TIMELINE_STRIP_MAX_WIDTH = 7680;
+// Page follow keeps the camera still until the playhead reaches a safe inset
+// near the right edge, then carries it back to the matching inset on the left.
+// Keep these CSS-pixel values independent from musical zoom: zoom changes how
+// much time fits in one page, not where the transport sits within that page.
+export const COMPOSITE_TIMELINE_PAGE_EDGE_RATIO = 0.1;
+export const COMPOSITE_TIMELINE_PAGE_EDGE_MIN = 56;
+export const COMPOSITE_TIMELINE_PAGE_EDGE_MAX = 120;
+export const COMPOSITE_TIMELINE_PAGE_TRANSITION_MS = 120;
 const RANGE_BUFFER_PX = 900;
 const ENTRY_RANGE_INDEX = new WeakMap();
 const SOURCE_ENTRY_PREPROCESSING = new WeakMap();
@@ -512,6 +520,146 @@ export function compositeTimelineCameraFramePure({
         visualScrollLeft: scrollLeft,
         screenX: contentX - scrollLeft,
         maxScroll,
+    };
+}
+
+export function compositeTimelinePagedGeometryPure({
+    viewportWidth = 1200,
+    gutter = COMPOSITE_TIMELINE_GUTTER,
+} = {}) {
+    const width = Math.max(1, finite(viewportWidth, 1200));
+    // Reserve at least one CSS pixel for the time-bearing surface. This only
+    // differs from the requested gutter on pathologically narrow containers,
+    // where letting both page anchors cross would make follow oscillate.
+    const stickyGutter = Math.max(0, Math.min(Math.max(0, width - 1), finite(gutter)));
+    const usableWidth = Math.max(1, width - stickyGutter);
+    const requestedEdgeInset = Math.max(COMPOSITE_TIMELINE_PAGE_EDGE_MIN,
+        Math.min(COMPOSITE_TIMELINE_PAGE_EDGE_MAX,
+            usableWidth * COMPOSITE_TIMELINE_PAGE_EDGE_RATIO));
+    const maximumValidInset = Math.max(0, (usableWidth - 1) / 2);
+    const edgeInset = Math.min(requestedEdgeInset, maximumValidInset);
+    const landingScreenX = stickyGutter + edgeInset;
+    const triggerScreenX = width - edgeInset;
+    return {
+        viewportWidth: width,
+        gutter: stickyGutter,
+        usableWidth,
+        requestedEdgeInset,
+        edgeInset,
+        visibleStartScreenX: stickyGutter,
+        visibleEndScreenX: width,
+        landingScreenX,
+        triggerScreenX,
+        pageTravelPx: Math.max(0, triggerScreenX - landingScreenX),
+    };
+}
+
+/**
+ * Resolve one deterministic page-follow decision without reading or mutating
+ * the DOM. The controller keeps the returned target stable for the duration of
+ * a transition, and can use `prefetchScrollLeft` / `prefetchViewportRange` to
+ * prepare its standby strip before moving the visible camera.
+ */
+export function compositeTimelinePagedCameraPure({
+    beat = 0,
+    context = {},
+    zoom = HYBRID_PREVIEW_DEFAULTS.timelineZoom,
+    viewportWidth = 1200,
+    visualScrollLeft = 0,
+    gutter = COMPOSITE_TIMELINE_GUTTER,
+} = {}) {
+    const geometry = compositeTimelinePagedGeometryPure({ viewportWidth, gutter });
+    const displayBeat = compositeTimelineDisplayBeatPure(beat, context);
+    const contentX = compositeTimelineXForBeatPure(displayBeat, context, zoom);
+    const contentWidth = compositeTimelineContentWidthPure(context, zoom);
+    const maxScroll = Math.max(0, contentWidth - geometry.viewportWidth);
+    const currentScrollLeft = Math.max(0,
+        Math.min(maxScroll, finite(visualScrollLeft)));
+    const screenX = contentX - currentScrollLeft;
+    const songFits = maxScroll <= 1e-6;
+    let reason = 'hold';
+    let wantedScrollLeft = currentScrollLeft;
+    if (songFits) {
+        reason = 'song-fits';
+        wantedScrollLeft = 0;
+    } else if (screenX >= geometry.triggerScreenX) {
+        reason = 'right-trigger';
+        wantedScrollLeft = contentX - geometry.landingScreenX;
+    } else if (screenX < geometry.visibleStartScreenX) {
+        // A backward seek or an external camera movement can leave the
+        // transport hidden underneath the sticky labels. Recover in one page
+        // decision and use the same landing anchor as forward playback.
+        reason = 'playhead-before-view';
+        wantedScrollLeft = contentX - geometry.landingScreenX;
+    }
+    const targetScrollLeft = Math.max(0, Math.min(maxScroll, wantedScrollLeft));
+    const deltaScrollLeft = targetScrollLeft - currentScrollLeft;
+    const advance = Math.abs(deltaScrollLeft) > 1e-6;
+    if (!advance && reason === 'right-trigger' && targetScrollLeft >= maxScroll - 1e-6) {
+        reason = 'end-clamp';
+    }
+    const prefetchViewportRange = compositeTimelineViewportRangePure({
+        context,
+        zoom,
+        scrollLeft: targetScrollLeft,
+        viewportWidth: geometry.viewportWidth,
+        gutter: geometry.gutter,
+    });
+    return {
+        ...geometry,
+        displayBeat,
+        contentX,
+        contentWidth,
+        maxScroll,
+        currentScrollLeft,
+        screenX,
+        songFits,
+        reason,
+        advance,
+        shouldAdvance: advance,
+        direction: Math.sign(deltaScrollLeft),
+        deltaScrollLeft,
+        targetScrollLeft,
+        targetScreenX: contentX - targetScrollLeft,
+        prefetchScrollLeft: targetScrollLeft,
+        prefetchViewportRange,
+    };
+}
+
+export function compositeTimelineCubicEaseOutPure(progress = 0) {
+    const value = Math.max(0, Math.min(1, finite(progress)));
+    return 1 - (1 - value) ** 3;
+}
+
+/** Interpolate one page jump. Reduced motion and explicit immediate changes
+ * settle on the target in the first frame while retaining the same result
+ * shape, so the controller does not need a separate completion path. */
+export function compositeTimelinePageTransitionPure({
+    fromScrollLeft = 0,
+    targetScrollLeft = fromScrollLeft,
+    elapsedMs = 0,
+    durationMs = COMPOSITE_TIMELINE_PAGE_TRANSITION_MS,
+    reducedMotion = false,
+    immediate = false,
+} = {}) {
+    const from = finite(fromScrollLeft);
+    const target = finite(targetScrollLeft, from);
+    const duration = Math.max(0, finite(durationMs,
+        COMPOSITE_TIMELINE_PAGE_TRANSITION_MS));
+    const forced = Boolean(reducedMotion || immediate || duration <= 0
+        || Math.abs(target - from) <= 1e-6);
+    const progress = forced ? 1 : Math.max(0, Math.min(1,
+        finite(elapsedMs) / duration));
+    const easedProgress = forced ? 1 : compositeTimelineCubicEaseOutPure(progress);
+    return {
+        fromScrollLeft: from,
+        targetScrollLeft: target,
+        durationMs: duration,
+        progress,
+        easedProgress,
+        visualScrollLeft: from + (target - from) * easedProgress,
+        done: forced || progress >= 1,
+        immediate: forced,
     };
 }
 
