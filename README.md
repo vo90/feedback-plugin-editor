@@ -49,6 +49,10 @@ read this top-to-bottom once — the architecture section saves real time.
   **mixer console** (`Shift+C`) is vertical channel strips with live meters
   over SOURCE/GUIDE/CLICK buses and a MASTER output — every fader unity with
   +10 dB of headroom.
+- **Hybrid guitar/bass tracks** — combine two synchronized, compatible fretted
+  parts while keeping both originals unchanged. Automatic mode fills safe rests;
+  Review Sections mode lets the player choose either track or mix notes in each
+  different musical section. Repeated riffs can share one reviewed choice.
 - **Keys with hands** — MusicXML imports keep the score's left/right hand
   split; hands are authorable per note or stamped by split point, shaded on
   the roll, and drive the grand-staff notation's hand split.

@@ -261,6 +261,92 @@ empty** to chart from scratch — no source file needed — or **Import from a
 file** for Guitar Pro / MIDI / MusicXML). An empty track lands selected and
 ready: double-click the chart to add notes, and save to commit.
 
+### Hybrid guitar/bass tracks
+
+Use **Track ▸ Create Hybrid Track…** to combine two synchronized guitar
+or bass parts into one playable track. For example, you can keep a lead part and
+add rhythm notes during its silent sections. Both original tracks stay exactly
+as they were.
+
+#### Quick start
+
+1. Choose the **Base track**. This is the starting arrangement.
+2. Choose the **Fill track**. This supplies extra or alternative notes.
+3. Name the new Hybrid Track.
+4. Choose **Automatic** or **Review sections yourself**.
+5. Preview the result, then select **Create Hybrid Track**. Save the song when
+   you want to keep it. Creating the track is undoable.
+
+The builder expands with the Song Editor window, including on large displays.
+You can also drag its visible lower-right corner to make the workspace smaller
+or larger, or use the square title-bar button to maximize and restore the whole
+workspace. Both the size and maximized state are remembered. Setup, review, and
+full-song preview are shown as three clear stages at the top.
+
+The listening panel keeps comparisons separate: play the **Original song**, the
+**Base track only**, the **Fill track only**, or the current **Hybrid only**.
+Choose **Clean**, **Edge**, or **Distortion** from **Tone** for the three
+generated previews. **Volume** controls all four playback choices. Tone
+and volume are remembered, and the builder automatically level-matches the
+recording and guide tones so switching sources does not create a large volume
+jump. These listening settings never change the song or the normal Editor mixer.
+While a Hybrid preview is playing or loading, **Escape** stops that preview and
+keeps the builder open. Press Escape again to use the builder's normal close and
+discard rules.
+
+#### Which method should I choose?
+
+- **Automatic** is the fast choice. It keeps the entire base track and adds
+  fill-track notes only where the whole chord, trail, slide, or connected
+  technique fits safely between base-track parts.
+- **Review sections yourself** gives you control. Where the two tracks play
+  different material, choose **Use [track]** or **Mix notes** in the compact
+  decision toolbar.
+Empty, identical, and one-track-only sections are handled automatically.
+
+Both review and full-song preview use the same three aligned, scrollable tracks.
+During review, the decision toolbar stays beside the shared playback and zoom
+controls instead of taking space from the tracks. It shows progress, the three
+choices, Clear, Previous/Next, and Continue. The selected Base, Fill, or Hybrid
+track header is highlighted. Open **Decision details** only when you need the
+reason for the choice, repeated-section controls, bar splitting, or the full
+note list. Use **Adjust settings** to return to Setup.
+They open at **120 px/beat**; use the Zoom controls or **Ctrl+mouse wheel** for
+5 px/beat changes around the pointer. Drag the lower edge of any track to resize
+it. Click the overview map to seek to that exact point and, when there is room,
+center it in the visible tablature; hold and drag to scrub continuously. A short
+click on a colored review mark also selects it without losing the
+clicked position. The overview box and centered playhead exclude the fixed track
+labels, so they represent the usable note area. The tablature also keeps a small,
+display-only margin before beat 0 and after the song endpoint, ensuring the first
+and last note heads remain readable without changing their timing. A playhead
+follows all four playback choices. In manual mix mode,
+the sticky status row shows how many notes come from each track. Select outlined
+notes in the aligned tracks; connected notes, chords, and trails stay together.
+
+Choose **Review matching riffs once (recommended)** if repeated riffs should
+share one decision. Each copy still receives its own playability check. If one
+copy has different surrounding notes and cannot safely use the shared choice,
+only that copy returns for separate review. Choose **Review every occurrence
+separately** when you deliberately want different choices each time.
+
+The tracks must use the same instrument family, string count, tuning, capo, and
+pitch-cent offset. Notes that match in both tracks are included once. The builder
+never silently cuts a trail or connected gesture, and **Create Hybrid Track**
+remains unavailable until every reviewed section is playable.
+
+Advanced controls let you measure Automatic gaps in beats or seconds, adjust
+the safety space around base-track parts, split a review section at a bar, or
+choose notes directly from the aligned tablature. The technical note list and
+import-timing cleanup details are available when needed but do not change either
+original track.
+
+If you return to Setup after making review choices, those choices stay intact.
+Changed settings are marked as pending, and rebuilding asks before discarding
+review work. Nothing is added to the song until **Create Hybrid Track** is
+pressed; the resulting track is one undoable editor change and still requires
+the normal song save.
+
 The **Tracks column** down the left side lists every track — the master mix,
 any studio stems, and each transcription part — beside a matching timeline lane.
 From a track's row you can:
