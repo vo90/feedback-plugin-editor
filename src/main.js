@@ -682,6 +682,53 @@ window.editorNewTrackSetType = editorNewTrackSetType;
 window.editorNewTrackSetInstrument = editorNewTrackSetInstrument;
 window.editorNewTrackSetSource = editorNewTrackSetSource;
 window.editorNewTrackCreate = editorNewTrackCreate;
+/* @pure:hybrid-lazy-loader:start */
+let _hybridFeatureModule = null;
+let _hybridFeatureImport = null;
+let _hybridFeatureGeneration = 0;
+
+function _loadHybridFeature() {
+    if (_hybridFeatureModule) return Promise.resolve(_hybridFeatureModule);
+    if (_hybridFeatureImport) return _hybridFeatureImport;
+    const pending = import('./composite/entry.js').then(module => {
+        if (_hybridFeatureImport === pending) {
+            _hybridFeatureModule = module;
+            _hybridFeatureImport = null;
+        }
+        return module;
+    }, error => {
+        if (_hybridFeatureImport === pending) _hybridFeatureImport = null;
+        throw error;
+    });
+    _hybridFeatureImport = pending;
+    return pending;
+}
+
+function _teardownHybridFeature() {
+    _hybridFeatureGeneration++;
+    const hybridFeature = _hybridFeatureModule;
+    _hybridFeatureModule = null;
+    _hybridFeatureImport = null;
+    try { hybridFeature?.editorTeardownCompositeArrangementUi?.(); } catch (_) {}
+}
+
+window.editorShowCompositeArrangementModal = async () => {
+    const generation = _hybridFeatureGeneration;
+    try {
+        const feature = await _loadHybridFeature();
+        // Importing the entry module has no UI side effects. A stale caller
+        // therefore owns nothing to tear down; touching the shared ESM
+        // singleton here could close a newer Editor injection's modal.
+        if (generation !== _hybridFeatureGeneration) return false;
+        return await feature.editorShowCompositeArrangementModal();
+    } catch (error) {
+        if (generation !== _hybridFeatureGeneration) return false;
+        console.error('[Editor] Hybrid Track failed to open:', error);
+        setStatus('Hybrid Track could not be opened. Reload the Editor and try again.');
+        return false;
+    }
+};
+/* @pure:hybrid-lazy-loader:end */
 
 // Save-format modal (file-ops.js owns the logic; HTML calls these by name).
 window.editorHideSaveFormatModal = editorHideSaveFormatModal;
@@ -885,6 +932,7 @@ window.__editorScreenTeardown = () => {
     // Unblock any awaiting session-transition prompt before its listener is
     // swept below, so a re-injection can't strand guardSessionTransition.
     try { dismissSessionPrompt(); } catch (_) {}
+    if (typeof _teardownHybridFeature === 'function') _teardownHybridFeature();
     _globalListeners.removeAll();
     // Stop any playback this injection owns — the audio graph outlives the
     // DOM, so a replaced screen would otherwise keep sounding.
