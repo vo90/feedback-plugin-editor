@@ -6,21 +6,9 @@ import { GUIDED_REPEAT_MODE_EVERY, GUIDED_REPEAT_MODE_MATCHING } from './guided-
 const GAP_FILL_KEY = 'editorCompositeGapFill';
 const GUIDED_KEY = 'editorCompositeGuided';
 const PREVIEW_KEY = 'editorCompositePreview';
-const EXPERIMENTAL_KEY = 'editorCompositeExperimental';
 const DIALOG_SIZE_KEY = 'editorCompositeDialogSize';
 const TIMELINE_PREF_VERSION_KEY = 'editorCompositeTimelineVersion';
 const TIMELINE_PREF_VERSION = 3;
-// Increment whenever the opt-in engine changes its musical decision rules.
-// A prior opt-in must never silently authorize materially different choices.
-export const HYBRID_EXPERIMENTAL_PREF_VERSION = 2;
-export const HYBRID_EXPERIMENTAL_PROFILE_STRICT = 'strict';
-export const HYBRID_EXPERIMENTAL_PROFILE_BALANCED = 'balanced';
-export const HYBRID_EXPERIMENTAL_PROFILE_FILL_MORE = 'fill-more';
-export const HYBRID_EXPERIMENTAL_DEFAULTS = Object.freeze({
-    enabled: false,
-    profile: HYBRID_EXPERIMENTAL_PROFILE_BALANCED,
-    version: HYBRID_EXPERIMENTAL_PREF_VERSION,
-});
 
 // Display-only Overview may need well below one pixel per beat for unusually
 // long charts. Persisted/readable Notes zoom still has its separate 5 px floor.
@@ -137,44 +125,6 @@ export function loadHybridGuidedPreferences() {
 
 export function saveHybridGuidedPreferences(preferences) {
     try { localStorage.setItem(GUIDED_KEY, JSON.stringify(preferences)); } catch (_) { /* blocked storage */ }
-}
-
-export function hybridExperimentalPreferencesPure(raw) {
-    let parsed = raw;
-    if (typeof raw === 'string') {
-        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-    }
-    if (!parsed || typeof parsed !== 'object') parsed = {};
-    const knownProfiles = new Set([
-        HYBRID_EXPERIMENTAL_PROFILE_STRICT,
-        HYBRID_EXPERIMENTAL_PROFILE_BALANCED,
-        HYBRID_EXPERIMENTAL_PROFILE_FILL_MORE,
-    ]);
-    const currentVersion = Number(parsed.version) === HYBRID_EXPERIMENTAL_PREF_VERSION;
-    return {
-        // A future/old preference shape may describe materially different
-        // rules. Requiring a fresh opt-in is safer than silently changing an
-        // automatic merge the user had previously enabled.
-        enabled: currentVersion && parsed.enabled === true,
-        profile: knownProfiles.has(parsed.profile)
-            ? parsed.profile : HYBRID_EXPERIMENTAL_DEFAULTS.profile,
-        version: HYBRID_EXPERIMENTAL_PREF_VERSION,
-    };
-}
-
-export function loadHybridExperimentalPreferences() {
-    let raw = null;
-    try { raw = localStorage.getItem(EXPERIMENTAL_KEY); } catch (_) { /* blocked storage */ }
-    return hybridExperimentalPreferencesPure(raw);
-}
-
-export function saveHybridExperimentalPreferences(preferences) {
-    const normalized = hybridExperimentalPreferencesPure({
-        ...(preferences || {}),
-        version: HYBRID_EXPERIMENTAL_PREF_VERSION,
-    });
-    try { localStorage.setItem(EXPERIMENTAL_KEY, JSON.stringify(normalized)); } catch (_) { /* blocked storage */ }
-    return normalized;
 }
 
 export function hybridPreviewPreferencesPure(raw) {

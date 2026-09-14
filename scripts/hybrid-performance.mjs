@@ -1,7 +1,5 @@
 import { performance } from 'node:perf_hooks';
 
-import { analyzeExperimentalAutoComposite } from '../src/composite/experimental-auto-engine.js';
-import { experimentalComparisonReport } from '../src/composite/experimental-auto-engine.js';
 import { analyzeGapFillComposite } from '../src/composite/gap-fill-engine.js';
 import { analyzeGuidedComposite } from '../src/composite/guided-engine.js';
 import { compositeResolvedEntries } from '../src/composite/merge-engine.js';
@@ -108,12 +106,6 @@ const results = [
         plans.set('guided', plan);
         return plan;
     }, plan => ({ ok: plan?.ok === true, decisions: plan?.conflicts?.length || 0 })),
-    measure('experimental', () => analyzeExperimentalAutoComposite({
-        ...sources, gapFill, profile: 'balanced',
-    }), plan => {
-        plans.set('experimental', plan);
-        return { ok: plan?.ok === true, decisions: plan?.conflicts?.length || 0 };
-    }),
 ];
 
 // The planner is only one part of perceived latency. Exercise the synchronous
@@ -144,7 +136,6 @@ for (const [strategy, plan] of plans) {
         sourceEntries: (view?.lanes || []).slice(0, 2)
             .reduce((sum, lane) => sum + lane.entries.length, 0),
         decisions: view?.decisions?.length || 0,
-        passages: view?.passages?.length || 0,
     })));
     const view = views.get(strategy);
     phases.push(measure(`${strategy}:overview-svg`, () =>
@@ -194,7 +185,6 @@ if (overviewSourceView) {
                 .filter(marker => marker.beat <= overviewSpanBeats),
         },
         review: null,
-        passageFocus: null,
         lanes: [{
             ...overviewSourceView.lanes.find(lane => lane.id === 'result'),
             entries: denseEntries,
@@ -221,11 +211,6 @@ if (overviewSourceView) {
     }));
 }
 
-const experimentalPlan = plans.get('experimental');
-if (experimentalPlan?.ok) {
-    phases.push(measure('experimental:comparison-report', () =>
-        experimentalComparisonReport(experimentalPlan), report => ({ bytes: report.length })));
-}
 const standardPlan = plans.get('standard');
 if (standardPlan?.ok) {
     const previewEntries = standardPlan.sourceEntries?.primary || [];

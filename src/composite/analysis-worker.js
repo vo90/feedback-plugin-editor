@@ -1,4 +1,3 @@
-import { analyzeExperimentalAutoComposite } from './experimental-auto-engine.js';
 import { analyzeGapFillComposite } from './gap-fill-engine.js';
 import { analyzeGuidedComposite } from './guided-engine.js';
 import { materializeCompositeArrangement } from './merge-engine.js';
@@ -11,13 +10,6 @@ export function runHybridWorkerTaskPure(action, payload = {}) {
                 ...sources,
                 sections: sources.sections,
                 repeatMode: payload.repeatMode,
-            });
-        }
-        if (payload.experimentalEnabled) {
-            return analyzeExperimentalAutoComposite({
-                ...sources,
-                gapFill: payload.gapFill,
-                profile: payload.experimentalProfile || 'balanced',
             });
         }
         return analyzeGapFillComposite({ ...sources, gapFill: payload.gapFill });

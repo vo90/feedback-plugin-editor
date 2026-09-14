@@ -33,7 +33,6 @@ const arrangement = (name, notes) => ({
     chords: [],
     chord_templates: [],
 });
-
 function conflictPlan(primaryNotes = [], secondaryNotes = []) {
     return analyzeGuidedComposite({
         primary: arrangement('Lead', primaryNotes),
@@ -140,19 +139,4 @@ test('review toolbar model keeps compact Guided choice and manual-selection stat
     assert.equal(model.canReset, true);
     assert.equal(model.canContinue, false,
         'an invalid or incomplete draft cannot continue until the resolver accepts it');
-});
-
-test('review toolbar model gives Experimental choices plain, distinct labels', () => {
-    const plan = conflictPlan([note(8, 1, 3)], [note(9, 2, 7)]);
-    plan.strategy = 'experimental';
-    plan.profile = 'balanced';
-    const conflict = plan.conflicts[0];
-    conflict.resolution = 'secondary';
-    const model = buildCompositeReviewToolbarModel({ plan, conflict });
-    assert.deepEqual(model.choices.map(choice => choice.label),
-        ['Leave fill out', 'Add fill', 'Choose notes']);
-    assert.equal(model.experimental, true);
-    assert.equal(model.profile, 'balanced');
-    assert.equal(model.selectedLaneId, 'secondary');
-    assert.equal(model.canContinue, true);
 });

@@ -126,8 +126,6 @@
 #editor-composite-modal .editor-composite-map-key .editor-composite-map-review { background: #fbbf24; }
 #editor-composite-modal .editor-composite-map-key .editor-composite-map-resolved { background: #34d399; }
 #editor-composite-modal .editor-composite-map-key .editor-composite-map-invalid { background: #f87171; }
-#editor-composite-modal .editor-composite-map-key .editor-composite-map-passage-auto { background: #c084fc; }
-#editor-composite-modal .editor-composite-map-key .editor-composite-map-passage-out { background: #475569; }
 #editor-composite-modal [data-composite-entry-id]:focus { outline: none; }
 #editor-composite-modal [data-composite-entry-id]:focus rect {
     stroke: #f8fafc;
@@ -295,15 +293,12 @@
     background: #0e7490;
     font-weight: 700;
 }
-#editor-composite-modal .editor-composite-review-details,
-#editor-composite-modal .editor-composite-review-more { position: relative; }
-#editor-composite-modal .editor-composite-review-details > summary,
-#editor-composite-modal .editor-composite-review-more > summary {
+#editor-composite-modal .editor-composite-review-details { position: relative; }
+#editor-composite-modal .editor-composite-review-details > summary {
     cursor: pointer;
     list-style: none;
 }
-#editor-composite-modal .editor-composite-review-details > summary::-webkit-details-marker,
-#editor-composite-modal .editor-composite-review-more > summary::-webkit-details-marker { display: none; }
+#editor-composite-modal .editor-composite-review-details > summary::-webkit-details-marker { display: none; }
 #editor-composite-modal .editor-composite-review-details-panel {
     position: absolute;
     top: calc(100% + .4rem);
@@ -334,31 +329,6 @@
     font-size: .75rem;
 }
 #editor-composite-modal .editor-composite-review-details-heading span { color: #94a3b8; }
-#editor-composite-modal .editor-composite-review-more > div {
-    position: absolute;
-    top: calc(100% + .4rem);
-    right: 0;
-    z-index: 91;
-    min-width: 15rem;
-    display: flex;
-    flex-direction: column;
-    gap: .35rem;
-    padding: .5rem;
-    border: 1px solid #64748b;
-    border-radius: .5rem;
-    background: #0f172a;
-    box-shadow: 0 14px 32px rgba(0, 0, 0, .48);
-}
-#editor-composite-modal .editor-composite-review-more button {
-    padding: .5rem .6rem;
-    border: 0;
-    border-radius: .35rem;
-    color: #e5e7eb;
-    background: #1f2937;
-    text-align: left;
-    font-size: .74rem;
-}
-#editor-composite-modal .editor-composite-review-more button:hover { background: #334155; }
 @media (max-width: 72rem) {
     #editor-composite-modal .editor-composite-header {
         grid-template-columns: minmax(0, 1fr) auto;

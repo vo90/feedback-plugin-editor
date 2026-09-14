@@ -34,9 +34,6 @@ export function createHybridBuilderSession() {
         timelineScrollLeft: 0,
         timelineNotesScrollLeft: 0,
         timelineFocusReview: false,
-        timelineFocusPassage: false,
-        inspectedPassageId: '',
-        passageFilter: 'all',
         previewLastMode: 'song',
         customDrafts: new Map(),
         creating: false,
@@ -129,9 +126,7 @@ export function markHybridViewChanged(session) {
 }
 
 export function markHybridReviewWork(session) {
-    if (session?.plan?.strategy === 'guided'
-        || session?.plan?.strategy === 'experimental'
-            && Array.isArray(session.plan.conflicts) && session.plan.conflicts.length) {
+    if (session?.plan?.strategy === 'guided') {
         session.hasReviewWork = true;
     }
     return !!session?.hasReviewWork;
@@ -219,9 +214,6 @@ export function resetHybridBuilderReview(session) {
     session.timelineScrollLeft = 0;
     session.timelineNotesScrollLeft = 0;
     session.timelineFocusReview = false;
-    session.timelineFocusPassage = false;
-    session.inspectedPassageId = '';
-    session.passageFilter = 'all';
     session.previewLastMode = 'song';
     session.customDrafts.clear();
     session.closePromptPending = false;

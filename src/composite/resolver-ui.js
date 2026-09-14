@@ -25,7 +25,6 @@ import {
     COMPOSITE_TIMING_TOLERANCE_MAX_SECONDS,
     clearCompositeConflictResolution,
     compositeCompatibility,
-    compositeExperimentalMetadataPreview,
     compositePlanResolutionRevision,
     compositeResolvedEntries,
     compositeSelectionUnitIds,
@@ -36,12 +35,6 @@ import {
     compositeGapFillDefaultsForUnit,
     normalizeCompositeGapFillOptions,
 } from './gap-fill-engine.js';
-import {
-    experimentalComparisonReport,
-    experimentalPassageOutcome,
-    normalizeExperimentalProfile,
-    refreshExperimentalPlayability,
-} from './experimental-auto-engine.js';
 import {
     clearGuidedRepeatGroup,
     detachGuidedRepeatOccurrence,
@@ -142,16 +135,13 @@ import {
     createHybridPreferenceWriter,
     hybridGapFillPreferencesPure,
     hybridGuidedPreferencesPure,
-    hybridExperimentalPreferencesPure,
     hybridPreviewPreferencesPure,
-    loadHybridExperimentalPreferences,
     loadHybridDialogSize,
     loadHybridGapFillPreferences,
     loadHybridGuidedPreferences,
     loadHybridPreviewPreferences,
     saveHybridGapFillPreferences,
     saveHybridGuidedPreferences,
-    saveHybridExperimentalPreferences,
     saveHybridDialogSize,
     saveHybridPreviewPreferences,
 } from './preferences.js';
@@ -159,7 +149,6 @@ import {
 export {
     hybridGapFillPreferencesPure as _compositeGapFillPreferencesPure,
     hybridGuidedPreferencesPure as _compositeGuidedPreferencesPure,
-    hybridExperimentalPreferencesPure as _compositeExperimentalPreferencesPure,
     hybridPreviewPreferencesPure as _compositePreviewPreferencesPure,
 };
 
@@ -381,10 +370,6 @@ function compositeAnalysisConfigFromDialog() {
     return {
         ...base,
         gapFill: gapFillOptionsFromDialog(),
-        experimentalEnabled: byId('editor-composite-experimental')?.checked === true,
-        experimentalProfile: normalizeExperimentalProfile(
-            byId('editor-composite-experimental-profile')?.value,
-        ),
     };
 }
 
@@ -901,9 +886,6 @@ function entryMarkup(entry, checkboxName = '', stringCount = 6) {
 }
 
 function conflictReason(group) {
-    if (group.reason === 'experimental-handoff-review') {
-        return (group.reasons || []).join('; ') || 'the musical handoff is worth checking';
-    }
     if ((group.reasons || []).includes('guided-choice')) {
         return (group.reasons || []).includes('transition')
             ? 'a source handoff needs a playable transition'
@@ -991,7 +973,7 @@ function customDetailsMarkup(group) {
         `data-entry-id="${entry.id}"`, `data-entry-id="${entry.id}"${checked.has(entry.id) ? ' checked' : ''}`);
     const names = selectedSourceNames();
     return `<div class="border-t border-gray-700 pt-3"><b class="text-sm text-amber-100">Manual note list</b>`
-        + `<p class="mt-1 text-xs text-gray-300">You can click the outlined notes in the tracks above, or use these checkboxes. Connected notes, chords, and trails stay together.${hybridSession.plan?.strategy === 'experimental' ? ` The ${_editorEscHtml(names.primary)} track is already kept outside this optional fill passage.` : ''}</p>`
+        + `<p class="mt-1 text-xs text-gray-300">You can click the outlined notes in the tracks above, or use these checkboxes. Connected notes, chords, and trails stay together.</p>`
         + `<div class="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2"><div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b>${group.primaryEntries.map(render).join('')}</div>`
         + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b>${group.secondaryEntries.map(render).join('')}</div></div></div>`;
 }
@@ -1058,40 +1040,19 @@ function compositeEntriesKeepSortPosition(left, right) {
         && String(left?.id) === String(right?.id);
 }
 
-function entryLastBeat(entry) {
-    return Math.max(Number(entry?.startBeat) || 0, Number(entry?.endBeat) || 0,
-        Number(entry?.effectiveEndBeat) || 0);
-}
-
 function wholePlanPreviewView() {
     if (!hybridSession.plan) return null;
     const names = selectedSourceNames();
     const result = resolvedCompositeEntriesForPlan(hybridSession.plan);
     const durationSeconds = compositePreviewTimelineDuration();
-    const view = buildCompositeTimelineViewModel({
+    return buildCompositeTimelineViewModel({
         plan: hybridSession.plan,
         primaryName: names.primary,
         secondaryName: names.secondary,
         resultEntries: result,
         resultEntriesPrepared: true,
         durationSeconds,
-        passageFocusId: hybridSession.inspectedPassageId,
     });
-    const passage = hybridSession.plan.passages?.find(candidate =>
-        candidate.id === hybridSession.inspectedPassageId);
-    if (passage) {
-        const previous = passage.handoff?.previousBaseBeat;
-        const next = passage.handoff?.nextBaseBeat;
-        view.playbackContext = {
-            startBeat: Math.max(view.context.startBeat,
-                Math.min(passage.startBeat, Number.isFinite(previous) ? previous : passage.startBeat) - 0.5),
-            endBeat: Math.min(view.context.endBeat,
-                Math.max(passage.endBeat, Number.isFinite(next) ? next : passage.endBeat) + 0.5),
-        };
-        view.inspectedPassage = passage;
-        view.wholeSong = false;
-    }
-    return view;
 }
 
 function reviewPlanTimelineView() {
@@ -1151,7 +1112,7 @@ function reviewPlanTimelineView() {
 }
 
 function currentTimelineView() {
-    const cacheKey = `${hybridSession.stage}:${hybridSession.conflictIndex}:${hybridSession.inspectedPassageId}`
+    const cacheKey = `${hybridSession.stage}:${hybridSession.conflictIndex}`
         + `:${hybridSession.planRevision}:${hybridSession.resolutionRevision}`
         + `:${hybridSession.viewRevision}`;
     if (timelineViewCache?.plan === hybridSession.plan
@@ -1400,7 +1361,7 @@ function restartCompositePreview() {
         center: true,
     });
     if (activeMode) startCompositePreview(activeMode);
-    else setCompositeEditorStatus(`Hybrid preview returned to the beginning of the ${view.review || view.inspectedPassage ? 'selected section' : 'song'}.`);
+    else setCompositeEditorStatus(`Hybrid preview returned to the beginning of the ${view.review ? 'selected section' : 'song'}.`);
 }
 
 function renderCompositeReviewToolbar({
@@ -1425,14 +1386,9 @@ function renderCompositeReviewToolbar({
         + `<details class="border-t border-gray-700 pt-3 text-xs text-gray-400"><summary class="cursor-pointer hover:text-gray-200">Technical note details</summary><div class="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">`
         + `<div><b class="text-sky-300">${_editorEscHtml(names.primary)}</b><ul>${group.primaryEntries.map(entry => entryMarkup(entry, '', view.stringCount)).join('')}</ul></div>`
         + `<div><b class="text-violet-300">${_editorEscHtml(names.secondary)}</b><ul>${group.secondaryEntries.map(entry => entryMarkup(entry, '', view.stringCount)).join('')}</ul></div></div></details></div></details>`;
-    const secondaryActions = `<details class="editor-composite-review-more"><summary>More</summary><div>`
-        + `<button type="button" id="editor-composite-edit-settings">Back and adjust settings</button>`
-        + (model.experimental && model.unresolvedDecisions
-            ? `<button type="button" id="editor-composite-skip-experimental-review" title="Keep only passages already added automatically">Leave all uncertain passages out</button>` : '')
-        + `</div></details>`;
+    const adjustSettings = `<button type="button" id="editor-composite-edit-settings">Adjust settings</button>`;
     const continueLabel = _compositeReviewContinueLabelPure(model.unresolvedDecisions);
-    const modeLabel = model.experimental
-        ? `Experimental · ${model.profile}` : 'Guided review';
+    const modeLabel = 'Guided review';
     return `<section class="editor-composite-review-toolbar" aria-label="Review decision ${model.decisionNumber} of ${model.decisionTotal}">`
         + `<div class="editor-composite-review-summary"><div><b>Decision ${model.decisionNumber} of ${model.decisionTotal}</b><span class="editor-composite-review-mode">${_editorEscHtml(modeLabel)}</span><span class="editor-composite-review-location" title="${_editorEscHtml(rangeLabel)}">${_editorEscHtml(group.label)}</span></div>`
         + `<div><span class="${stateClass}">${_editorEscHtml(model.stateLabel)}</span><span class="editor-composite-review-left">${model.unresolvedDecisions} left</span>${repeatBadge}</div></div>`
@@ -1442,7 +1398,7 @@ function renderCompositeReviewToolbar({
         + `<button type="button" id="editor-composite-prev" aria-label="Previous review section" ${model.decisionNumber <= 1 ? 'disabled' : ''}>← Previous</button>`
         + `<button type="button" id="editor-composite-next" aria-label="Next review section" ${model.decisionNumber >= model.decisionTotal ? 'disabled' : ''}>Next →</button>`
         + `<button type="button" id="editor-composite-reset-choice" ${model.canReset ? '' : 'disabled'}>Clear</button>`
-        + details + secondaryActions
+        + details + adjustSettings
         + `<button type="button" id="editor-composite-apply-next" class="editor-composite-review-continue" ${model.canContinue ? '' : 'disabled'}>${_editorEscHtml(continueLabel)}</button></div></section>`;
 }
 
@@ -1528,7 +1484,6 @@ function enterCompositeFinalPreview() {
     endCompositePreviewPlayback();
     hybridSession.stage = 'final-preview';
     hybridSession.timelineFocusReview = false;
-    hybridSession.timelineFocusPassage = false;
     renderResult();
     scheduleCompositePreviewEventPrewarm(hybridSession.plan);
     const workspace = byId('editor-composite-result-workspace');
@@ -1555,31 +1510,6 @@ function toggleCompositeCustomEntry(entryId) {
     markHybridReviewWork(hybridSession);
     refreshCurrentCompositeReview();
     finishCompositeInteraction('review.manual', interactionStartedAt);
-}
-
-function inspectExperimentalPassage(passageId) {
-    if (!requireCurrentCompositePlan()) return false;
-    const passage = hybridSession.plan?.passages?.find(candidate => candidate.id === passageId);
-    if (!passage) return false;
-    endCompositePreviewPlayback();
-    hybridSession.inspectedPassageId = passage.id;
-    hybridSession.timelineFocusPassage = true;
-    hybridSession.timelineSeekTime = Math.max(0, timeOf(hybridSession.plan.beats,
-        Math.max(0, passage.startBeat - 0.5)));
-    invalidateCompositeTimelineView();
-    renderResult();
-    return true;
-}
-
-function applyExperimentalPassageFilter(value = hybridSession.passageFilter) {
-    const allowed = new Set(['all', 'added', 'reviewed', 'review', 'left-out']);
-    hybridSession.passageFilter = allowed.has(value) ? value : 'all';
-    const select = byId('editor-composite-passage-filter');
-    if (select) select.value = hybridSession.passageFilter;
-    for (const button of document.querySelectorAll('[data-composite-passage-category]')) {
-        button.hidden = hybridSession.passageFilter !== 'all'
-            && button.dataset.compositePassageCategory !== hybridSession.passageFilter;
-    }
 }
 
 function bindCompositeReviewDetails(details) {
@@ -1650,16 +1580,6 @@ function bindCompositeReviewToolbarEvents(toolbar) {
         setCompositeReviewMode(false);
         byId('editor-composite-primary')?.focus();
     });
-    toolbar.querySelector('#editor-composite-skip-experimental-review')?.addEventListener('click', () => {
-        if (!reviewActionAvailable()) return;
-        for (const conflict of hybridSession.plan.conflicts) {
-            if (!conflict.resolution) resolveCompositeConflict(
-                hybridSession.plan, conflict.id, 'primary');
-        }
-        markHybridResolutionChanged(hybridSession);
-        markHybridReviewWork(hybridSession);
-        enterCompositeFinalPreview();
-    });
     const moveDecision = offset => {
         if (!reviewActionAvailable()) return;
         const interactionStartedAt = hybridPerfStart();
@@ -1694,9 +1614,7 @@ function bindCompositeReviewToolbarEvents(toolbar) {
                     hybridSession.customDrafts.set(conflict.id,
                         conflict.resolution === 'custom'
                             ? [...conflict.selectedEntryIds]
-                            : hybridSession.plan.strategy === 'experimental'
-                                ? conflict.secondaryEntries.map(entry => entry.id)
-                                : conflict.primaryEntries.map(entry => entry.id));
+                            : conflict.primaryEntries.map(entry => entry.id));
                 }
                 const draft = hybridSession.customDrafts.get(conflict.id);
                 resolveReviewChoice(hybridSession.plan, conflict.id, 'custom', draft);
@@ -1796,48 +1714,6 @@ function bindResultEvents() {
             byId('editor-composite-primary')?.focus();
         });
     }
-    byId('editor-composite-copy-report')?.addEventListener('click', async () => {
-        if (!transportActionAvailable()) return;
-        let report = hybridSession.plan?.comparisonReport
-            || experimentalComparisonReport(hybridSession.plan);
-        if (hybridSession.plan?.strategy === 'experimental') {
-            const metadata = compositeExperimentalMetadataPreview(hybridSession.plan);
-            report += `\nPreserved metadata: ${metadata.chordTemplates} chord shapes, ${metadata.handshapes} handshapes, ${metadata.phrases} phrases, ${metadata.toneChanges} tone changes`;
-            if (metadata.warnings.length) report += `\nMetadata notes: ${metadata.warnings.join(' | ')}`;
-        }
-        try {
-            await navigator.clipboard.writeText(report);
-            const button = byId('editor-composite-copy-report');
-            if (button) button.textContent = 'Copied ✓';
-            setCompositeEditorStatus('Experimental Hybrid comparison copied to the clipboard.');
-        } catch (_) {
-            setCompositeEditorStatus(
-                'Could not copy the comparison report. Clipboard access is unavailable.');
-        }
-    });
-    for (const button of document.querySelectorAll('[data-composite-inspect-passage]')) {
-        button.addEventListener('click', () => inspectExperimentalPassage(
-            button.dataset.compositeInspectPassage));
-    }
-    byId('editor-composite-passage-filter')?.addEventListener('change', event =>
-        applyExperimentalPassageFilter(event.target.value));
-    applyExperimentalPassageFilter();
-    const moveInspectedPassage = delta => {
-        const passages = hybridSession.plan?.passages || [];
-        const index = passages.findIndex(passage => passage.id === hybridSession.inspectedPassageId);
-        const next = passages[index + delta];
-        if (next) inspectExperimentalPassage(next.id);
-    };
-    byId('editor-composite-passage-prev')?.addEventListener('click', () => moveInspectedPassage(-1));
-    byId('editor-composite-passage-next')?.addEventListener('click', () => moveInspectedPassage(1));
-    byId('editor-composite-passage-clear')?.addEventListener('click', () => {
-        if (!transportActionAvailable()) return;
-        endCompositePreviewPlayback();
-        hybridSession.inspectedPassageId = '';
-        hybridSession.timelineFocusPassage = false;
-        invalidateCompositeTimelineView();
-        renderResult();
-    });
     byId('editor-composite-back-review')?.addEventListener('click', () => {
         if (!transportActionAvailable()) return;
         endCompositePreviewPlayback();
@@ -1928,146 +1804,6 @@ export function _compositeAutomaticSummaryPure(stats = {}, names = {}) {
     };
 }
 
-export function _compositeExperimentalSummaryPure(stats = {}, names = {}) {
-    const base = String(names.primary || 'Base track');
-    const fill = String(names.secondary || 'Fill track');
-    const added = Math.max(0, Number(stats.secondaryAddedCleanly) || 0);
-    const reviewed = Math.max(0, Number(stats.secondaryAcceptedAfterReview
-        ?? stats.secondaryReviewable) || 0);
-    const skipped = Math.max(0, Number(stats.secondarySkippedByStrategy) || 0)
-        + Math.max(0, Number(stats.secondaryLeftOutAfterReview) || 0);
-    return {
-        title: 'Experimental hybrid ready',
-        description: `${base} unchanged · ${added} ${fill} added automatically · ${reviewed} added after review · ${skipped} left out`,
-        added, reviewed, skipped,
-    };
-}
-
-function experimentalComparisonMarkup(plan) {
-    if (plan.strategy !== 'experimental') return '';
-    const standard = plan.standardComparison || {};
-    const stats = plan.stats || {};
-    const sync = plan.sync || {};
-    const outcome = plan.reviewOutcome || {};
-    const syncClass = sync.status === 'verified' ? 'text-emerald-300' : 'text-amber-300';
-    return `<details class="mb-2 rounded-lg border border-amber-800/60 bg-amber-950/15 px-3 py-2">`
-        + `<summary class="cursor-pointer text-sm text-amber-100"><b>Experimental comparison</b><span class="ml-2 text-xs font-normal text-gray-400">Standard vs selected profile</span></summary>`
-        + `<div class="mt-3 flex flex-wrap items-start justify-between gap-3"><p class="text-xs text-gray-300">Profile: ${_editorEscHtml(plan.profile)}. The Standard Automatic result was calculated unchanged as a control.</p><button type="button" id="editor-composite-copy-report" class="rounded bg-dark-700 px-3 py-2 text-xs hover:bg-dark-600">Copy comparison report</button></div>`
-        + `<div class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2"><div class="rounded border border-gray-700 bg-dark-900/60 p-3"><b class="text-sm text-gray-100">Standard Automatic</b><p class="mt-1 text-xs text-gray-300">${Number(standard.secondaryAddedCleanly) || 0} fill notes added · ${Number(standard.secondarySkippedByStrategy) || 0} left out</p></div>`
-        + `<div class="rounded border border-amber-800/50 bg-dark-900/60 p-3"><b class="text-sm text-amber-100">Experimental</b><p class="mt-1 text-xs text-gray-300">${Number(stats.secondaryAddedCleanly) || 0} added automatically · ${Number(outcome.acceptedNotes) || 0} added after review · ${(Number(stats.secondarySkippedByStrategy) || 0) + (Number(outcome.leftOutNotes) || 0)} left out</p></div></div>`
-        + `<div class="mt-3 grid grid-cols-1 gap-2 text-xs text-gray-300 md:grid-cols-3"><p><b class="${syncClass}">Timing ${_editorEscHtml(sync.status || 'inconclusive')}</b><br>${_editorEscHtml(sync.message || '')}</p><p><b class="text-gray-100">Shared notes</b><br>${Number(stats.duplicatesRemoved) || 0} duplicates removed, including ${Number(stats.semanticDuplicates) || 0} that play the same despite different chart annotations.</p><p><b class="text-gray-100">Playability comparison</b><br>${plan.playability?.newWarnings?.length || 0} new advisory warnings versus the base track.</p></div></details>`;
-}
-
-function finiteMetric(value, suffix) {
-    return Number.isFinite(value) ? `${value}${suffix}` : 'Song boundary';
-}
-
-export function _compositeExperimentalPassageInspectorPure(plan, {
-    inspectedPassageId = '', passageFilter = 'all',
-} = {}) {
-    if (plan.strategy !== 'experimental' || !(plan.passages || []).length) return '';
-    const states = plan.passages.map((passage, index) => ({
-        passage,
-        outcome: experimentalPassageOutcome(plan, passage),
-        index,
-    })).map(item => ({
-        ...item,
-        category: item.outcome.state === 'automatic' ? 'added'
-            : ['accepted', 'accepted-partial'].includes(item.outcome.state) ? 'reviewed'
-                : item.outcome.state === 'review' ? 'review' : 'left-out',
-    }));
-    const selectedAt = Math.max(0, states.findIndex(item =>
-        item.passage.id === inspectedPassageId));
-    const selected = inspectedPassageId ? states[selectedAt] : null;
-    const automatic = states.filter(item => item.outcome.state === 'automatic').length;
-    const reviewed = states.filter(item => ['accepted', 'accepted-partial']
-        .includes(item.outcome.state)).length;
-    const needsReview = states.filter(item => item.outcome.state === 'review').length;
-    const leftOut = states.filter(item => ['left-out', 'declined'].includes(item.outcome.state)).length;
-    // A pathological import can produce thousands of tiny passages. Keep the
-    // inspector responsive while the overview remains the full-song navigator.
-    // Preserve up to this many chronological examples in every filter group,
-    // and always include a passage selected from the overview.
-    const maximumPerCategory = 240;
-    const categoryCounts = new Map();
-    const displayed = states.filter(item => {
-        const count = categoryCounts.get(item.category) || 0;
-        const keep = count < maximumPerCategory || item.passage.id === inspectedPassageId;
-        if (keep) categoryCounts.set(item.category, count + 1);
-        return keep;
-    });
-    const buttons = displayed.map(({ passage, outcome, category, index }) => {
-        const colors = category === 'added' ? 'border-violet-600/70 text-violet-100'
-            : category === 'reviewed' ? 'border-emerald-600/70 text-emerald-100'
-                : category === 'review' ? 'border-amber-600/70 text-amber-100'
-                    : 'border-slate-600 text-slate-300';
-        const active = passage.id === inspectedPassageId;
-        const hidden = passageFilter !== 'all' && category !== passageFilter;
-        return `<button type="button" data-composite-inspect-passage="${_editorEscHtml(passage.id)}" data-composite-passage-category="${category}" aria-pressed="${active}"${hidden ? ' hidden' : ''} class="rounded-lg border bg-dark-800 px-3 py-2 text-left text-xs ${colors}${active ? ' ring-2 ring-sky-400' : ''}"><b class="block">${index + 1}. ${_editorEscHtml(passage.label)}</b><span class="mt-0.5 block text-gray-400">${_editorEscHtml(outcome.state.replace('-', ' '))} · score ${passage.handoffScore}/100 · ${passage.noteCount} notes</span></button>`;
-    }).join('');
-    let detail = '<p class="mt-3 text-xs text-gray-400">Choose a passage to inspect its handoffs, reasons, and candidate notes. The timeline and preview buttons will focus on that passage.</p>';
-    if (selected) {
-        const { passage, outcome } = selected;
-        const handoff = passage.handoff || {};
-        const reasons = passage.reasons?.length
-            ? `<ul class="mt-2 list-disc space-y-1 pl-5 text-xs text-gray-300">${passage.reasons.map(reason => `<li>${_editorEscHtml(reason)}</li>`).join('')}</ul>`
-            : '<p class="mt-2 text-xs text-emerald-300">No questionable handoff was found.</p>';
-        const advisoryDetails = [...new Set((plan.playability?.newWarnings || [])
-            .filter(issue => issue.passageId === passage.id)
-            .map(issue => issue.detail).filter(Boolean))];
-        const advisories = advisoryDetails.length
-            ? `<div class="mt-3 rounded border border-amber-800/50 bg-amber-950/20 p-2"><b class="text-xs text-amber-100">Playability ${advisoryDetails.length === 1 ? 'advisory' : 'advisories'}</b><ul class="mt-1 list-disc space-y-1 pl-5 text-xs text-amber-200">${advisoryDetails.map(detail => `<li>${_editorEscHtml(detail)}</li>`).join('')}</ul></div>` : '';
-        detail = `<div class="mt-3 rounded-lg border border-sky-800/60 bg-sky-950/20 p-3">`
-            + `<div class="flex flex-wrap items-start justify-between gap-2"><div><b class="text-sm text-sky-100">${_editorEscHtml(passage.label)}</b><p class="mt-1 text-xs text-gray-300">${_editorEscHtml(passage.explanation)}</p></div>`
-            + `<div class="flex gap-1"><button type="button" id="editor-composite-passage-prev" class="rounded bg-dark-700 px-2 py-1 text-xs"${selectedAt <= 0 ? ' disabled' : ''}>←</button><button type="button" id="editor-composite-passage-next" class="rounded bg-dark-700 px-2 py-1 text-xs"${selectedAt >= states.length - 1 ? ' disabled' : ''}>→</button><button type="button" id="editor-composite-passage-clear" class="rounded bg-dark-700 px-2 py-1 text-xs">Whole song</button></div></div>`
-            + `<div class="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-4"><p><b class="text-gray-100">Entry space</b><br>${finiteMetric(handoff.entryGapBeats, ' beats')} · ${finiteMetric(handoff.entryGapSeconds, ' s')}</p><p><b class="text-gray-100">Exit space</b><br>${finiteMetric(handoff.exitGapBeats, ' beats')} · ${finiteMetric(handoff.exitGapSeconds, ' s')}</p><p><b class="text-gray-100">Position movement</b><br>${handoff.entryFretShift || 0} frets in · ${handoff.exitFretShift || 0} out</p><p><b class="text-gray-100">Result</b><br>${_editorEscHtml(outcome.state.replace('-', ' '))} · ${outcome.selectedNotes}/${outcome.offeredNotes} notes</p></div>${reasons}${advisories}</div>`;
-    }
-    return `<details class="mb-2 rounded-lg border border-slate-700 bg-dark-900/60 px-3 py-2" aria-label="Experimental passage inspector"${selected ? ' open' : ''}>`
-        + `<summary class="cursor-pointer text-sm text-gray-100"><b>Passage inspector</b><span class="ml-2 text-xs font-normal text-gray-400">${automatic} automatic · ${reviewed} reviewed · ${needsReview} need review · ${leftOut} left out</span></summary>`
-        + `<div class="mt-2 flex flex-wrap items-center justify-between gap-2"><p class="text-[11px] text-gray-500">Handoff score estimates how smoothly the parts switch; higher is smoother.</p>`
-        + `<label class="text-xs text-gray-300">Show <select id="editor-composite-passage-filter" class="ml-1 rounded border border-gray-600 bg-dark-700 px-2 py-1"><option value="all"${passageFilter === 'all' ? ' selected' : ''}>All passages</option><option value="added"${passageFilter === 'added' ? ' selected' : ''}>Added automatically</option><option value="reviewed"${passageFilter === 'reviewed' ? ' selected' : ''}>Added after review</option><option value="review"${passageFilter === 'review' ? ' selected' : ''}>Still needs review</option><option value="left-out"${passageFilter === 'left-out' ? ' selected' : ''}>Left out</option></select></label></div>`
-        + `<div id="editor-composite-passage-list" class="mt-3 grid max-h-40 grid-cols-1 gap-2 overflow-y-auto md:grid-cols-2 xl:grid-cols-3">${buttons}</div>`
-        + (displayed.length < states.length ? `<p class="mt-2 text-[11px] text-gray-500">Showing up to ${maximumPerCategory} passages in each result group. Use the overview to inspect any later passage.</p>` : '')
-        + `${detail}</details>`;
-}
-
-function experimentalMetadataMarkup(plan) {
-    if (plan.strategy !== 'experimental') return '';
-    const metadata = compositeExperimentalMetadataPreview(plan);
-    const warnings = metadata.warnings.length
-        ? `<ul class="mt-2 list-disc pl-5 text-xs text-amber-200">${metadata.warnings.map(warning => `<li>${_editorEscHtml(warning)}</li>`).join('')}</ul>` : '';
-    return `<details class="mb-2 rounded-lg border border-gray-700 bg-dark-900/50 px-3 py-2"><summary class="cursor-pointer text-xs text-gray-300"><b>Preserved details</b> · ${metadata.chordTemplates} chords · ${metadata.handshapes} handshapes · ${metadata.phrases} phrases · ${metadata.toneChanges} tones</summary>${warnings}</details>`;
-}
-
-function experimentalToolsMarkup(plan) {
-    if (plan.strategy !== 'experimental') return '';
-    const open = hybridSession.inspectedPassageId ? ' open' : '';
-    return `<details class="mb-2 rounded-lg border border-amber-800/50 bg-amber-950/10 px-3 py-2"${open}>`
-        + `<summary class="cursor-pointer text-sm text-amber-100"><b>Experimental details</b><span class="ml-2 text-xs font-normal text-gray-400">comparison · passages · preserved data</span></summary>`
-        + `<div class="mt-2">${experimentalComparisonMarkup(plan)}`
-        + _compositeExperimentalPassageInspectorPure(plan, {
-            inspectedPassageId: hybridSession.inspectedPassageId,
-            passageFilter: hybridSession.passageFilter,
-        })
-        + experimentalMetadataMarkup(plan) + `</div></details>`;
-}
-
-export function _compositeAutomaticOverviewPure(plan, names) {
-    const all = [...(plan.sourceEntries?.primary || []), ...(plan.sourceEntries?.secondary || [])];
-    if (!all.length) return '';
-    const start = Math.min(...all.map(entry => entry.startBeat));
-    const end = Math.max(start + 1, ...all.map(entryLastBeat));
-    const additions = plan.fixedEntries.filter(entry => entry.source === 'secondary').map(entry => {
-        const left = ((entry.startBeat - start) / (end - start)) * 100;
-        const width = Math.max(0.25, ((entryLastBeat(entry) - entry.startBeat) / (end - start)) * 100);
-        return `<span aria-hidden="true" class="absolute inset-y-0 rounded" style="left:${left}%;width:${width}%;min-width:3px;background:#c084fc" title="Added from ${_editorEscHtml(names.secondary)}"></span>`;
-    }).join('');
-    return `<div class="rounded-lg border border-gray-700 bg-dark-900/60 px-3 py-3 mb-3" aria-label="Where fill-track notes were added">`
-        + `<div class="flex flex-wrap justify-between gap-2 text-xs mb-2"><b class="text-gray-200">Where notes were added</b><span class="text-gray-400"><span aria-hidden="true" class="text-violet-300">●</span> ${_editorEscHtml(names.secondary)} added to the hybrid</span></div>`
-        + `<div class="relative h-5 rounded bg-sky-950/70 border border-sky-900 overflow-hidden">${additions}</div>`
-        + `<p class="text-xs text-gray-500 mt-1.5">The full bar represents the song. Colored marks show the safe gaps that received notes.</p></div>`;
-}
-
 const COMPOSITE_TIMELINE_ZOOM_PRESETS = Object.freeze([
     Object.freeze([60, 'Compact']),
     Object.freeze([120, 'Normal']),
@@ -2146,19 +1882,10 @@ function compositeTimelineMapKeyMarkup(view) {
             + (view.decisions.some(decision => decision.state === 'invalid')
                 ? '<span><i class="editor-composite-map-invalid" aria-hidden="true"></i>Needs attention</span>' : '')
         : '';
-    const passageKey = view.passages?.length
-        ? '<span><i class="editor-composite-map-passage-auto" aria-hidden="true"></i>Automatic passage</span>'
-            + (view.passages.some(passage => passage.state === 'review')
-                ? '<span><i class="editor-composite-map-review" aria-hidden="true"></i>Passage to review</span>' : '')
-            + (view.passages.some(passage => ['accepted', 'accepted-partial'].includes(passage.state))
-                ? '<span><i class="editor-composite-map-resolved" aria-hidden="true"></i>Accepted passage</span>' : '')
-            + (view.passages.some(passage => ['left-out', 'declined'].includes(passage.state))
-                ? '<span><i class="editor-composite-map-passage-out" aria-hidden="true"></i>Left-out passage</span>' : '')
-        : '';
     return `<span><i class="editor-composite-map-base" aria-hidden="true"></i>Hybrid notes</span>`
         + (view.hasFillAdditions
             ? `<span><i class="editor-composite-map-fill" aria-hidden="true"></i>Added from ${_editorEscHtml(view.names.secondary)}</span>` : '')
-        + decisionKey + passageKey;
+        + decisionKey;
 }
 
 function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar = '') {
@@ -2196,13 +1923,10 @@ function renderCompositeTimelineWorkspace(view, wholeSong = false, reviewToolbar
     const timelineHeight = COMPOSITE_TIMELINE_RULER_HEIGHT
         + [...laneHeights.values()].reduce((sum, height) => sum + height, 0);
     const followPressed = hybridPreviewPreferences.followPlayhead;
-    const title = view.review ? `Decision ${view.review.index + 1}`
-        : view.inspectedPassage ? `Inspect ${view.inspectedPassage.label}` : 'Tracks';
+    const title = view.review ? `Decision ${view.review.index + 1}` : 'Tracks';
     const description = view.review
         ? 'The full song remains available while the highlighted decision stays in focus.'
-        : view.inspectedPassage
-            ? 'The full song remains scrollable while playback loops this passage and its handoffs.'
-            : 'All three tracks stay aligned while you scroll, zoom, and resize them.';
+        : 'All three tracks stay aligned while you scroll, zoom, and resize them.';
     const manualChip = view.manualSelectionActive && !reviewToolbar
         ? `<span class="rounded-full border border-amber-600/60 bg-amber-950/50 px-2 py-1 text-[11px] text-amber-100" role="status" title="Select notes in the aligned tracks; white outlines show notes included in the hybrid">Manual mix · outlined notes are included</span>` : '';
     return `<div class="sticky top-0 z-50 -mx-1 mb-2 rounded-lg border border-slate-700 bg-slate-950/95 p-1.5 shadow-xl backdrop-blur-sm">`
@@ -3767,7 +3491,6 @@ function bindCompositeTimelineEvents() {
         if (timelineViewportDom !== boundDom) return;
         if (event.button !== 0) return;
         event.preventDefault();
-        const passage = event.target.closest?.('[data-composite-map-passage]');
         const decision = event.target.closest?.('[data-composite-map-decision]');
         const density = event.target.closest?.('[data-composite-map-density-kind]');
         const surface = map.querySelector('svg') || map;
@@ -3782,8 +3505,6 @@ function bindCompositeTimelineEvents() {
             },
         ) : null;
         const densityKind = density?.dataset.compositeMapDensityKind;
-        const densityPassageId = densityKind === 'passage' && densityItem?.id != null
-            ? String(densityItem.id) : '';
         const resumeMode = hybridSession.previewMode;
         const resumePlaying = hybridSession.previewPlaying
             && compositePreviewControllerPlaying();
@@ -3799,8 +3520,6 @@ function bindCompositeTimelineEvents() {
             startY: event.clientY,
             latestClientX: event.clientX,
             moved: false,
-            passageId: passage?.dataset.compositeMapPassage
-                || densityPassageId,
             decisionIndex: decision ? Number(decision.dataset.compositeMapDecision)
                 : densityKind === 'decision' && Number.isInteger(densityItem?.index)
                     ? densityItem.index : -1,
@@ -3829,14 +3548,12 @@ function bindCompositeTimelineEvents() {
         const location = flushMapPreview(event.clientX);
         mapPointerGesture = null;
         map.releasePointerCapture?.(event.pointerId);
-        const opensPassage = !gesture.moved && gesture.passageId
-            && hybridSession.stage === 'final-preview';
         const opensDecision = !gesture.moved
             && Number.isInteger(gesture.decisionIndex) && gesture.decisionIndex >= 0
             && hybridSession.stage === 'review'
             && hybridSession.plan.conflicts[gesture.decisionIndex];
         if (gesture.resumePlaying && gesture.resumeMode
-                && !opensPassage && !opensDecision) {
+                && !opensDecision) {
             // startCompositePreview owns the single transport seek when it
             // resumes. Settle only visual/native camera state here so the same
             // cursor is not redundantly committed twice.
@@ -3846,14 +3563,6 @@ function bindCompositeTimelineEvents() {
         }
         if (gesture.moved) {
             resumeMapPreview(gesture);
-            return;
-        }
-        if (opensPassage) {
-            hybridSession.inspectedPassageId = gesture.passageId;
-            hybridSession.timelineFocusPassage = false;
-            hybridSession.timelineSeekTime = location.time;
-            rememberCompositeTimelineScroll(location.scrollLeft);
-            renderResult();
             return;
         }
         if (opensDecision) {
@@ -4049,16 +3758,6 @@ function bindCompositeTimelineEvents() {
                     viewportWidth: scroller.clientWidth,
                 }));
             hybridSession.timelineFocusReview = false;
-        } else if (liveView.passageFocus && hybridSession.timelineFocusPassage) {
-            const beat = (liveView.passageFocus.startBeat
-                + liveView.passageFocus.endBeat) / 2;
-            nextScroll = clampTimelineScroll(scroller,
-                compositeTimelineCenteredScrollPure({
-                    beat, context: liveView.context,
-                    zoom: compositeTimelineEffectiveZoom(liveView, boundDom.viewportWidth),
-                    viewportWidth: scroller.clientWidth,
-                }));
-            hybridSession.timelineFocusPassage = false;
         } else {
             nextScroll = clampTimelineScroll(scroller,
                 hybridSession.timelineScrollLeft);
@@ -4082,13 +3781,7 @@ function renderFinalPreviewResult(plan, names, normalizationDetails, repeatNotic
     const summary = guided ? {
         title: 'Review complete ✓',
         description: `${stats.reviewDecisions || 0} ${(stats.reviewDecisions || 0) === 1 ? 'choice' : 'choices'} complete · inspect or listen before creating`,
-    } : plan.strategy === 'experimental'
-        ? _compositeExperimentalSummaryPure({
-            ...stats,
-            secondaryAcceptedAfterReview: plan.reviewOutcome?.acceptedNotes,
-            secondaryLeftOutAfterReview: plan.reviewOutcome?.leftOutNotes,
-        }, names)
-        : _compositeAutomaticSummaryPure(stats, names);
+    } : _compositeAutomaticSummaryPure(stats, names);
     const backReview = plan.conflicts.length
         ? `<button type="button" id="editor-composite-back-review" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm text-gray-200">← Back to review choices</button>` : '';
     return `<section class="mx-auto max-w-none">`
@@ -4096,17 +3789,12 @@ function renderFinalPreviewResult(plan, names, normalizationDetails, repeatNotic
         + `<div class="flex flex-wrap items-center justify-between gap-2"><div class="flex flex-wrap items-baseline gap-x-2"><b class="text-sm text-emerald-100">${_editorEscHtml(summary.title)}</b>`
         + `<p class="text-xs text-gray-300">${_editorEscHtml(summary.description)}</p></div><div class="flex flex-wrap gap-2">${backReview}`
         + `<button type="button" id="editor-composite-edit-settings" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded text-sm text-gray-200">Back and adjust</button></div></div></div>`
-        + experimentalToolsMarkup(plan)
         + renderCompositeTimelineWorkspace(view, view.wholeSong)
         + normalizationDetails + repeatNoticeMarkup
         + `</section>`;
 }
 
-function refreshCompositePlanDerivedState(plan, { includePlayability = true } = {}) {
-    if (plan.strategy === 'experimental' && includePlayability) {
-        refreshExperimentalPlayability(plan);
-        plan.comparisonReport = experimentalComparisonReport(plan);
-    }
+function refreshCompositePlanDerivedState(plan) {
     if (plan.strategy === 'guided') guidedReviewGroups(plan);
 }
 
@@ -4273,11 +3961,7 @@ function scheduleCompositeReviewTimelineRefresh(conflictId) {
             if (generation !== timelineReviewRefreshGeneration
                     || hybridSession.stage !== 'review' || !dom
                     || conflict?.id !== conflictId) return;
-            // Resolution-dependent Experimental reports and full-song
-            // playability are not needed to redraw the current decision. They
-            // are refreshed when entering final preview/copying the report,
-            // away from this post-input frame.
-            refreshCompositePlanDerivedState(plan, { includePlayability: false });
+            refreshCompositePlanDerivedState(plan);
             invalidateCompositeTimelineView();
             const presentation = currentCompositeReviewPresentation(plan);
             if (!presentation?.timelineView) return;
@@ -4335,7 +4019,7 @@ function refreshCurrentCompositeReview() {
     }
     if (hybridSession.previewMode) endCompositePreviewPlayback();
     const snapshot = captureCompositeReviewUi(previousToolbar);
-    refreshCompositePlanDerivedState(plan, { includePlayability: false });
+    refreshCompositePlanDerivedState(plan);
     invalidateCompositeTimelineView();
     const presentation = currentCompositeReviewPresentation(plan, {
         includeTimeline: false,
@@ -4403,8 +4087,7 @@ function compositeAnalyzeButtonLabel() {
         return hybridSession.setupDirty ? 'Rebuild hybrid preview' : 'Rebuild preview';
     }
     if (selectedCompositeStrategy() === 'guided') return 'Find sections to review';
-    return byId('editor-composite-experimental')?.checked
-        ? 'Analyze experimental hybrid' : 'Preview automatic hybrid';
+    return 'Preview automatic hybrid';
 }
 
 export function _compositeAnalysisConfigTokenPure(config) {
@@ -4415,7 +4098,6 @@ export function _compositeTaskPhaseLabelPure(phase, config = {}) {
     if (phase === 'materialize') return 'Building the new Hybrid Track…';
     if (phase === 'analyze') {
         if (config.strategy === 'guided') return 'Finding sections to review…';
-        if (config.experimentalEnabled) return 'Checking experimental fill…';
         return 'Finding safe gaps…';
     }
     return 'Preparing tracks…';
@@ -4482,8 +4164,6 @@ async function analyzeFromDialog() {
     disposeCompositePreviewSession();
     const config = compositeAnalysisConfigFromDialog();
     const { primaryIndex, secondaryIndex, strategy } = config;
-    const experimentalEnabled = config.experimentalEnabled === true;
-    const experimentalProfile = config.experimentalProfile || 'balanced';
     const repeatMode = config.repeatMode || normalizeGuidedRepeatMode();
     const gapFill = config.gapFill || gapFillOptionsFromDialog();
     if (strategy === 'gap-fill') {
@@ -4494,10 +4174,6 @@ async function analyzeFromDialog() {
             transitionMargin: gapFill.transitionMargin,
         };
         saveHybridGapFillPreferences(preferences);
-        saveHybridExperimentalPreferences({
-            enabled: experimentalEnabled,
-            profile: experimentalProfile,
-        });
     } else if (strategy === 'guided') {
         saveHybridGuidedPreferences({ repeatMode });
     }
@@ -4563,8 +4239,6 @@ async function analyzeFromDialog() {
             strategy,
             repeatMode,
             gapFill,
-            experimentalEnabled,
-            experimentalProfile,
         }, {
             signal: request.controller.signal,
             onProgress: phase => {
@@ -4600,9 +4274,7 @@ async function analyzeFromDialog() {
         const notice = byId('editor-composite-setup-notice');
         if (notice) {
             notice.hidden = false;
-            notice.textContent = plan.sync?.blocked
-                ? 'Experimental smart fill stopped because the source timing appears misaligned. Align the tracks in the main editor, then rebuild.'
-                : 'These tracks cannot be combined. Check their instrument, tuning, string count and capo.';
+            notice.textContent = 'These tracks cannot be combined. Check their instrument, tuning, string count and capo.';
         }
         return;
     }
@@ -4614,14 +4286,12 @@ async function analyzeFromDialog() {
     hybridSession.hasReviewWork = false;
     hybridSession.conflictIndex = 0;
     hybridSession.customDrafts.clear();
-    hybridSession.stage = (strategy === 'guided' || experimentalEnabled) && plan.conflicts.length
+    hybridSession.stage = strategy === 'guided' && plan.conflicts.length
         ? 'review' : 'final-preview';
     hybridSession.timelineSeekTime = 0;
     hybridSession.timelineScrollLeft = 0;
     hybridSession.timelineNotesScrollLeft = 0;
     hybridSession.timelineFocusReview = hybridSession.stage === 'review';
-    hybridSession.timelineFocusPassage = false;
-    hybridSession.inspectedPassageId = '';
     if (hybridSession.stage === 'review') prepareCurrentReviewFocus(true);
     setCompositeReviewMode(true);
     renderResult();
@@ -4983,7 +4653,6 @@ export async function editorShowCompositeArrangementModal() {
     const gapFillValues = gapFillPreferences[gapFillUnit]
         || compositeGapFillDefaultsForUnit(gapFillUnit);
     const guidedPreferences = loadHybridGuidedPreferences();
-    const experimentalPreferences = loadHybridExperimentalPreferences();
     hybridPreviewPreferences = loadHybridPreviewPreferences();
     recordingPreviewLevelCache = null;
     const modal = document.createElement('div');
@@ -4999,8 +4668,6 @@ export async function editorShowCompositeArrangementModal() {
         + renderHybridSetupView({
             sources, name, gapFillUnit, gapFillValues,
             guidedRepeatMode: guidedPreferences.repeatMode,
-            experimentalEnabled: experimentalPreferences.enabled,
-            experimentalProfile: experimentalPreferences.profile,
         })
         + `<main id="editor-composite-result-workspace" hidden class="p-3 min-h-0 overflow-y-auto"><div id="editor-composite-result"><p class="text-sm text-gray-400">Choose two tracks and how you want to build the hybrid.</p></div></main></div>`
         + `<footer class="editor-composite-footer"><div id="editor-composite-error" class="text-sm text-red-300 max-w-xl" role="alert" aria-live="polite"></div>`
@@ -5030,8 +4697,6 @@ export async function editorShowCompositeArrangementModal() {
     const strategyInputs = [...document.querySelectorAll('input[name="editor-composite-strategy"]')];
     const unitSelect = byId('editor-composite-gap-unit');
     const repeatModeSelect = byId('editor-composite-repeat-mode');
-    const experimentalToggle = byId('editor-composite-experimental');
-    const experimentalProfileSelect = byId('editor-composite-experimental-profile');
     let currentGapFillUnit = gapFillUnit;
     let generatedName = name;
     let nameManuallyEdited = false;
@@ -5092,16 +4757,8 @@ export async function editorShowCompositeArrangementModal() {
         const strategy = selectedCompositeStrategy();
         const guidedControls = byId('editor-composite-guided-controls');
         const gapControls = byId('editor-composite-gap-controls');
-        const experimentalControls = byId('editor-composite-experimental-controls');
-        const experimentalProfileControls = byId('editor-composite-experimental-profile-controls');
         if (guidedControls) guidedControls.hidden = strategy !== 'guided';
         if (gapControls) gapControls.hidden = strategy !== 'gap-fill';
-        if (experimentalControls) experimentalControls.hidden = strategy !== 'gap-fill';
-        if (experimentalControls && experimentalToggle?.checked) experimentalControls.open = true;
-        if (experimentalProfileControls) {
-            experimentalProfileControls.hidden = strategy !== 'gap-fill'
-                || experimentalToggle?.checked !== true;
-        }
         for (const card of document.querySelectorAll('[data-composite-mode-card]')) {
             const selected = card.dataset.compositeModeCard === strategy;
             card.classList.toggle('border-accent', selected);
@@ -5113,8 +4770,7 @@ export async function editorShowCompositeArrangementModal() {
         const analyze = byId('editor-composite-analyze');
         if (analyze) analyze.textContent = strategy === 'guided'
             ? 'Find sections to review'
-            : experimentalToggle?.checked
-                ? 'Analyze experimental hybrid' : 'Preview automatic hybrid';
+            : 'Preview automatic hybrid';
         const sourceExplanation = byId('editor-composite-source-explanation');
         const modeExplanation = byId('editor-composite-mode-explanation');
         if (strategy === 'guided') {
@@ -5164,24 +4820,6 @@ export async function editorShowCompositeArrangementModal() {
         guidedPreferences.repeatMode = normalizeGuidedRepeatMode(repeatModeSelect.value);
         saveHybridGuidedPreferences(guidedPreferences);
         markSetupChanged('The repeated-riff setting changed. Rebuild the preview to use it.');
-    });
-    experimentalToggle?.addEventListener('change', () => {
-        experimentalPreferences.enabled = experimentalToggle.checked;
-        experimentalPreferences.profile = normalizeExperimentalProfile(
-            experimentalProfileSelect?.value,
-        );
-        saveHybridExperimentalPreferences(experimentalPreferences);
-        syncModeControls();
-        markSetupChanged(experimentalToggle.checked
-            ? 'Experimental smart fill is on. Rebuild to compare it with Standard Automatic.'
-            : 'Standard Automatic is selected. Rebuild the preview to use it.');
-    });
-    experimentalProfileSelect?.addEventListener('change', () => {
-        experimentalPreferences.profile = normalizeExperimentalProfile(
-            experimentalProfileSelect.value,
-        );
-        saveHybridExperimentalPreferences(experimentalPreferences);
-        markSetupChanged('The experimental profile changed. Rebuild the preview to use it.');
     });
     unitSelect.addEventListener('change', () => {
         rememberCurrentGapFillValues();

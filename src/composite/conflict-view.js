@@ -204,10 +204,6 @@ function propertyDifferences(conflict) {
 }
 
 function conflictExplanation(conflict, names, stringCount) {
-    if (conflict.reason === 'experimental-handoff-review') {
-        return conflict.explanation
-            || `This fill passage fits the hard timing gap, but its musical handoff is uncertain. Add the complete passage, leave it out, or choose complete gestures manually.`;
-    }
     if ((conflict.reasons || []).includes('guided-choice')) {
         if ((conflict.reasons || []).includes('transition')) {
             return `Notes or trails cross the edge of this section. Choose which track should play through the handoff; no trail will be cut off.`;
@@ -276,14 +272,12 @@ export function buildCompositeConflictViewModel({
         explanation: conflictExplanation(conflict, names, stringCount),
         differences: propertyDifferences(conflict),
         lanes: [
-            { id: 'primary', label: names.primary, subtitle: plan.strategy === 'experimental'
-                ? 'Base track · your starting arrangement' : 'Base track · kept outside reviewed sections', entries: primary },
-            { id: 'secondary', label: names.secondary, subtitle: plan.strategy === 'experimental'
-                ? 'Optional fill passage under review' : 'Fill track · alternative part for this section', entries: secondary },
+            { id: 'primary', label: names.primary,
+                subtitle: 'Base track · kept outside reviewed sections', entries: primary },
+            { id: 'secondary', label: names.secondary,
+                subtitle: 'Fill track · alternative part for this section', entries: secondary },
             { id: 'result', label: 'Hybrid result', subtitle: conflict.resolution || custom
-                ? 'Your current choice' : plan.strategy === 'experimental'
-                    ? 'Base track shown until you choose whether to add the passage'
-                    : 'Choose what to play here', entries: result },
+                ? 'Your current choice' : 'Choose what to play here', entries: result },
         ],
     };
 }
@@ -294,7 +288,6 @@ export function buildCompositeReviewToolbarModel({
     unresolvedDecisions = 0, repeatCount = 1, canReset = null,
 } = {}) {
     if (!plan || !conflict) return null;
-    const experimental = plan.strategy === 'experimental';
     const draftActive = Array.isArray(customEntryIds);
     const manualActive = draftActive || conflict.resolution === 'custom';
     const selection = draftActive ? customEntryIds
@@ -307,18 +300,12 @@ export function buildCompositeReviewToolbarModel({
     const validationError = String(conflict.validationError || '');
     const resolution = manualActive ? 'custom' : conflict.resolution || '';
     const state = validationError ? 'invalid' : conflict.resolution ? 'resolved' : 'unresolved';
-    const choices = experimental ? [
-        { id: 'primary', label: 'Leave fill out', hint: `Keep ${primaryName} unchanged` },
-        { id: 'secondary', label: 'Add fill', hint: `Add the complete ${secondaryName} passage` },
-        { id: 'custom', label: 'Choose notes', hint: 'Choose connected fill gestures' },
-    ] : [
+    const choices = [
         { id: 'primary', label: `Use ${primaryName}`, hint: 'Use the base track here' },
         { id: 'secondary', label: `Use ${secondaryName}`, hint: 'Use the fill track here' },
         { id: 'custom', label: 'Mix notes', hint: 'Choose notes from either track' },
     ];
     return {
-        experimental,
-        profile: experimental ? String(plan.profile || 'balanced') : '',
         decisionNumber: Math.max(1, Math.trunc(finite(decisionNumber, 1))),
         decisionTotal: Math.max(1, Math.trunc(finite(decisionTotal, 1))),
         unresolvedDecisions: Math.max(0, Math.trunc(finite(unresolvedDecisions))),

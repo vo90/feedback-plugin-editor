@@ -310,12 +310,12 @@ controls instead of taking space from the tracks. It shows progress, the three
 choices, Clear, Previous/Next, and Continue. The selected Base, Fill, or Hybrid
 track header is highlighted. Open **Decision details** only when you need the
 reason for the choice, repeated-section controls, bar splitting, or the full
-note list; **More** contains setup and Experimental bulk actions.
+note list. Use **Adjust settings** to return to Setup.
 They open at **120 px/beat**; use the Zoom controls or **Ctrl+mouse wheel** for
 5 px/beat changes around the pointer. Drag the lower edge of any track to resize
 it. Click the overview map to seek to that exact point and, when there is room,
 center it in the visible tablature; hold and drag to scrub continuously. A short
-click on a colored review or passage mark also selects it without losing the
+click on a colored review mark also selects it without losing the
 clicked position. The overview box and centered playhead exclude the fixed track
 labels, so they represent the usable note area. The tablature also keeps a small,
 display-only margin before beat 0 and after the song endpoint, ensuring the first
@@ -340,32 +340,6 @@ the safety space around base-track parts, split a review section at a bar, or
 choose notes directly from the aligned tablature. The technical note list and
 import-timing cleanup details are available when needed but do not change either
 original track.
-
-**Experimental smart fill** is an optional, collapsed Automatic setting. It
-tries complete musical passages and asks for review at uncertain handoffs while
-keeping the Standard Automatic result as a comparison. **Balanced** is the
-recommended experimental profile; **Strict** needs clearer, roomier handoffs,
-while **Fill more** offers more borderline passages for review. Even Fill more
-does not silently insert an isolated note, broken gesture, or incomplete piece
-of a detected passage.
-
-After the review choices, expand **Experimental details** to reach the collapsed
-**Passage inspector**.
-Filter it by what was added, accepted after review, still undecided, or left out.
-Choose a passage in the inspector to center it, or click its colored overview
-band to select it while staying at the exact clicked position. You can then
-preview that passage with its entry and exit context. Plain-language reasons
-explain uncertain handoffs; the detail panel also shows the available space and
-fret-position movement. **Preserved details** reports chord shapes,
-handshapes, phrases, and tone changes that will be carried into the Hybrid, plus
-any metadata that was skipped safely. **Copy comparison report** creates a
-text summary useful for testing or reporting a surprising result.
-
-Experimental analysis also checks whether the two arrangements appear aligned.
-A clearly consistent offset or drift must be corrected before continuing;
-source-length or shared-grid differences appear as warnings for you to inspect.
-It is intended for exploration and full-song listening; Standard Automatic
-remains the default and its rules are not changed by enabling Experimental.
 
 If you return to Setup after making review choices, those choices stay intact.
 Changed settings are marked as pending, and rebuilding asks before discarding

@@ -4,12 +4,8 @@ import test from 'node:test';
 import {
     _compositeEligibleSourcesPure,
     _compositeAutomaticSummaryPure,
-    _compositeAutomaticOverviewPure,
     _compositeAnalysisConfigEqualPure,
     _compositeDefaultNameForSourcePure,
-    _compositeExperimentalPreferencesPure,
-    _compositeExperimentalPassageInspectorPure,
-    _compositeExperimentalSummaryPure,
     _compositeGapFillPreferencesPure,
     _compositeGuidedPreferencesPure,
     _compositeModalShortcutPure,
@@ -107,8 +103,6 @@ test('analysis settings compare structurally so review choices are never replace
         secondaryIndex: 1,
         strategy: 'gap-fill',
         gapFill: { unit: 'beats', minimumGap: 1, transitionMargin: 0.25 },
-        experimentalEnabled: false,
-        experimentalProfile: 'balanced',
     };
     assert.equal(_compositeAnalysisConfigEqualPure(config, { ...config }), true);
     assert.equal(_compositeAnalysisConfigEqualPure(config, {
@@ -145,19 +139,6 @@ test('Guided repetition preferences default safely and remember grouped review',
     assert.deepEqual(_compositeGuidedPreferencesPure('{broken'), {
         repeatMode: 'matching-repetitions',
     });
-});
-
-test('experimental Automatic is versioned, opt-in, and Balanced by default', () => {
-    assert.deepEqual(_compositeExperimentalPreferencesPure(null), {
-        enabled: false, profile: 'balanced', version: 2,
-    });
-    assert.deepEqual(_compositeExperimentalPreferencesPure({
-        enabled: true, profile: 'fill-more', version: 2,
-    }), { enabled: true, profile: 'fill-more', version: 2 });
-    assert.deepEqual(_compositeExperimentalPreferencesPure({
-        enabled: true, profile: 'strict', version: 1,
-    }), { enabled: false, profile: 'strict', version: 2 },
-    'an old rule version requires a fresh opt-in');
 });
 
 test('Hybrid audition preferences remember a safe shared tone and volume', () => {
@@ -377,83 +358,6 @@ test('automatic result summary uses player-facing track names and outcomes', () 
         added: 1,
         skipped: 2,
     });
-});
-
-test('experimental summary distinguishes automatic, reviewed, and left-out notes', () => {
-    assert.deepEqual(_compositeExperimentalSummaryPure({
-        secondaryAddedCleanly: 4,
-        secondaryReviewable: 3,
-        secondarySkippedByStrategy: 2,
-    }, { primary: 'Lead', secondary: 'Rhythm' }), {
-        title: 'Experimental hybrid ready',
-        description: 'Lead unchanged · 4 Rhythm added automatically · 3 added after review · 2 left out',
-        added: 4, reviewed: 3, skipped: 2,
-    });
-});
-
-test('experimental passage inspector exposes outcomes, filtering, and focused handoffs', () => {
-    const entry = { id: 'secondary:1' };
-    const plan = {
-        strategy: 'experimental',
-        passages: [{
-            id: 'experimental:passage:1', status: 'review', label: '<Bar 2>',
-            handoffScore: 72, noteCount: 1, entries: [entry],
-            explanation: 'Needs a choice.', reasons: ['Large position change'],
-            handoff: {
-                entryGapBeats: 1, entryGapSeconds: 0.5,
-                exitGapBeats: 2, exitGapSeconds: 1,
-                entryFretShift: 8, exitFretShift: 2,
-            },
-        }],
-        conflicts: [{
-            id: 'experimental:passage:1', resolution: 'secondary',
-            selectedEntryIds: ['secondary:1'],
-        }],
-        playability: { newWarnings: [{
-            passageId: 'experimental:passage:1', detail: 'Very wide stretch',
-        }] },
-    };
-    const html = _compositeExperimentalPassageInspectorPure(plan, {
-        inspectedPassageId: 'experimental:passage:1', passageFilter: 'reviewed',
-    });
-    assert.match(html, /Passage inspector/);
-    assert.match(html, /1 reviewed/);
-    assert.match(html, /aria-label="Experimental passage inspector" open/);
-    assert.match(html, /value="reviewed" selected/);
-    assert.match(html, /Entry space/);
-    assert.match(html, /accepted · 1\/1 notes/);
-    assert.match(html, /Playability advisory/);
-    assert.match(html, /Very wide stretch/);
-    assert.match(html, /&lt;Bar 2&gt;/);
-    assert.doesNotMatch(html, /<Bar 2>/);
-});
-
-test('experimental passage inspector bounds pathological result lists', () => {
-    const plan = {
-        strategy: 'experimental', conflicts: [],
-        passages: Array.from({ length: 1000 }, (_, index) => ({
-            id: `experimental:passage:${index + 1}`, status: 'automatic',
-            label: `Bar ${index + 1}`, handoffScore: 90, noteCount: 1,
-            entries: [], reasons: [],
-        })),
-    };
-    const html = _compositeExperimentalPassageInspectorPure(plan);
-    assert.equal((html.match(/data-composite-inspect-passage=/g) || []).length, 240);
-    assert.match(html, /Showing up to 240 passages/);
-});
-
-test('automatic overview renders visible, escaped fill-note marks', () => {
-    const html = _compositeAutomaticOverviewPure({
-        sourceEntries: {
-            primary: [{ startBeat: 0, endBeat: 1 }],
-            secondary: [{ startBeat: 8, endBeat: 9 }],
-        },
-        fixedEntries: [{ source: 'secondary', startBeat: 4, endBeat: 5 }],
-    }, { secondary: '<Rhythm>' });
-    assert.match(html, /min-width:3px;background:#c084fc/);
-    assert.match(html, /left:44\.444/);
-    assert.match(html, /Added from &lt;Rhythm&gt;/);
-    assert.doesNotMatch(html, /Added from <Rhythm>/);
 });
 
 test('composite creation inserts before drums and rolls back without touching sources', t => {

@@ -62,12 +62,6 @@ function view() {
                 primary: [entry('p:1', 2, 4, 0, 3)],
                 secondary: [entry('s:1', 8, 9, 2, 7, 'secondary')],
             },
-            passages: [{
-                id: 'experimental:passage:1', startBeat: 8, endBeat: 9,
-                status: 'automatic', label: 'Bar 3', handoffScore: 92,
-                noteCount: 1, entries: [entry('s:1', 8, 9, 2, 7, 'secondary')],
-                reasons: [], explanation: 'Added automatically.',
-            }],
         },
         primaryName: 'Lead',
         secondaryName: 'Rhythm',
@@ -438,51 +432,9 @@ test('lane and overview markup contain full-song notes without review controls',
     assert.match(map, /fill="#c084fc"/, 'fill-track additions share the main song map');
     assert.doesNotMatch(map, /editor-composite-map-(viewport|playhead)/,
         'the dense overview SVG stays static while HTML overlays move above it');
-    assert.match(map, /data-composite-map-passage="experimental:passage:1"/);
 });
 
-test('Experimental passage outcomes stay linear at twenty thousand review sections', () => {
-    const count = 20_000;
-    let conflictReads = 0;
-    const conflicts = Array.from({ length: count }, (_, index) => ({
-        id: `passage:${index}`,
-        startBeat: index,
-        endBeat: index + 0.5,
-        resolution: index % 2 ? 'secondary' : null,
-        selectedEntryIds: index % 2 ? [`entry:${index}`] : [],
-        primaryEntries: [],
-        secondaryEntries: [],
-    }));
-    const observedConflicts = new Proxy(conflicts, {
-        get(target, property, receiver) {
-            if (typeof property === 'string' && /^\d+$/.test(property)) conflictReads++;
-            return Reflect.get(target, property, receiver);
-        },
-    });
-    const passages = Array.from({ length: count }, (_, index) => ({
-        id: `passage:${index}`,
-        startBeat: index,
-        endBeat: index + 0.5,
-        status: 'review',
-        noteCount: 1,
-        entries: [{ id: `entry:${index}` }],
-        reasons: [],
-    }));
-    const model = buildCompositeTimelineViewModel({
-        plan: {
-            beats: [], compatibility: { stringCount: 6 },
-            sourceEntries: { primary: [], secondary: [] },
-            conflicts: observedConflicts, passages,
-        },
-    });
-    assert.equal(model.passages.length, count);
-    assert.equal(model.passages[0].state, 'review');
-    assert.equal(model.passages.at(-1).state, 'accepted');
-    assert.ok(conflictReads < count * 12,
-        `indexed construction should be linear, but read ${conflictReads} conflict slots`);
-});
-
-test('dense overview groups visual intervals but keeps late focused markers interactive', () => {
+test('dense overview groups decisions but keeps a late focused marker interactive', () => {
     const count = 20_000;
     assert.equal(COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT, 512);
     const decisions = Array.from({ length: count }, (_, index) => ({
@@ -492,44 +444,26 @@ test('dense overview groups visual intervals but keeps late focused markers inte
         endBeat: index + 0.5,
         state: index % 3 === 0 ? 'resolved' : index % 3 === 1 ? 'unresolved' : 'invalid',
     }));
-    const passages = Array.from({ length: count }, (_, index) => ({
-        id: `passage:${index}`,
-        startBeat: index,
-        endBeat: index + 0.5,
-        state: index % 2 ? 'automatic' : 'left-out',
-        label: `Passage ${index + 1}`,
-        active: index === count - 1,
-    }));
     const map = renderCompositeTimelineMapSvg({
         context: { startBeat: 0, endBeat: count },
         lanes: [{ id: 'result', entries: [] }],
         review: { id: decisions.at(-1).id },
         decisions,
-        passages,
     });
 
     assert.equal((map.match(/data-composite-map-decision="/g) || []).length, 1,
         'only the focused decision remains an individual SVG hit target');
     assert.match(map, /data-composite-map-decision="19999"/,
         'a focused decision beyond the aggregation limit remains selectable');
-    assert.equal((map.match(/data-composite-map-passage="/g) || []).length, 1,
-        'only the inspected passage remains an individual SVG hit target');
-    assert.match(map, /data-composite-map-passage="passage:19999"/,
-        'a late inspected passage remains selectable');
     assert.match(map, /data-composite-map-decision-density=/);
-    assert.match(map, /data-composite-map-passage-density=/);
     assert.match(map, /data-composite-map-density-kind="decision"[^>]*pointer-events="fill"/,
         'a delegated handler can distinguish and hit a grouped decision path');
-    assert.match(map, /data-composite-map-density-kind="passage"[^>]*pointer-events="fill"/,
-        'a delegated handler can distinguish and hit a grouped passage path');
-    assert.match(map, /Dense 20000 decision markers and 20000 passage markers are visually grouped[^<]*clicking a grouped marker opens the exact section/,
+    assert.match(map, /Dense 20000 decision markers are visually grouped[^<]*clicking a grouped marker opens the exact section/,
         'the accessible description explains that grouped marks still open exact sections');
     assert.match(map, /data-composite-map-density-state="(?:resolved|unresolved|invalid)"[^>]*aria-hidden="true"/,
         'decorative grouped paths defer their name to the containing labelled map button');
     assert.ok((map.match(/data-composite-map-decision-density=/g) || []).length <= 3,
         'decision aggregation emits at most one path per visible state');
-    assert.ok((map.match(/data-composite-map-passage-density=/g) || []).length <= 6,
-        'passage aggregation emits at most one path per visible state');
     assert.ok(map.length < 250_000,
         `twenty thousand intervals should not produce unbounded markup (${map.length} chars)`);
 });
@@ -543,12 +477,7 @@ test('dense overview hit index resolves overlaps, visual gaps, states, and focus
         { id: 'focused', index: 4, startBeat: 2, endBeat: 5, state: 'unresolved' },
         { id: 'other-state', index: 5, startBeat: 8, endBeat: 9, state: 'imported-new-state' },
     ];
-    const passages = [
-        { id: 'passage:left', startBeat: 10, endBeat: 11, state: 'review' },
-        { id: 'passage:right', startBeat: 13, endBeat: 14, state: 'review' },
-        { id: 'passage:active', startBeat: 10, endBeat: 14, state: 'review', active: true },
-    ];
-    const view = { review: { id: 'focused' }, decisions, passages };
+    const view = { review: { id: 'focused' }, decisions };
     const index = compositeTimelineOverviewIntervalIndexPure(view);
 
     assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2.5, {
@@ -566,9 +495,6 @@ test('dense overview hit index resolves overlaps, visual gaps, states, and focus
     assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 8.5, {
         kind: 'decision', state: 'other',
     })?.id, 'other-state', 'the literal visual fallback state remains queryable');
-    assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 12, {
-        kind: 'passage', state: 'review',
-    })?.id, 'passage:right', 'active exact markers are excluded from grouped hit testing');
     assert.equal(compositeTimelineOverviewIntervalAtBeatPure(view, 2.5, {
         kind: 'decision', state: 'unresolved',
     })?.id, 'top', 'a view remains a correct one-off input without retaining an index');
@@ -585,7 +511,6 @@ test('overview interval focus exclusion mirrors rendering for falsy decision ids
         const index = compositeTimelineOverviewIntervalIndexPure({
             review: { id: focusedId },
             decisions,
-            passages: [],
         });
         assert.equal(compositeTimelineOverviewIntervalAtBeatPure(index, 2, {
             kind: 'decision', state: 'unresolved',
@@ -610,7 +535,7 @@ test('overview interval index matches brute-force marker intent on randomized ov
             state: states[Math.floor(random() * states.length)],
         };
     });
-    const view = { decisions, passages: [] };
+    const view = { decisions };
     const index = compositeTimelineOverviewIntervalIndexPure(view);
     const brute = (beat, state) => {
         const candidates = decisions.filter(item => item.state === state);
@@ -649,7 +574,7 @@ test('twenty-thousand-marker overview index stays below the renderer long-task r
         state: index % 2 ? 'resolved' : 'unresolved',
     }));
     const started = performance.now();
-    const hitIndex = compositeTimelineOverviewIntervalIndexPure({ decisions, passages: [] });
+    const hitIndex = compositeTimelineOverviewIntervalIndexPure({ decisions });
     const elapsed = performance.now() - started;
     assert.equal(compositeTimelineOverviewIntervalAtBeatPure(hitIndex, 14_999, {
         kind: 'decision', state: 'resolved',
@@ -663,25 +588,19 @@ test('twenty-thousand-marker overview index stays below the renderer long-task r
         `twenty thousand intervals should index below a long-task budget (${elapsed.toFixed(1)} ms)`);
 });
 
-test('ordinary overview counts preserve every decision and passage hit target', () => {
+test('ordinary overview counts preserve every decision hit target', () => {
     const decisions = Array.from({ length: 12 }, (_, index) => ({
         id: `decision:${index}`, index, startBeat: index, endBeat: index + 0.5,
         state: 'unresolved',
-    }));
-    const passages = Array.from({ length: 12 }, (_, index) => ({
-        id: `passage:${index}`, startBeat: index, endBeat: index + 0.5,
-        state: 'automatic', label: `Passage ${index + 1}`, active: false,
     }));
     const map = renderCompositeTimelineMapSvg({
         context: { startBeat: 0, endBeat: 12 },
         lanes: [{ id: 'result', entries: [] }],
         review: null,
         decisions,
-        passages,
     });
     assert.equal((map.match(/data-composite-map-decision="/g) || []).length, 12);
-    assert.equal((map.match(/data-composite-map-passage="/g) || []).length, 12);
-    assert.doesNotMatch(map, /data-composite-map-(?:decision|passage)-density=/);
+    assert.doesNotMatch(map, /data-composite-map-decision-density=/);
     assert.match(map, /aria-label="Whole-song Hybrid overview"/,
         'normal songs keep the previous concise accessible name');
 });
@@ -1033,22 +952,4 @@ test('explicit density overview keeps manual-review detail and omits ordinary tr
         'the ordinary background trail is omitted even when it crosses the view');
     assert.equal((fitted.match(/data-composite-density-notes=/g) || []).length, 1,
         'only the non-review attack is density-rendered');
-});
-
-test('an inspected Experimental passage remains detailed in explicit density overview', () => {
-    const model = view();
-    model.passageFocus = { id: 'passage:focus', startBeat: 8, endBeat: 9 };
-    model.lanes[1].entries = [
-        entry('context', 2, 2.25, 0, 3, 'secondary'),
-        entry('passage', 8, 9, 2, 7, 'secondary'),
-    ];
-    const fitted = renderCompositeTimelineLaneContents(model, 'secondary', 158,
-        { startBeat: 0, endBeat: model.context.endBeat }, 3,
-        { overviewDensity: true });
-    assert.match(fitted, /<title>String 4, fret 7,/,
-        'the passage under inspection keeps its full note description');
-    assert.match(fitted, />7<\/text>/,
-        'the passage under inspection keeps its readable fret marker');
-    assert.equal((fitted.match(/data-composite-density-notes=/g) || []).length, 1,
-        'unfocused song context remains density-rendered');
 });

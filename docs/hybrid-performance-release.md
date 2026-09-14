@@ -71,15 +71,14 @@ more than 25% from the recorded baseline. At 20,000 notes per source, the
 player-facing resolved-entry, timeline-model, and overview phases should each
 remain below 50 ms median, and visible-lane SVG work should remain below 16 ms
 median. Planner computation runs in a Worker; its baseline budgets are 1.2 s
-for Standard, 1.8 s for Guided, and 3.5 s for Experimental. Record the commit,
-CPU, memory, Node/Electron version, window size, DPR, power state, and raw JSON
-with every release run.
+for Standard and 1.8 s for Guided. Record the commit, CPU, memory, Node/Electron
+version, window size, DPR, power state, and raw JSON with every release run.
 
 ## Required scenarios
 
-- Automatic, Experimental, and Review sections yourself.
+- Automatic and Review sections yourself.
 - Repeated-riff grouping and detached individual decisions.
-- Review timeline, inspected Experimental passage, and Final Preview.
+- Review timeline and Final Preview.
 - Cold and warm Clean, Edge, and Distortion tones.
 - Original, Lead, Rhythm, and Hybrid playback.
 - Space immediately after opening, before clicking the timeline; the stopped
@@ -113,7 +112,7 @@ with every release run.
 - Overview and main playheads are scheduled once per display frame. On a
   nominal 60 Hz display the automated tolerance is p95 <= 25 ms; also inspect
   the trace for sustained low-rate stepping that a percentile can hide.
-- A grouped dense overview marker opens the exact decision or passage painted
+- A grouped dense overview marker opens the exact decision painted
   at the pointer, including after a retained review choice changes its state.
 - Map dragging performs at most one committed audio seek and one resume.
 - Cancel responds within 50 ms while background analysis is running.
@@ -149,11 +148,11 @@ for the refactored branch without a fresh desktop trace and soak run.
 
 Warm planner medians in milliseconds:
 
-| Notes/source | Standard | Guided | Experimental |
-| ---: | ---: | ---: | ---: |
-| 1,000 | 38.28 | 95.92 | 93.95 |
-| 5,000 | 153.57 | 267.20 | 406.39 |
-| 20,000 | 515.99 | 1,220.42 | 2,090.27 |
+| Notes/source | Standard | Guided |
+| ---: | ---: | ---: |
+| 1,000 | 38.28 | 95.92 |
+| 5,000 | 153.57 | 267.20 |
+| 20,000 | 515.99 | 1,220.42 |
 
 The 20,000-note warm player-facing phase medians all remain inside their
 budgets:
@@ -162,11 +161,10 @@ budgets:
 | --- | ---: | ---: | ---: | ---: |
 | Standard | 13.55 | 7.21 | 8.42 | 4.02 |
 | Guided | 0.16 | 3.03 | 1.05 | 2.99 |
-| Experimental | 4.56 | 13.36 | 10.65 | 2.12 |
 
-At the same size, the Experimental comparison report was 14.10 ms warm median
-and source guide-event conversion was 10.18 ms. The complete local measurement
-summary is stored outside the repository with the other release artifacts.
+At the same size, source guide-event conversion was 10.18 ms. The complete
+local measurement summary is stored outside the repository with the other
+release artifacts.
 
 The native Majesty smoke used Lead as the base and Rhythm as the fill. Before
 playback, the red playhead and blue overview viewport were both initialized at

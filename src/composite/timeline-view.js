@@ -8,7 +8,6 @@
 
 import { beatOf } from '../beats.js';
 import { compositeTechniqueLabels } from './conflict-view.js';
-import { experimentalPassageOutcomes } from './experimental-auto-engine.js';
 import {
     HYBRID_PREVIEW_DEFAULTS,
     HYBRID_TIMELINE_LANE_MAX,
@@ -41,9 +40,6 @@ const OVERVIEW_INTERVAL_INDEX_TYPE = 'composite-timeline-overview-interval-index
 
 const OVERVIEW_MARKER_STATES = Object.freeze({
     decision: new Set(['invalid', 'resolved', 'unresolved']),
-    passage: new Set([
-        'automatic', 'review', 'accepted', 'accepted-partial', 'declined', 'left-out',
-    ]),
 });
 
 const TIMELINE_DETAIL_LEVELS = Object.freeze({
@@ -215,7 +211,6 @@ export function buildCompositeTimelineViewModel({
     resultEntriesPrepared = false,
     durationSeconds = 0,
     review = null,
-    passageFocusId = '',
 } = {}) {
     if (!plan) return null;
     const primary = immutableSourceEntries(plan.sourceEntries?.primary);
@@ -242,23 +237,6 @@ export function buildCompositeTimelineViewModel({
         state: conflict.validationError ? 'invalid' : conflict.resolution ? 'resolved' : 'unresolved',
         label: conflict.label || `Decision ${index + 1}`,
     }));
-    const passageOutcomes = plan.passages?.length
-        ? experimentalPassageOutcomes(plan) : new Map();
-    const passages = (plan.passages || []).map((passage, index) => {
-        const state = passageOutcomes.get(passage.id)?.state || passage.status;
-        return {
-            id: passage.id,
-            index,
-            startBeat: finite(passage.startBeat),
-            endBeat: Math.max(finite(passage.startBeat), finite(passage.endBeat)),
-            state,
-            label: passage.label || `Passage ${index + 1}`,
-            explanation: passage.explanation || '',
-            score: finite(passage.handoffScore),
-            reasons: (passage.reasons || []).slice(),
-            active: passage.id === passageFocusId,
-        };
-    });
     return {
         wholeSong: true,
         names: { primary: primaryName || 'Base track', secondary: secondaryName || 'Fill track' },
@@ -268,8 +246,6 @@ export function buildCompositeTimelineViewModel({
         beats: plan.beats || [],
         review,
         decisions,
-        passages,
-        passageFocus: passages.find(passage => passage.active) || null,
         hasFillAdditions,
         lanes: [
             { id: 'primary', label: primaryName || 'Base track', subtitle: 'Base track', entries: primary },
@@ -734,7 +710,7 @@ function entryDisplayMetadata(entry, stringCount, {
 function entryNeedsDetailedTimelineMarkup(view, entry) {
     if (entry?.selectable || entry?.inConflict
             || entry?.selected || entry?.invalid) return true;
-    const focus = view?.review || view?.passageFocus;
+    const focus = view?.review;
     if (!focus) return false;
     const start = finite(focus.startBeat);
     const end = Math.max(start, finite(focus.endBeat, start));
@@ -1053,8 +1029,8 @@ function overviewUpperBound(values, value) {
 
 function compositeTimelineOverviewIntervalGroupIndex(records) {
     if (!records.length) return null;
-    // Decisions and Experimental passages are normally authored in song order
-    // and do not overlap. Keep that overwhelmingly common case as compact
+    // Decisions are normally authored in song order and do not overlap. Keep
+    // that overwhelmingly common case as compact
     // typed arrays: it builds linearly and an upper-bound lookup is exact. A
     // strict overlap (shared boundaries are okay) or out-of-order source falls
     // through to the general sweep index below.
@@ -1183,8 +1159,6 @@ export function compositeTimelineOverviewIntervalIndexPure(view = {}) {
         type: OVERVIEW_INTERVAL_INDEX_TYPE,
         decision: compositeTimelineOverviewKindIndex(view.decisions || [], 'decision',
             item => Boolean(review) && item.id === review.id),
-        passage: compositeTimelineOverviewKindIndex(view.passages || [], 'passage',
-            item => Boolean(item.active)),
     };
 }
 
@@ -1237,7 +1211,7 @@ function compositeTimelineOverviewGroupHitPure(kindIndex, group, beat) {
 }
 
 /**
- * Resolve a click on a grouped decision/passage marker to one exact interval.
+ * Resolve a click on a grouped decision marker to one exact interval.
  * Pass an index returned by `compositeTimelineOverviewIntervalIndexPure` on a
  * hot pointer path; passing a view directly is a convenient one-off fallback.
  */
@@ -1245,7 +1219,7 @@ export function compositeTimelineOverviewIntervalAtBeatPure(viewOrIndex, beat, {
     kind = 'decision',
     state,
 } = {}) {
-    if (kind !== 'decision' && kind !== 'passage') return null;
+    if (kind !== 'decision') return null;
     const index = viewOrIndex?.type === OVERVIEW_INTERVAL_INDEX_TYPE
         ? viewOrIndex : compositeTimelineOverviewIntervalIndexPure(viewOrIndex);
     const kindIndex = index[kind];
@@ -1300,7 +1274,7 @@ function compositeTimelineOverviewDensityMarkup(entries, toX, {
     for (let bin = 0; bin < width; bin++) {
         active += difference[bin];
         // Quantising density lets adjacent pixels collapse into bounded runs
-        // while still making stacked chords/passages visibly stronger.
+        // while still making stacked chords visibly stronger.
         const opacity = active > 0
             ? fixedOpacity ?? Math.min(0.88,
                 0.52 + Math.floor(Math.log2(active + 1)) * 0.09)
@@ -1351,12 +1325,6 @@ function compositeTimelineOverviewDecisionMarkup(decision, toX, width, active) {
     return `<rect data-composite-map-decision="${decision.index}" x="${x1.toFixed(1)}" y="5" width="${Math.max(2, x2 - x1).toFixed(1)}" height="8" rx="2" fill="${color}" opacity="${active ? 1 : 0.72}"/>`;
 }
 
-function compositeTimelineOverviewPassageMarkup(passage, toX, width, colors) {
-    const x1 = Math.max(0, Math.min(width, toX(passage.startBeat)));
-    const x2 = Math.max(x1 + 2, Math.min(width, toX(passage.endBeat)));
-    return `<rect data-composite-map-passage="${escapeMarkup(passage.id)}" x="${x1.toFixed(1)}" y="31" width="${Math.max(2, x2 - x1).toFixed(1)}" height="7" rx="2" fill="${colors[passage.state] || '#64748b'}" opacity="${passage.active ? 1 : 0.76}"${passage.active ? ' stroke="#f8fafc" stroke-width="1.5"' : ''}><title>${escapeMarkup(`${passage.label}: ${passage.state}`)}</title></rect>`;
-}
-
 export function renderCompositeTimelineMapSvg(view, _viewportRange, _playheadBeat = 0) {
     const width = OVERVIEW_WIDTH;
     const height = 42;
@@ -1383,26 +1351,11 @@ export function renderCompositeTimelineMapSvg(view, _viewportRange, _playheadBea
             compositeTimelineOverviewDecisionMarkup(decision, x, width, true)).join('')
         : decisionItems.map(decision => compositeTimelineOverviewDecisionMarkup(
             decision, x, width, activeDecision(decision))).join('');
-    const passageColors = {
-        automatic: '#c084fc', review: '#fbbf24', accepted: '#34d399',
-        'accepted-partial': '#2dd4bf', declined: '#64748b', 'left-out': '#475569',
-    };
-    const passageItems = view.passages || [];
-    const densePassages = passageItems.length > COMPOSITE_TIMELINE_OVERVIEW_INTERVAL_LIMIT;
-    const passages = densePassages
-        ? compositeTimelineOverviewGroupedIntervals(passageItems, x, {
-            kind: 'passage', y: 31, height: 7,
-            colors: passageColors,
-            active: passage => passage.active,
-        }) + passageItems.filter(passage => passage.active).map(passage =>
-            compositeTimelineOverviewPassageMarkup(passage, x, width, passageColors)).join('')
-        : passageItems.map(passage =>
-            compositeTimelineOverviewPassageMarkup(passage, x, width, passageColors)).join('');
-    const groupedDescription = denseDecisions || densePassages
-        ? `. Dense ${denseDecisions ? `${decisionItems.length} decision markers` : ''}${denseDecisions && densePassages ? ' and ' : ''}${densePassages ? `${passageItems.length} passage markers` : ''} are visually grouped by position and status; clicking a grouped marker opens the exact section at that position, and focused markers remain individually selectable`
+    const groupedDescription = denseDecisions
+        ? `. Dense ${decisionItems.length} decision markers are visually grouped by position and status; clicking a grouped marker opens the exact section at that position, and the focused marker remains individually selectable`
         : '';
     const accessibleLabel = `Whole-song Hybrid overview${groupedDescription}`;
     return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" width="100%" height="42" role="img" aria-label="${escapeMarkup(accessibleLabel)}" style="display:block">`
-        + `<title>${escapeMarkup(accessibleLabel)}</title><rect width="${width}" height="${height}" rx="7" fill="#0f172a"/>${entries}${decisions}${passages}`
+        + `<title>${escapeMarkup(accessibleLabel)}</title><rect width="${width}" height="${height}" rx="7" fill="#0f172a"/>${entries}${decisions}`
         + '</svg>';
 }

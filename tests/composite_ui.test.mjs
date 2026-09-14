@@ -67,6 +67,10 @@ test('Hybrid review uses one responsive sticky toolbar instead of a side or belo
     assert.match(theme, /\.editor-composite-review-toolbar/);
     assert.match(theme, /@media \(max-width: 56rem\)/);
     assert.match(theme, /@media \(max-height: 44rem\)/);
+    assert.match(resolver, /id="editor-composite-edit-settings">Adjust settings<\/button>/,
+        'the only secondary review action is a direct button');
+    assert.doesNotMatch(resolver, /editor-composite-review-more/);
+    assert.doesNotMatch(theme, /editor-composite-review-more/);
     assert.doesNotMatch(theme, /editor-composite-decision-panel|editor-composite-review-shell/);
 });
 
@@ -81,7 +85,7 @@ test('same-decision Hybrid choices retain the workspace and update its live mode
     const timelineRefreshStart = resolver.indexOf(
         'function scheduleCompositeReviewTimelineRefresh');
     const timelineRefreshEnd = resolver.indexOf(
-        '\n// Resolution and manual-note changes', timelineRefreshStart);
+        '\n// Choices, manual-note edits', timelineRefreshStart);
     const timelineRefreshBody = resolver.slice(timelineRefreshStart, timelineRefreshEnd);
     assert.match(refreshBody,
         /captureCompositeReviewUi[\s\S]*restoreCompositeReviewUi/,
@@ -93,8 +97,8 @@ test('same-decision Hybrid choices retain the workspace and update its live mode
         /refreshCompositeTimelineStaticMap[\s\S]*scheduleCompositeTimelineStandby/,
         'the bounded map updates before dense lanes render through the hidden camera');
     assert.match(timelineRefreshBody,
-        /includePlayability:\s*false[\s\S]*freshnessDeadlineAt:[\s\S]*\+ 240[\s\S]*onCommitted/,
-        'choice feedback skips full Experimental linting and has a bounded visible-lane commit');
+        /refreshCompositePlanDerivedState\(plan\)[\s\S]*freshnessDeadlineAt:[\s\S]*\+ 240[\s\S]*onCommitted/,
+        'choice feedback has a bounded visible-lane commit');
     assert.doesNotMatch(refreshBody, /result\.innerHTML\s*=/,
         'same-decision input never replaces the full result DOM');
     assert.doesNotMatch(refreshBody, /renderResult\(\)/,
@@ -104,7 +108,7 @@ test('same-decision Hybrid choices retain the workspace and update its live mode
         'retained controls keep their one existing timeline listener set');
 
     const toggleStart = resolver.indexOf('function toggleCompositeCustomEntry');
-    const toggleEnd = resolver.indexOf('\nfunction inspectExperimentalPassage', toggleStart);
+    const toggleEnd = resolver.indexOf('\nfunction bindCompositeReviewDetails', toggleStart);
     const toggleBody = resolver.slice(toggleStart, toggleEnd);
     assert.match(toggleBody, /markHybridResolutionChanged[\s\S]*refreshCurrentCompositeReview/);
     assert.doesNotMatch(toggleBody, /renderResult\(\)/,
@@ -281,7 +285,7 @@ test('Hybrid analysis and creation use cancellable background tasks with stale g
         /installHybridPlan\(hybridSession, plan, request\.sessionId\)/,
         'the completed plan retains the song session that produced it');
     assert.doesNotMatch(analyzeBody,
-        /analyzeGapFillComposite|analyzeGuidedComposite|analyzeExperimentalAutoComposite/,
+        /analyzeGapFillComposite|analyzeGuidedComposite/,
         'the modal must not run a planner directly on the renderer thread');
 
     const finishStart = resolver.indexOf('async function finishMerge');
@@ -726,31 +730,13 @@ test('Hybrid setup presents the two player-facing workflows and escapes song dat
     assert.match(html, />Review sections yourself</);
     assert.match(html, /Review matching riffs once \(recommended\)[^<]*<\/option>/);
     assert.match(html, /Advanced safety settings/);
-    assert.match(html, /Experimental smart fill/);
-    assert.match(html, /Use experimental smart fill/);
-    assert.match(html, /<details id="editor-composite-experimental-controls"/);
-    assert.doesNotMatch(html, /<details id="editor-composite-experimental-controls"[^>]* open/,
-        'experimental settings stay collapsed until the user opts in');
-    assert.match(html, /Balanced — recommended/);
-    assert.match(html, /id="editor-composite-experimental-profile-controls" hidden/,
-        'experimental controls stay collapsed until the user opts in');
+    assert.doesNotMatch(html, /experimental/i,
+        'the MVP setup exposes only Automatic and guided manual review');
     assert.match(html, /id="editor-composite-setup" class="min-h-0 overflow-y-auto/,
         'the setup body must shrink and scroll so the fixed footer stays visible');
     assert.match(html, /&lt;Lead&gt;/);
     assert.match(html, /Hybrid &quot;One&quot;/);
     assert.doesNotMatch(html, /Primary track|Secondary track|strategy skips|compatible-union/i);
-});
-
-test('Hybrid setup restores an opted-in experimental profile explicitly', () => {
-    const html = renderHybridSetupView({
-        sources,
-        gapFillValues: { minimumGap: 1, transitionMargin: 0.25 },
-        experimentalEnabled: true,
-        experimentalProfile: 'fill-more',
-    });
-    assert.match(html, /id="editor-composite-experimental" type="checkbox" checked/);
-    assert.doesNotMatch(html, /id="editor-composite-experimental-profile-controls" hidden/);
-    assert.match(html, /value="fill-more" selected/);
 });
 
 test('Hybrid setup remembers explicit review-every-occurrence preference', () => {
@@ -778,9 +764,6 @@ test('Hybrid builder session reset clears review and private-preview ownership',
     session.timelineSeekTime = 18;
     session.timelineScrollLeft = 420;
     session.timelineFocusReview = true;
-    session.timelineFocusPassage = true;
-    session.inspectedPassageId = 'experimental:passage:2';
-    session.passageFilter = 'review';
     session.previewLastMode = 'secondary';
     session.analysisConfig = { strategy: 'guided' };
     session.setupDirty = true;
@@ -799,9 +782,6 @@ test('Hybrid builder session reset clears review and private-preview ownership',
     assert.equal(session.timelineSeekTime, 0);
     assert.equal(session.timelineScrollLeft, 0);
     assert.equal(session.timelineFocusReview, false);
-    assert.equal(session.timelineFocusPassage, false);
-    assert.equal(session.inspectedPassageId, '');
-    assert.equal(session.passageFilter, 'all');
     assert.equal(session.previewLastMode, 'song');
     assert.equal(session.analysisConfig, null);
     assert.equal(session.setupDirty, false);
@@ -825,17 +805,6 @@ test('only meaningful Guided choices require a discard-review confirmation', () 
 
     resetHybridBuilderReview(session);
     assert.equal(session.hasReviewWork, false);
-    assert.equal(hybridCloseGuardKind(session), 'none');
-});
-
-test('experimental review choices use the same discard guard without affecting Standard Automatic', () => {
-    const session = createHybridBuilderSession();
-    session.plan = { strategy: 'experimental', conflicts: [{ id: 'passage:1' }] };
-    assert.equal(markHybridReviewWork(session), true);
-    assert.equal(hybridCloseGuardKind(session), 'review');
-    resetHybridBuilderReview(session);
-    session.plan = { strategy: 'experimental', conflicts: [] };
-    assert.equal(markHybridReviewWork(session), false);
     assert.equal(hybridCloseGuardKind(session), 'none');
 });
 
