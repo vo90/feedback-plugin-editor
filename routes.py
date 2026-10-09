@@ -11,6 +11,11 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from copy import deepcopy
+try:
+    from .guidance_provenance import edited as _guidance_edited, protected as _guidance_protected
+except ImportError:  # Standalone helper tests.
+    from guidance_provenance import edited as _guidance_edited, protected as _guidance_protected
 from xml.etree import ElementTree as ET
 from xml.dom import minidom
 
@@ -2938,7 +2943,7 @@ def _compute_anchors(notes, chords, width=_ANCHOR_WIDTH):
 
 def _arr_dict_to_wire(
     name, tuning, capo, notes, chords, chord_templates,
-    *, tones=None, handshapes=None, anchors_user=None,
+    *, tones=None, handshapes=None, anchors_user=None, original=None, _track_guidance=True,
 ):
     """Convert editor's long-named arrangement dict into sloppak wire format.
 
@@ -3044,7 +3049,8 @@ def _arr_dict_to_wire(
             }
             for a in (
                 _valid_anchor_dicts(anchors_user)
-                or _compute_anchors(notes, chords)
+                or ([] if original and not original.get("anchors") and _guidance_protected(original, "anchors")
+                    else _compute_anchors(notes, chords))
             )
         ],
         # Drop handshapes whose `chord_id` points past the available
@@ -3082,7 +3088,43 @@ def _arr_dict_to_wire(
     }
     if tones:
         wire["tones"] = tones
+    if _track_guidance:
+        _preserve_edited_guidance(original, wire, anchors_user)
     return wire
+
+
+def _preserve_edited_guidance(original, out, anchors_user):
+    """Preserve raw no-op fields despite UI rounding and inserted defaults."""
+    original = original or {}
+    if original:
+        from lib.song import arrangement_from_wire
+        view = _arr_to_data(arrangement_from_wire(original), original.get("name", ""))
+        normalized = _arr_dict_to_wire(view["name"], view["tuning"], view["capo"],
+            view["notes"], view["chords"], view["chord_templates"],
+            anchors_user=view["anchors_user"], handshapes=view["handshapes"],
+            original=original, _track_guidance=False)
+        for key in ("notes", "chords", "templates", "anchors", "handshapes", "tuning", "capo"):
+            if out.get(key) == normalized.get(key) and key in original:
+                out[key] = deepcopy(original[key])
+            elif key in ("notes", "chords", "templates", "anchors", "handshapes"):
+                # Preserve untouched rows even when another row was edited.
+                # Ambiguous projections (e.g. two sub-ms attacks rounded onto
+                # one coordinate) cannot safely recover a row's identity.
+                lookup = {}
+                raw_rows, view_rows = original.get(key, []), normalized.get(key, [])
+                if len(raw_rows) == len(view_rows):
+                    for raw, display in zip(raw_rows, view_rows):
+                        token = json.dumps(display, sort_keys=True)
+                        lookup[token] = raw if token not in lookup or lookup[token] == raw else None
+                    out[key] = [deepcopy(lookup.get(json.dumps(v, sort_keys=True)))
+                                if lookup.get(json.dumps(v, sort_keys=True)) is not None else v for v in out.get(key, [])]
+        if "centOffset" in original:
+            out["centOffset"] = original["centOffset"]
+        if "beats" in original:
+            out["beats"] = deepcopy(original["beats"])
+    auto = not _valid_anchor_dicts(anchors_user) and not (
+        not original.get("anchors") and _guidance_protected(original, "anchors"))
+    _guidance_edited(original, out, generated_anchors=auto)
 
 
 # Keys-family arrangement names (piano/keyboard/synth) get a notation sidecar in
@@ -3627,6 +3669,26 @@ def _populate_notation_notes(arrangements, notation_by_id):
         ]
 
 
+def _preserve_phrase_guidance(original, wire, phrases):
+    if original and all(wire.get(k) == original.get(k) for k in ("notes", "chords", "anchors", "templates", "handshapes")):
+        wire["phrases"] = deepcopy(phrases)
+        return
+    wire["phrases"] = _repopulate_phrase_levels(phrases, wire["notes"], wire["chords"], wire["anchors"])
+    try:
+        from .guidance_provenance import carry, digest, origins
+    except ImportError:
+        from guidance_provenance import carry, digest, origins
+    inherited = {k: wire[k] for k in ("tuning", "capo", "centOffset", "templates", "beats") if k in wire}
+    for phrase in wire["phrases"]:
+        for level in phrase.get("levels", []):
+            context = {**inherited, **level, "ext": deepcopy(level.get("ext", {}))}
+            for key in ("anchors", "chords"):
+                lookup = {digest(v): o for v, o in zip(wire[key], origins(wire, key))}
+                carry(wire, context, key, producer="feedback-editor-level-copy-v1",
+                      row_origins=[lookup.get(digest(v), "unknown") for v in context[key]])
+            level["ext"] = context["ext"]
+
+
 def _repopulate_phrase_levels(phrases, notes, chords, anchors):
     """Re-slice each phrase level's notes/chords/anchors from the flat
     editor lists.
@@ -4050,6 +4112,9 @@ def _arr_to_data(arr, name):
         "chord_templates": [],
         "handshapes": [],
     }
+    if getattr(arr, "ext", None):
+        from lib.song import arrangement_to_wire
+        arr_data["_guidance_source"] = arrangement_to_wire(arr)
 
     anchors_payload = [
         {
@@ -5235,7 +5300,7 @@ def setup(app, context):
             # Build the wire JSON for one arrangement. Anchors / handshapes /
             # tones come through the kwargs; phrases stay opaque passthrough
             # (the editor UI still doesn't author phrase tiers).
-            def _build_wire(arr_dict, is_first):
+            def _build_wire(arr_dict, is_first, original=None):
                 # Anchors: prefer the authored `anchors_user` key when
                 # it's present (even if explicitly empty — empty means
                 # "force `_compute_anchors`"); otherwise fall back to
@@ -5268,12 +5333,11 @@ def setup(app, context):
                     tones=arr_dict.get("tones"),
                     handshapes=authored_handshapes,
                     anchors_user=authored_anchors,
+                    original=original or arr_dict.get("_guidance_source"),
                 )
                 ph = arr_dict.get("phrases")
                 if ph:
-                    wire["phrases"] = _repopulate_phrase_levels(
-                        ph, wire["notes"], wire["chords"], wire["anchors"],
-                    )
+                    _preserve_phrase_guidance(original or arr_dict.get("_guidance_source"), wire, ph)
                 if is_first:
                     wire["beats"], wire["sections"] = _wire_beats_sections(
                         beats, sections)
@@ -5320,7 +5384,7 @@ def setup(app, context):
                     if _old_path_ok:
                         try:
                             _existing = _load_arrangement_json(_old_path)
-                            for _k in ("anchors", "handshapes", "phrases", "tones"):
+                            for _k in ("anchors", "handshapes", "phrases", "tones", "ext"):
                                 if _k in _existing:
                                     _preserved[_k] = _existing[_k]
                         except (OSError, json.JSONDecodeError):
@@ -5360,7 +5424,7 @@ def setup(app, context):
                 }
                 merged_arrangements = []
                 for i, entry in enumerate(old_entries):
-                    wire = _build_wire(edited_dict, i == 0) if i == arrangement_index else None
+                    wire = _build_wire(edited_dict, i == 0, _existing if _preserved else None) if i == arrangement_index else None
                     merged_arrangements.append({"entry": entry, "wire": wire})
             else:
                 # Full snapshot path — used when arrangements were added/
@@ -5381,7 +5445,13 @@ def setup(app, context):
                     else:
                         aid = _arrangement_id(ad.get("name", "arr"), used_ids)
                     used_ids.add(aid)
-                    wire = _build_wire(ad, i == 0)
+                    original = None
+                    old = _old_by_id.get(aid)
+                    if old and old.get("file"):
+                        old_path = (source_dir / old["file"]).resolve()
+                        old_path.relative_to(source_dir)
+                        original = _load_arrangement_json(old_path)
+                    wire = _build_wire(ad, i == 0, original)
                     _rebuilt = {
                         "id": aid,
                         "name": ad.get("name", "arr"),
@@ -9288,6 +9358,7 @@ def setup(app, context):
                     tones=ad.get("tones"),
                     handshapes=authored_handshapes,
                     anchors_user=authored_anchors,
+                    original=ad.get("_guidance_source"),
                 )
                 if i == 0:
                     wire["beats"], wire["sections"] = _wire_beats_sections(
@@ -9568,6 +9639,9 @@ def setup(app, context):
                     for h in (arr.hand_shapes or [])
                 ],
             }
+            if getattr(arr, "ext", None):
+                from lib.song import arrangement_to_wire
+                arr_data["_guidance_source"] = arrangement_to_wire(arr)
             # Loaded anchors become the user-overridable initial set
             # (`anchors_user`). We ALSO emit the legacy `anchors` field
             # with the same payload until the editor UI is fully on

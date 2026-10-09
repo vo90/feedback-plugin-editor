@@ -2679,6 +2679,10 @@ export async function editorBuild(options = {}) {
         // correction on its very first build. The save path already ships it via
         // the full-arrangement spread in _buildSaveBody; the build whitelist must too.
         if (arr.type) arrEntry.type = arr.type;
+        if (arr._guidance_source) {
+            arrEntry._guidance_source = arr._guidance_source;
+            arrEntry.anchors_user = arr.anchors_user || arr.anchors || [];
+        }
         if (buildTones) arrEntry.tones = buildTones;
         if (arr._gp_notation) arrEntry._gp_notation = arr._gp_notation;
         // PR3d: include authored anchors too — same dirty-gate as
