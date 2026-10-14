@@ -1,0 +1,2 @@
+# Shared guidance ownership code is audited byte-for-byte across checkouts.
+guidance_provenance.py text eol=lf
